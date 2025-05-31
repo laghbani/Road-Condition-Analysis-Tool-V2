@@ -3,6 +3,8 @@ import tempfile
 import json
 
 import folium
+from folium.plugins import BeautifyIcon
+from geopy.distance import geodesic
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QUrl
 
@@ -35,14 +37,40 @@ class MapWidget(QWebEngineView):
             heading_deg = (np.degrees(np.arctan2(fwd[1], fwd[0])) + 360) % 360
             folium.Marker(
                 location=[lat0, lon0],
-                icon=folium.plugins.BeautifyIcon(
+                icon=BeautifyIcon(
                     icon_shape="arrow",
                     border_color="#d35400",
                     border_width=2,
                     text_color="#d35400",
                     icon_rotate=heading_deg,
                 ),
-                tooltip=f"Heading ≈ {heading_deg:.1f}°",
+                tooltip=f"Heading \u2248 {heading_deg:.1f}\xb0",
+            ).add_to(self._map)
+
+            # --- Länge der Pfeile auf der Karte (Meter) ---
+            L_FWD = 30
+            L_LEFT = 15
+
+            # ► Endpunkte berechnen
+            pt_fwd = geodesic(meters=L_FWD).destination((lat0, lon0), heading_deg)
+            pt_left = geodesic(meters=L_LEFT).destination(
+                (lat0, lon0), (heading_deg + 90) % 360
+            )
+
+            # ► X-Achse (rot)
+            folium.PolyLine(
+                [[lat0, lon0], [pt_fwd.latitude, pt_fwd.longitude]],
+                color="red",
+                weight=3,
+                tooltip="Sensor X",
+            ).add_to(self._map)
+
+            # ► Y-Achse (grün)
+            folium.PolyLine(
+                [[lat0, lon0], [pt_left.latitude, pt_left.longitude]],
+                color="green",
+                weight=3,
+                tooltip="Sensor Y",
             ).add_to(self._map)
 
         self._refresh()
