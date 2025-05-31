@@ -149,6 +149,11 @@ def first_frame_id(samples: list) -> str:
 
 
 def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
+    """Deprecated wrapper for :func:`rot_from_gps`."""
+    return rot_from_gps(df, gps_df)
+
+
+def rot_from_gps(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
     """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``.
 
     This GPS-based approach is used as fallback when no reliable orientation
@@ -205,6 +210,73 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
     y_sens = np.cross(np.array([0, 0, 1]), x_sens)
     y_sens /= np.linalg.norm(y_sens)
     R_sv = np.stack([x_sens, y_sens, np.array([0, 0, 1])]).T @ R_z
+    return [[round(c, 3) for c in row] for row in R_sv]
+
+
+def z_axis_from_quat(q: np.ndarray) -> np.ndarray:
+    """Return average ``-g`` vector in sensor frame from quaternion series."""
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    return -R.from_quat(q).apply([0, 0, G_STD]).mean(axis=0)
+
+
+def rot_from_quat_static(q: np.ndarray,
+                         gps_df: pd.DataFrame | None) -> list | None:
+    z_sens = z_axis_from_quat(q)
+    if np.linalg.norm(z_sens) < 1:
+        return None
+    R_z = rot_between(z_sens / np.linalg.norm(z_sens), [0, 0, 1])
+
+    if gps_df is None or len(gps_df) < 3:
+        return None
+    lat = np.deg2rad(gps_df["lat"].to_numpy())
+    lon = np.deg2rad(gps_df["lon"].to_numpy())
+    dx = np.diff(lon) * np.cos(lat[:-1])
+    dy = np.diff(lat)
+    win = max(3, int(5 / np.median(np.diff(gps_df["time"]))))
+    vx = pd.Series(dx).rolling(win).mean().dropna().to_numpy()
+    vy = pd.Series(dy).rolling(win).mean().dropna().to_numpy()
+    if len(vx) < 20:
+        return None
+    M = np.cov(np.vstack((vx, vy)))
+    eigval, eigvec = np.linalg.eig(M)
+    x_world = eigvec[:, np.argmax(eigval)]
+    cands = [
+        R_z @ np.array([1, 0, 0]),
+        R_z @ np.array([0, 1, 0]),
+        R_z @ np.array([-1, 0, 0]),
+        R_z @ np.array([0, -1, 0]),
+    ]
+    dots = [np.dot(c[:2], x_world) for c in cands]
+    x_sens = cands[int(np.argmax(np.abs(dots)))]
+    if dots[np.argmax(np.abs(dots))] < 0:
+        x_sens = -x_sens
+    y_sens = np.cross([0, 0, 1], x_sens)
+    y_sens /= np.linalg.norm(y_sens)
+    R_sv = np.stack([x_sens, y_sens, [0, 0, 1]]).T @ R_z
+    return [[round(c, 3) for c in row] for row in R_sv]
+
+
+def rot_from_quat_dynamic(q: np.ndarray) -> list | None:
+    z_sens = z_axis_from_quat(q)
+    if np.linalg.norm(z_sens) < 1:
+        return None
+    R_z = rot_between(z_sens / np.linalg.norm(z_sens), [0, 0, 1])
+
+    x_w = R.from_quat(q).apply([1, 0, 0]).mean(axis=0)
+    x_w[:2] /= np.linalg.norm(x_w[:2])
+    cands = [
+        R_z @ np.array([1, 0, 0]),
+        R_z @ np.array([0, 1, 0]),
+        R_z @ np.array([-1, 0, 0]),
+        R_z @ np.array([0, -1, 0]),
+    ]
+    dots = [np.dot(c[:2], x_w[:2]) for c in cands]
+    x_sens = cands[int(np.argmax(np.abs(dots)))]
+    if dots[np.argmax(np.abs(dots))] < 0:
+        x_sens = -x_sens
+    y_sens = np.cross([0, 0, 1], x_sens)
+    y_sens /= np.linalg.norm(y_sens)
+    R_sv = np.stack([x_sens, y_sens, [0, 0, 1]]).T @ R_z
     return [[round(c, 3) for c in row] for row in R_sv]
 
 
@@ -281,7 +353,6 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 var_ok = (np.ptp(rotvec, axis=0) > 0.005).all()
             else:
                 var_ok = False
-            has_quat_dyn = has_quat and var_ok
             has_gyro = not np.allclose(gyro, 0.0)
 
             work = df.copy()
@@ -318,10 +389,13 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work["ax_corr"], work["ay_corr"], work["az_corr"] = smooth.T
 
             # Rotation & Beschleunigung transformieren
-            if has_quat_dyn:
-                rot_mat = vehicle_rot_from_quat(ori, work["speed_mps"].to_numpy())
+            if comp_type == "quaternion":
+                if var_ok:
+                    rot_mat = rot_from_quat_dynamic(ori[norm_ok])
+                else:
+                    rot_mat = rot_from_quat_static(ori[norm_ok], gps_df)
             else:
-                rot_mat = auto_vehicle_frame(work, gps_df)
+                rot_mat = rot_from_gps(work, gps_df)
             rot_avail = bool(rot_mat)
             if rot_avail:
                 R = np.array(rot_mat)

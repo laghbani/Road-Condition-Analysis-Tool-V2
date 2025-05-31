@@ -469,10 +469,22 @@ class MainWindow(QMainWindow):
 
     def _show_quality(self):
         bad, warn, ok = 0, 0, 0
+        bagstem = pathlib.Path(self.bag_path).stem
         for t, df in self.dfs.items():
+            meta_path = None
+            if hasattr(self, "last_export_dir"):
+                meta_path = (
+                    pathlib.Path(self.last_export_dir)
+                    / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
+                )
+            rot_flag = None
+            if meta_path and meta_path.exists():
+                rot_flag = json.loads(meta_path.read_text()).get(
+                    "rotation_available", False)
+
             if {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
                 # Erwartet:  |az_veh| ≈ 9.8,  ax_veh & ay_veh mitteln ≈ 0
-                az  = df["az_veh"].mean()
+                az = df["az_veh"].mean()
                 rms = np.sqrt((df["ax_veh"]**2 + df["ay_veh"]**2).mean())
                 if abs(az - 9.81) < 0.5 and rms < 0.5:
                     ok += 1
@@ -481,7 +493,10 @@ class MainWindow(QMainWindow):
                 else:
                     bad += 1
             else:
-                bad += 1
+                if rot_flag is False:
+                    warn += 1
+                else:
+                    bad += 1
         if ok and not bad and not warn:
             col, txt = "green", "Alles plausibel ✔"
         elif bad:
