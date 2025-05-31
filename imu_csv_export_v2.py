@@ -12,6 +12,7 @@ from scipy.signal import butter, filtfilt
 G_STD = 9.80665
 FSR_2G = 2 * G_STD
 FSR_8G = 8 * G_STD
+CAND_G = np.array([2, 4, 8, 16]) * G_STD        #  19.6, 39.2 … 156.9 m/s²
 
 
 def sha1_of_file(path: Path) -> str:
@@ -23,9 +24,22 @@ def sha1_of_file(path: Path) -> str:
 
 
 def detect_fsr(abs_a: np.ndarray) -> float:
-    """Heuristik:  ±2 g ↔ Werte < 22 m/s², sonst ±8 g."""
-    vmax = np.nanpercentile(abs_a, 99.9)        # robuster als .5-Perzentil
-    return FSR_2G if vmax < 22.0 else FSR_8G
+    """
+    Versucht die Full-Scale-Range ausschließlich aus den Daten abzuleiten.
+    Idee:  Bei einem saturierten Sensor häufen sich Samples in der Nähe des
+           Maximalwerts.  Wir zählen, wie viele Messpunkte ≥ 98 % jedes
+           Kandidaten liegen, und wählen den kleinsten Kandidaten, der
+           »signifikant« getroffen wird.
+    """
+    hits = [(c, np.sum(abs_a >= 0.98 * c)) for c in CAND_G]
+    # 0.02 % der Gesamtlänge als Faustregel
+    thr = 0.0002 * len(abs_a)
+    for c, cnt in hits:
+        if cnt > thr:
+            return c
+    # Fallback –  heuristisch wie bisher
+    vmax = np.nanpercentile(abs_a, 99.9)
+    return CAND_G[0] if vmax < 22 else CAND_G[2]   # ±2 g oder ±8 g
 
 
 def find_stationary_bias(df: pd.DataFrame,
@@ -152,6 +166,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     if not folder:          # Dialog abgebrochen
         return
     dest = Path(folder)
+    self.last_export_dir = str(dest)   # für den GUI-Check
     exporter_sha = sha1_of_file(Path(__file__))
     for topic, df in self.dfs.items():
         if not (df["label_id"] != 99).any():
@@ -175,7 +190,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             )
             norm_ok  = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
             var_ok   = np.ptp(ori, axis=0).max() > 1e-3           # bewegt sich etwas?
-            has_quat = norm_ok.any() and var_ok
+            has_quat = bool(norm_ok.any() and var_ok)
             has_gyro = not np.allclose(gyro, 0.0)
 
             work = df.copy()
@@ -206,6 +221,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work["az_corr"] = acc_corr[:, 2]
 
             rot_mat = auto_vehicle_frame(work, gps_df)
+            rot_avail = bool(rot_mat) or bool(has_quat)
 
             if has_gyro:
                 abs_w = np.linalg.norm(gyro, axis=1)
@@ -230,6 +246,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
                 "g_compensation": comp_type,
                 "vehicle_rot_mat": rot_mat,
+                "rotation_available": rot_avail,
                 "sampling_rate_hz": round(fs, 2),
                 "exporter_sha1": exporter_sha,
             }
@@ -254,7 +271,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             QMessageBox = getattr(__import__("PySide6.QtWidgets", fromlist=["QMessageBox"]), "QMessageBox", None)
             if QMessageBox is None:
                 from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}")
+            QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
             continue
 
     if hasattr(self, "statusBar"):
