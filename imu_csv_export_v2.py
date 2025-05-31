@@ -1,0 +1,251 @@
+import hashlib
+import json
+from pathlib import Path
+
+import yaml
+import numpy as np
+import pandas as pd
+from scipy.spatial.transform import Rotation as R
+from scipy.signal import butter, filtfilt
+
+
+G_STD = 9.80665
+FSR_2G = 2 * G_STD
+FSR_8G = 8 * G_STD
+
+
+def sha1_of_file(path: Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def detect_fsr(abs_a: np.ndarray) -> float:
+    p99 = np.percentile(abs_a, 99.9)
+    return FSR_2G if p99 < 0.9 * FSR_8G else FSR_8G
+
+
+def find_stationary_bias(df: pd.DataFrame,
+                         win_s: float = 2.0,
+                         thr_sigma: float = 0.05) -> np.ndarray | None:
+    if len(df) < 2:
+        return None
+    dt = np.median(np.diff(df["time"]))
+    fs = 1.0 / dt if dt > 0 else 1.0
+    win = max(1, int(win_s * fs))
+    mag = np.linalg.norm(df[["ax", "ay", "az"]].to_numpy(), axis=1)
+    ser = pd.Series(mag)
+    std = ser.rolling(win, center=True).std()
+    mean = ser.rolling(win, center=True).mean()
+    mask = (std < thr_sigma) & (np.abs(mean - G_STD) < 0.2)
+    if mask.any():
+        idx = mask.idxmax()
+        j0 = max(0, idx - win // 2)
+        j1 = min(len(df), idx + win // 2 + 1)
+        return df.iloc[j0:j1][["ax", "ay", "az"]].mean().to_numpy()
+    return None
+
+
+def gravity_from_quat(df: pd.DataFrame) -> np.ndarray:
+    rots = R.from_quat(df[["ox", "oy", "oz", "ow"]].to_numpy())
+    g_world = np.array([0.0, 0.0, G_STD])
+    return rots.inv().apply(g_world)
+
+
+def get_sensor_model(bag_root: Path, topic: str) -> str:
+    meta_path = bag_root / "metadata.yaml"
+    if meta_path.exists():
+        try:
+            meta = yaml.safe_load(meta_path.read_text())
+            for k in ("device_type", "product"):
+                if k in meta:
+                    return str(meta[k])
+        except Exception:
+            pass
+    tl = topic.lower()
+    if "ouster" in tl:
+        return "Ouster OS-Series"
+    if "zed" in tl:
+        return "StereoLabs ZED 2/2i"
+    return "unknown"
+
+
+def first_frame_id(samples: list) -> str:
+    for s in samples:
+        fid = getattr(getattr(s.msg, "header", None), "frame_id", "")
+        if fid:
+            return fid
+    return "sensor_native"
+
+
+def auto_vehicle_frame(df: pd.DataFrame,
+                       gps_df: pd.DataFrame | None) -> list | None:
+    if gps_df is None or len(gps_df) < 2:
+        return None
+    if not {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
+        return None
+
+    lat = np.deg2rad(gps_df["lat"].to_numpy())
+    lon = np.deg2rad(gps_df["lon"].to_numpy())
+    dlat = np.diff(lat)
+    dlon = np.diff(lon)
+    if not len(dlat):
+        return None
+    x_comp = np.sum(dlon * np.cos(lat[:-1]))
+    y_comp = np.sum(dlat)
+    if x_comp == 0 and y_comp == 0:
+        return None
+    x_world = np.array([x_comp, y_comp])
+    x_world = x_world / np.linalg.norm(x_world)
+    z_body = (df[["ax", "ay", "az"]].to_numpy() -
+              df[["ax_corr", "ay_corr", "az_corr"]].to_numpy()).mean(axis=0)
+    if np.linalg.norm(z_body) == 0:
+        return None
+    z_body = z_body / np.linalg.norm(z_body)
+
+    def rot_between(v1, v2):
+        v1 = v1 / np.linalg.norm(v1)
+        v2 = v2 / np.linalg.norm(v2)
+        v = np.cross(v1, v2)
+        c = np.dot(v1, v2)
+        if np.linalg.norm(v) < 1e-8:
+            return np.eye(3) if c > 0 else -np.eye(3)
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        return np.eye(3) + vx + vx @ vx * ((1 - c) / (np.linalg.norm(v) ** 2))
+
+    R_z = rot_between(z_body, np.array([0, 0, 1]))
+    x_cand = R_z @ np.array([1, 0, 0])
+    y_cand = R_z @ np.array([0, 1, 0])
+    cands = [x_cand, y_cand, -x_cand, -y_cand]
+    dots = [np.dot(c[:2], x_world) for c in cands]
+    idx = int(np.argmax(np.abs(dots)))
+    x_sel = cands[idx]
+    if dots[idx] < 0:
+        x_sel = -x_sel
+    y_sel = np.cross(np.array([0, 0, 1]), x_sel)
+    y_sel = y_sel / np.linalg.norm(y_sel)
+    R_wv = np.stack((x_sel, y_sel, np.array([0, 0, 1]))).T
+    R_sw = R_wv @ R_z
+    rot = [[round(c, 3) for c in row] for row in R_sw]
+    a_corr = df[["ax_corr", "ay_corr", "az_corr"]].to_numpy()
+    veh = a_corr @ np.array(rot).T
+    df["ax_veh"] = veh[:, 0]
+    df["ay_veh"] = veh[:, 1]
+    df["az_veh"] = veh[:, 2]
+    return rot
+
+
+def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
+    bag_root = Path(self.bag_path)
+    dest = bag_root.parent
+    exporter_sha = sha1_of_file(Path(__file__))
+    for topic, df in self.dfs.items():
+        try:
+            samps = self.samples[topic]
+
+            ori = np.array(
+                [
+                    [s.msg.orientation.x, s.msg.orientation.y,
+                     s.msg.orientation.z, s.msg.orientation.w]
+                    for s in samps
+                ]
+            )
+            gyro = np.array(
+                [
+                    [s.msg.angular_velocity.x, s.msg.angular_velocity.y,
+                     s.msg.angular_velocity.z]
+                    for s in samps
+                ]
+            )
+            has_quat = not np.allclose(ori, 0.0)
+            has_gyro = not np.allclose(gyro, 0.0)
+
+            work = df.copy()
+            if has_gyro:
+                work["gx"] = gyro[:, 0]
+                work["gy"] = gyro[:, 1]
+                work["gz"] = gyro[:, 2]
+
+            abs_a = np.linalg.norm(df[["ax", "ay", "az"]].to_numpy(), axis=1)
+            fsr = detect_fsr(abs_a)
+            clipped = (df[["ax", "ay", "az"]].abs() >= 0.98 * fsr).any(axis=1)
+
+            if has_quat:
+                g_vec = gravity_from_quat(
+                    pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
+                acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
+                bias_vec = None
+                comp_type = "quaternion"
+            else:
+                bias_vec = find_stationary_bias(df)
+                if bias_vec is None:
+                    bias_vec = np.zeros(3)
+                acc_corr = df[["ax", "ay", "az"]].to_numpy() - bias_vec
+                comp_type = "static_bias"
+
+            work["ax_corr"] = acc_corr[:, 0]
+            work["ay_corr"] = acc_corr[:, 1]
+            work["az_corr"] = acc_corr[:, 2]
+
+            rot_mat = auto_vehicle_frame(work, gps_df)
+
+            if has_gyro:
+                abs_w = np.linalg.norm(gyro, axis=1)
+            else:
+                abs_w = np.full(len(work), np.nan)
+
+            work["|a|_raw"] = abs_a
+            work["|ω|_raw"] = abs_w
+            work["clipped_flag"] = clipped.astype(int)
+
+            if len(work["time"]) > 1:
+                fs = 1.0 / np.median(np.diff(work["time"]))
+            else:
+                fs = 0.0
+
+            header = {
+                "file_format": "imu_v1",
+                "sensor_topic": topic,
+                "sensor_model": get_sensor_model(bag_root, topic),
+                "coordinate_frame": first_frame_id(samps),
+                "sensor_fs_accel_g": round(fsr / G_STD, 3),
+                "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
+                "g_compensation": comp_type,
+                "vehicle_rot_mat": rot_mat,
+                "sampling_rate_hz": round(fs, 2),
+                "exporter_sha1": exporter_sha,
+            }
+
+            cols = ["time", "time_abs", "ax", "ay", "az"]
+            if has_gyro:
+                cols += ["gx", "gy", "gz"]
+            cols += ["ax_corr", "ay_corr", "az_corr"]
+            if rot_mat is not None:
+                cols += ["ax_veh", "ay_veh", "az_veh"]
+            cols += ["|a|_raw", "|ω|_raw", "clipped_flag", "label_id", "label_name"]
+
+            out_df = work[cols]
+
+            fname = f"{topic.strip('/').replace('/', '__')}_{bag_root.stem}__imu_v1.csv"
+            p_out = dest / fname
+            with open(p_out, "w") as f:
+                for k, v in header.items():
+                    if isinstance(v, (list, tuple)):
+                        v = json.dumps(v)
+                    f.write(f"# {k}: {v}\n")
+                f.write("# ---\n")
+                out_df.to_csv(f, index=False)
+
+        except Exception as exc:
+            QMessageBox = getattr(__import__("PySide6.QtWidgets", fromlist=["QMessageBox"]), "QMessageBox", None)
+            if QMessageBox is None:
+                from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}")
+            continue
+
+    if hasattr(self, "statusBar"):
+        self.statusBar().showMessage(f"Export abgeschlossen → {dest}")
+
+
