@@ -48,6 +48,8 @@ def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
         on="time_abs",
         direction="nearest",
     )
+    #  Future-safe: keine chained assignment
+    out = out.copy()
     out["speed_mps"] = out["speed_mps"].interpolate(limit_direction="both")
     return out
 

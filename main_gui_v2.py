@@ -70,14 +70,14 @@ except ImportError as exc:
 try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
-        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     )
     from PyQt5.QtCore import Qt
 except ImportError:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
-        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     )
     from PySide6.QtCore import Qt
@@ -213,6 +213,12 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.cmb)
         hl.addStretch()
 
+        # Umschalter: Sensor- vs. Vehicle-Frame
+        self.chk_veh = QCheckBox("Vehicle frame anzeigen")
+        self.chk_veh.setEnabled(False)        # erst nach Bag-Laden
+        self.chk_veh.stateChanged.connect(lambda _: self._draw_plots())
+        hl.addWidget(self.chk_veh)
+
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
         mb = self.menuBar()
@@ -242,6 +248,11 @@ class MainWindow(QMainWindow):
         self.act_verify.setEnabled(False)
         self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
         m_view.addAction(self.act_verify)
+
+        self.act_quality = QAction("Rotation-Qualität", self)
+        self.act_quality.setEnabled(False)
+        self.act_quality.triggered.connect(self._show_quality)
+        m_view.addAction(self.act_quality)
 
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
@@ -306,6 +317,8 @@ class MainWindow(QMainWindow):
         self.act_verify.setEnabled(True)
         self.act_export.setEnabled(True)
         self.act_check.setEnabled(True)
+        self.chk_veh.setEnabled(True)
+        self.act_quality.setEnabled(True)
 
     # ------------------------------------------------------------------ DataFrame
     def _build_dfs(self) -> None:
@@ -359,12 +372,17 @@ class MainWindow(QMainWindow):
             row = i * (2 if verify else 1)
             ax = self.fig.add_subplot(gs[row])
             ax.set_title(f"{topic} – Linear Acc.")
-            ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
-            ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
-            ax.plot(df["time"], df["az"], label="az", color="tab:green")
+            if self.chk_veh.isChecked() and {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
+                ax.plot(df["time"], df["ax_veh"], label="ax (veh)", color="tab:blue")
+                ax.plot(df["time"], df["ay_veh"], label="ay (veh)", color="tab:orange")
+                ax.plot(df["time"], df["az_veh"], label="az (veh)", color="tab:green")
+            else:
+                ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
+                ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
+                ax.plot(df["time"], df["az"], label="az", color="tab:green")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
-            ax.set_ylabel("m/s²")
+            ax.set_ylabel("m/s² (vehicle)" if self.chk_veh.isChecked() else "m/s² (sensor)")
             ax.legend(loc="upper right")
             self.ax_topic[ax] = topic
 
@@ -450,6 +468,32 @@ class MainWindow(QMainWindow):
                     f"<td align=center>{r[2]}</td></tr>"
         html += "</table>"
         QMessageBox.information(self, "Export Readiness", html)
+
+    def _show_quality(self):
+        bad, warn, ok = 0, 0, 0
+        for t, df in self.dfs.items():
+            if {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
+                # Erwartet:  |az_veh| ≈ 9.8,  ax_veh & ay_veh mitteln ≈ 0
+                az = df["az_veh"].abs().median()
+                ax = df["ax_veh"].abs().median()
+                ay = df["ay_veh"].abs().median()
+                if abs(az - 9.81) < 0.5 and max(ax, ay) < 0.4:
+                    ok += 1
+                elif abs(az - 9.81) < 1.5 and max(ax, ay) < 1.0:
+                    warn += 1
+                else:
+                    bad += 1
+            else:
+                bad += 1
+        if ok and not bad and not warn:
+            col, txt = "green", "Alles plausibel ✔"
+        elif bad:
+            col, txt = "red", f"{bad} Topic(s) unplausibel ✖"
+        else:
+            col, txt = "orange", f"{warn} Topic(s) grenzwertig ⚠"
+        QMessageBox.information(
+            self, "Rotation-Qualität",
+            f"<h2 style='color:{col}'>{txt}</h2>")
 
     # ------------------------------------------------------------------ Settings-Dialog
     def _configure_topics(self) -> None:
