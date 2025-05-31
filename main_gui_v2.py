@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 
 from map_widget import MapWidget
+from rotation_utils import estimate_vehicle_rot
 
 # ---------------------------------------------------------------------------#
 # Matplotlib – robuster Style-Loader                                         #
@@ -188,6 +189,7 @@ class MainWindow(QMainWindow):
         self.dfs: dict[str, pd.DataFrame] = {}
         self.t0: float | None = None
         self._gps_df: pd.DataFrame | None = None
+        self.rot_by_topic: dict[str, list | None] = {}
 
         # Runtime-State
         self.active_topics: list[str] = []
@@ -331,6 +333,22 @@ class MainWindow(QMainWindow):
         self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
 
         self._build_dfs()
+
+        # --- Rotation sofort abschätzen ---
+        self.rot_by_topic.clear()
+        for topic, df in self.dfs.items():
+            samps = self.samples[topic]
+            ori = np.array([
+                [s.msg.orientation.x, s.msg.orientation.y,
+                 s.msg.orientation.z, s.msg.orientation.w]
+                for s in samps
+            ])
+            rot = estimate_vehicle_rot(df, ori, self._gps_df)
+            self.rot_by_topic[topic] = rot
+            if rot is not None:
+                raw = df[["ax", "ay", "az"]].to_numpy()
+                df[["ax_veh", "ay_veh", "az_veh"]] = raw @ np.array(rot).T
+
         self._set_defaults()
         self._draw_plots()
 
@@ -473,19 +491,18 @@ class MainWindow(QMainWindow):
         if not sel_topic:
             self.map_widget.set_data(self._gps_df, None)
             return
-        bag_root = pathlib.Path(self.bag_path).stem if self.bag_path else ""
-        meta_path = None
-        if hasattr(self, "last_export_dir"):
+        rot = self.rot_by_topic.get(sel_topic)
+        if rot is None and hasattr(self, "last_export_dir"):
+            bag_root = pathlib.Path(self.bag_path).stem if self.bag_path else ""
             meta_path = (
                 pathlib.Path(self.last_export_dir)
                 / f"{sel_topic.strip('/').replace('/', '__')}_{bag_root}__imu_v1.json"
             )
-        rot = None
-        if meta_path and meta_path.exists():
-            try:
-                rot = json.loads(meta_path.read_text()).get("vehicle_rot_mat")
-            except Exception:
-                rot = None
+            if meta_path.exists():
+                try:
+                    rot = json.loads(meta_path.read_text()).get("vehicle_rot_mat")
+                except Exception:
+                    rot = None
         self.map_widget.set_data(self._gps_df, rot)
 
     def _check_export_status(self):
@@ -494,15 +511,17 @@ class MainWindow(QMainWindow):
         for t, df in self.dfs.items():
             has_lbl = (df["label_id"] != 99).any()
 
-            # Rotation: zuerst schauen, ob der Export schon lief und JSON vorliegt
-            meta = (
-                pathlib.Path(self.last_export_dir)
-                / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
-            ) if hasattr(self, "last_export_dir") else None
-
-            rot_ok = False
-            if meta and meta.exists():
-                rot_ok = json.loads(meta.read_text()).get("rotation_available", False)
+            rot_ok = self.rot_by_topic.get(t) is not None
+            if not rot_ok and hasattr(self, "last_export_dir"):
+                meta = (
+                    pathlib.Path(self.last_export_dir)
+                    / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
+                )
+                if meta.exists():
+                    try:
+                        rot_ok = json.loads(meta.read_text()).get("rotation_available", False)
+                    except Exception:
+                        rot_ok = False
 
             rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
         html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
@@ -516,14 +535,19 @@ class MainWindow(QMainWindow):
         bad = 0
         bagstem = pathlib.Path(self.bag_path).stem
         for t, df in self.dfs.items():
-            meta_path = None
-            if hasattr(self, "last_export_dir"):
+            rot = self.rot_by_topic.get(t)
+            rot_ok = rot is not None
+            if not rot_ok and hasattr(self, "last_export_dir"):
                 meta_path = (
                     pathlib.Path(self.last_export_dir)
                     / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
                 )
-            meta = json.loads(meta_path.read_text()) if meta_path and meta_path.exists() else {}
-            rot_ok = meta.get("rotation_available", False)
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text())
+                        rot_ok = meta.get("rotation_available", False)
+                    except Exception:
+                        rot_ok = False
             if not rot_ok:
                 bad += 1
                 continue
