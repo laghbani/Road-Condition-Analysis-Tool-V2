@@ -19,6 +19,8 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import json
+import os
 
 # ---------------------------------------------------------------------------#
 # Matplotlib – robuster Style-Loader                                         #
@@ -425,12 +427,23 @@ class MainWindow(QMainWindow):
 
     def _check_export_status(self):
         rows = []
+        bagstem = pathlib.Path(self.bag_path).stem
         for t, df in self.dfs.items():
             has_lbl = (df["label_id"] != 99).any()
-            rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns)
-            rows.append((t,
-                         "✔" if has_lbl else "—",
-                         "✔" if rot_ok  else "—"))
+
+            # Rotation: zuerst schauen, ob der Export schon lief und JSON vorliegt
+            meta_file = (
+                pathlib.Path(self.last_export_dir)
+                / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
+            ) if hasattr(self, "last_export_dir") else None
+
+            if meta_file and meta_file.exists():
+                rot_ok = json.loads(meta_file.read_text()).get("rotation_available", False)
+            else:
+                rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns) or \
+                    (has_lbl and any(s.msg.orientation.w not in (0, 1) for s in self.samples[t]))
+
+            rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
         html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
         for r in rows:
             html += f"<tr><td>{r[0]}</td><td align=center>{r[1]}</td>" \
