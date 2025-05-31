@@ -149,7 +149,11 @@ def first_frame_id(samples: list) -> str:
 
 
 def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
-    """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``."""
+    """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``.
+
+    This GPS-based approach is used as fallback when no reliable orientation
+    quaternion is present.
+    """
 
     # --- Z-Achse (Schwerkraft) -----------------------------------------
     if not {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
@@ -204,6 +208,38 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
     return [[round(c, 3) for c in row] for row in R_sv]
 
 
+def vehicle_rot_from_quat(ori_q: np.ndarray, speed: np.ndarray) -> list | None:
+    """Derive sensor→vehicle rotation from orientation quaternions.
+
+    This method requires valid orientation data while the vehicle is moving.
+    Returns ``None`` when insufficient motion is detected.
+    """
+    if len(ori_q) < 50 or np.nanmax(speed) < 1.0:
+        return None
+
+    moving = speed > 1.0
+    if moving.sum() < 20:
+        return None
+
+    ori_q = ori_q[moving]
+    ori_q = ori_q / np.linalg.norm(ori_q, axis=1, keepdims=True)
+    Rw_s = R.from_quat(ori_q)
+
+    z_world = np.array([0, 0, 1])
+    z_sensor = np.mean(Rw_s.apply(z_world * -1), axis=0)
+    z_sensor /= np.linalg.norm(z_sensor)
+
+    x_world = np.mean(Rw_s.apply([1, 0, 0]), axis=0)
+    x_world[:2] /= np.linalg.norm(x_world[:2])
+
+    x_s = R.from_rotvec(np.cross(z_sensor, z_world)).apply(x_world)
+    x_s[:2] /= np.linalg.norm(x_s[:2])
+    y_s = np.cross(z_sensor, x_s)
+    y_s /= np.linalg.norm(y_s)
+    Rsv = np.stack([x_s, y_s, z_sensor]).T
+    return np.round(Rsv, 3).tolist()
+
+
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     bag_root = Path(self.bag_path)
     from PyQt5.QtWidgets import QFileDialog
@@ -239,8 +275,13 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 ]
             )
             norm_ok  = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
-            var_ok   = np.ptp(ori, axis=0).max() > 1e-3           # bewegt sich etwas?
-            has_quat = bool(norm_ok.any() and var_ok)
+            has_quat = bool(norm_ok.any())
+            if has_quat:
+                rotvec = R.from_quat(ori[norm_ok]).as_rotvec()
+                var_ok = (np.ptp(rotvec, axis=0) > 0.005).all()
+            else:
+                var_ok = False
+            has_quat_dyn = has_quat and var_ok
             has_gyro = not np.allclose(gyro, 0.0)
 
             work = df.copy()
@@ -248,6 +289,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 work["gx"] = gyro[:, 0]
                 work["gy"] = gyro[:, 1]
                 work["gz"] = gyro[:, 2]
+
+            work = add_speed(work, gps_df)
 
             raw = df[["ax", "ay", "az"]].to_numpy()
             abs_a = np.linalg.norm(raw, axis=1)
@@ -275,7 +318,10 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work["ax_corr"], work["ay_corr"], work["az_corr"] = smooth.T
 
             # Rotation & Beschleunigung transformieren
-            rot_mat = auto_vehicle_frame(work, gps_df)
+            if has_quat_dyn:
+                rot_mat = vehicle_rot_from_quat(ori, work["speed_mps"].to_numpy())
+            else:
+                rot_mat = auto_vehicle_frame(work, gps_df)
             rot_avail = bool(rot_mat)
             if rot_avail:
                 R = np.array(rot_mat)
@@ -296,7 +342,6 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             else:
                 fs = 0.0
 
-            work = add_speed(work, gps_df)
 
             header = {
                 "file_format": "imu_v1",
