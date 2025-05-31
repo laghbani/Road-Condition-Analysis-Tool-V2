@@ -82,7 +82,8 @@ except ModuleNotFoundError:
 try:
     from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
     from rclpy.serialization import deserialize_message
-    from sensor_msgs.msg import Imu
+    from sensor_msgs.msg import Imu, NavSatFix
+    from imu_csv_export_v2 import export_csv_smart_v2
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -175,6 +176,7 @@ class MainWindow(QMainWindow):
         self.samples: dict[str, list[ImuSample]] = {}
         self.dfs: dict[str, pd.DataFrame] = {}
         self.t0: float | None = None
+        self._gps_df: pd.DataFrame | None = None
 
         # Runtime-State
         self.active_topics: list[str] = []
@@ -216,7 +218,8 @@ class MainWindow(QMainWindow):
 
         self.act_export = QAction("&CSV exportieren", self)
         self.act_export.setEnabled(False)
-        self.act_export.triggered.connect(self._export_csv)
+        self.act_export.triggered.connect(
+            lambda: export_csv_smart_v2(self, gps_df=self._gps_df))
         m_file.addAction(self.act_export)
 
         m_file.addSeparator()
@@ -254,7 +257,9 @@ class MainWindow(QMainWindow):
         try:
             reader = SequentialReader()
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
-            imu_topics = [t.name for t in reader.get_all_topics_and_types() if t.type == "sensor_msgs/msg/Imu"]
+            topics_info = reader.get_all_topics_and_types()
+            imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
+            gps_topic = next((t.name for t in topics_info if t.name == "/lvx_client/navsat"), None)
             for t in imu_topics:
                 self.samples[t] = []
         except Exception as exc:
@@ -266,14 +271,20 @@ class MainWindow(QMainWindow):
             return
 
         # Daten einlesen
+        gps_samples: list[tuple] = []
         try:
             while reader.has_next():
                 topic, data, ts = reader.read_next()
                 if topic in self.samples:
                     self.samples[topic].append(ImuSample(ts, deserialize_message(data, Imu)))
+                elif gps_topic and topic == gps_topic:
+                    msg = deserialize_message(data, NavSatFix)
+                    gps_samples.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
         except Exception as exc:
             QMessageBox.critical(self, "Lesefehler", f"Fehler beim Lesen:\n{exc}")
             return
+
+        self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
 
         self._build_dfs()
         self._set_defaults()
@@ -413,19 +424,7 @@ class MainWindow(QMainWindow):
         self.active_topics = sel
         self._draw_plots()
 
-    # ------------------------------------------------------------------ CSV-Export
-    def _export_csv(self) -> None:
-        assert self.bag_path
-        dest = self.bag_path.parent
-        name = self.bag_path.stem
-        for t, df in self.dfs.items():
-            fn = f"{t.strip('/').replace('/', '__')}_{name}.csv"
-            try:
-                df.to_csv(dest / fn, index=False)
-            except Exception as exc:
-                QMessageBox.critical(self, "Export-Fehler", f"{fn}: {exc}")
-                return
-        QMessageBox.information(self, "Export", f"Alle CSVs liegen in:\n{dest}")
+
 
 # ===========================================================================
 def main() -> None:
