@@ -23,8 +23,8 @@ def sha1_of_file(path: Path) -> str:
 
 
 def detect_fsr(abs_a: np.ndarray) -> float:
-    p99 = np.percentile(abs_a, 99.9)
-    return FSR_2G if p99 < 0.9 * FSR_8G else FSR_8G
+    vmax = np.percentile(abs_a, 99.5)  # robust gegen Ausreißer
+    return FSR_2G if vmax < 0.5 * FSR_8G else FSR_8G  # < ~40 m/s² → 2 g, sonst 8 g
 
 
 def find_stationary_bias(df: pd.DataFrame,
@@ -49,7 +49,9 @@ def find_stationary_bias(df: pd.DataFrame,
 
 
 def gravity_from_quat(df: pd.DataFrame) -> np.ndarray:
-    rots = R.from_quat(df[["ox", "oy", "oz", "ow"]].to_numpy())
+    q = df[["ox", "oy", "oz", "ow"]].to_numpy()
+    q /= np.linalg.norm(q, axis=1, keepdims=True)
+    rots = R.from_quat(q)
     g_world = np.array([0.0, 0.0, G_STD])
     return rots.inv().apply(g_world)
 
@@ -142,6 +144,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     dest = bag_root.parent
     exporter_sha = sha1_of_file(Path(__file__))
     for topic, df in self.dfs.items():
+        if not (df["label_id"] != 99).any():
+            continue  # nichts gelabelt → kein Export
         try:
             samps = self.samples[topic]
 
@@ -159,7 +163,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                     for s in samps
                 ]
             )
-            has_quat = not np.allclose(ori, 0.0)
+            norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
+            has_quat = norm_ok.any()  # mind. EIN gültiger Quaternion-Eintrag
             has_gyro = not np.allclose(gyro, 0.0)
 
             work = df.copy()
@@ -228,15 +233,11 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
 
             out_df = work[cols]
 
-            fname = f"{topic.strip('/').replace('/', '__')}_{bag_root.stem}__imu_v1.csv"
-            p_out = dest / fname
-            with open(p_out, "w") as f:
-                for k, v in header.items():
-                    if isinstance(v, (list, tuple)):
-                        v = json.dumps(v)
-                    f.write(f"# {k}: {v}\n")
-                f.write("# ---\n")
-                out_df.to_csv(f, index=False)
+            stem = f"{topic.strip('/').replace('/', '__')}_{bag_root.stem}__imu_v1"
+            csv_path = dest / f"{stem}.csv"
+            meta_path = dest / f"{stem}.json"
+            meta_path.write_text(json.dumps(header, indent=2))
+            out_df.to_csv(csv_path, index=False)
 
         except Exception as exc:
             QMessageBox = getattr(__import__("PySide6.QtWidgets", fromlist=["QMessageBox"]), "QMessageBox", None)
@@ -253,4 +254,4 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     except Exception:
         from PyQt5.QtWidgets import QMessageBox
     QMessageBox.information(self, "Export fertig",
-                            f"Alle CSVs wurden gespeichert nach:\n{dest}")
+                            f"CSV + JSON liegen in:\n{dest}")

@@ -237,6 +237,12 @@ class MainWindow(QMainWindow):
         self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
         m_view.addAction(self.act_verify)
 
+        act_check = QAction("Export Readiness …", self)
+        act_check.setEnabled(False)
+        act_check.triggered.connect(self._check_export_status)
+        m_view.addAction(act_check)
+        self.act_check = act_check
+
     # ------------------------------------------------------------------ Bag
     def _open_bag(self) -> None:
         pth, _ = QFileDialog.getOpenFileName(
@@ -293,6 +299,7 @@ class MainWindow(QMainWindow):
         self.act_topics.setEnabled(True)
         self.act_verify.setEnabled(True)
         self.act_export.setEnabled(True)
+        self.act_check.setEnabled(True)
 
     # ------------------------------------------------------------------ DataFrame
     def _build_dfs(self) -> None:
@@ -411,6 +418,19 @@ class MainWindow(QMainWindow):
         uniq = dict(zip(l, h))
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
         self.canvas.draw_idle()
+
+    def _check_export_status(self):
+        rows = []
+        for t, df in self.dfs.items():
+            has_lbl = (df["label_id"] != 99).any()
+            rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns)
+            rows.append((t, "✔" if has_lbl else "–", "ok" if rot_ok else "∅"))
+        html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
+        for r in rows:
+            html += f"<tr><td>{r[0]}</td><td align=center>{r[1]}</td>" \
+                    f"<td align=center>{r[2]}</td></tr>"
+        html += "</table>"
+        QMessageBox.information(self, "Export Readiness", html)
 
     # ------------------------------------------------------------------ Settings-Dialog
     def _configure_topics(self) -> None:
