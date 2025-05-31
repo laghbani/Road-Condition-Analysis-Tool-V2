@@ -455,10 +455,9 @@ class MainWindow(QMainWindow):
                 / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
             ) if hasattr(self, "last_export_dir") else None
 
+            rot_ok = False
             if meta and meta.exists():
                 rot_ok = json.loads(meta.read_text()).get("rotation_available", False)
-            else:
-                rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns)
 
             rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
         html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
@@ -473,11 +472,11 @@ class MainWindow(QMainWindow):
         for t, df in self.dfs.items():
             if {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
                 # Erwartet:  |az_veh| ≈ 9.8,  ax_veh & ay_veh mitteln ≈ 0
-                az = df["az_veh"].abs().median()
-                tilt = np.sqrt(df["ax_veh"] ** 2 + df["ay_veh"] ** 2).median()
-                if abs(az - 9.81) < 0.6 and tilt < 1.0:
+                az  = df["az_veh"].mean()
+                rms = np.sqrt((df["ax_veh"]**2 + df["ay_veh"]**2).mean())
+                if abs(az - 9.81) < 0.5 and rms < 0.5:
                     ok += 1
-                elif abs(az - 9.81) < 1.5 and tilt < 2.0:
+                elif abs(az - 9.81) < 1.5 and rms < 1.5:
                     warn += 1
                 else:
                     bad += 1

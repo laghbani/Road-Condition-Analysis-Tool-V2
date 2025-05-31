@@ -151,14 +151,19 @@ def first_frame_id(samples: list) -> str:
 def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
     """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``."""
 
-    # --- Z-axis via gravity vector -------------------------------------
-    if {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
-        # robust: Median in Stationärsegment suchen
-        mag = np.linalg.norm(df[["ax_corr", "ay_corr", "az_corr"]].to_numpy(), axis=1)
-        stat = np.abs(mag - 9.81) < 0.05
-        g_sens = -df.loc[stat, ["ax_corr", "ay_corr", "az_corr"]].median().to_numpy()
-    else:
+    # --- Z-Achse (Schwerkraft) -----------------------------------------
+    if not {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
         return None
+
+    a = df[["ax_corr", "ay_corr", "az_corr"]].to_numpy()
+    mag = np.linalg.norm(a, axis=1)
+    # Kandidaten: Fenster mit kleiner Varianz UND Betrag nahe g
+    w = 200                         # ~2 s bei 100 Hz
+    var = pd.Series(mag).rolling(w, center=True).var().to_numpy()
+    cand = (var < 0.02) & (np.abs(mag - 9.81) < 0.2)
+    if not cand.any():
+        return None                 # kein Ruhesegment → lieber abbrechen
+    g_sens = -a[cand].mean(axis=0)
     if np.linalg.norm(g_sens) < 1:
         return None
     z_sens = g_sens / np.linalg.norm(g_sens)
@@ -171,10 +176,16 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
     lon = np.deg2rad(gps_df["lon"].to_numpy())
     dx = np.diff(lon) * np.cos(lat[:-1])
     dy = np.diff(lat)
-    track = np.stack([dx, dy]).mean(axis=1)
-    if np.allclose(track, 0):
+    # 5-s-Fenster mitteln → weniger Zick-Zack
+    win = max(3, int(5 / np.median(np.diff(gps_df["time"]))))
+    vx = pd.Series(dx).rolling(win).mean().dropna().to_numpy()
+    vy = pd.Series(dy).rolling(win).mean().dropna().to_numpy()
+    if len(vx) < 20:
         return None
-    x_world = track / np.linalg.norm(track)
+    # PCA – Hauptachse wählen
+    M = np.cov(np.vstack((vx, vy)))
+    eigval, eigvec = np.linalg.eig(M)
+    x_world = eigvec[:, np.argmax(eigval)]
 
     # candidates after R_z rotation
     cands = [
@@ -238,7 +249,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 work["gy"] = gyro[:, 1]
                 work["gz"] = gyro[:, 2]
 
-            abs_a = np.linalg.norm(df[["ax", "ay", "az"]].to_numpy(), axis=1)
+            raw = df[["ax", "ay", "az"]].to_numpy()
+            abs_a = np.linalg.norm(raw, axis=1)
             fsr = detect_fsr(abs_a)
             clipped = (df[["ax", "ay", "az"]].abs() >= 0.98 * fsr).any(axis=1)
 
