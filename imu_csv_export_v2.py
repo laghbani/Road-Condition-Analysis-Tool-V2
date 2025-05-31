@@ -431,14 +431,13 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 rot_mat = rot_from_gps(work, gps_df)
             rot_avail = bool(rot_mat)
             if rot_avail:
-                R = np.array(rot_mat)
-                # Für die Qualitätsprüfung wollen wir die Roh-Beschl. (inkl. g)
+                rot_mat_np = np.array(rot_mat)           # no shadowing
+                # Roh-Beschleunigung (inkl. g) – Bias abziehen falls nötig
                 raw_fixed = df[["ax", "ay", "az"]].to_numpy() - (
                     bias_vec if bias_vec is not None else 0
                 )
-                veh = raw_fixed @ R.T
+                veh = raw_fixed @ rot_mat_np.T
                 work["ax_veh"], work["ay_veh"], work["az_veh"] = veh.T
-
             if has_gyro:
                 abs_w = np.linalg.norm(gyro, axis=1)
             else:
@@ -488,7 +487,12 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             QMessageBox = getattr(__import__("PySide6.QtWidgets", fromlist=["QMessageBox"]), "QMessageBox", None)
             if QMessageBox is None:
                 from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
+                QMessageBox.critical(
+                    self,
+                    "Export-Fehler",
+                    f"{topic}: {exc}",
+                    QMessageBox.StandardButton.Ok            # works for PyQt5 & PySide6
+                )
             continue
 
     if hasattr(self, "statusBar"):
