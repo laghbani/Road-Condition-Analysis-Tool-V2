@@ -9,6 +9,49 @@ from scipy.spatial.transform import Rotation as R
 from scipy.signal import butter, filtfilt
 
 
+def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    """Return minimal rotation matrix mapping ``v1`` to ``v2``.
+
+    Both vectors must be non-zero and are normalized internally.
+    """
+    v1, v2 = v1 / np.linalg.norm(v1), v2 / np.linalg.norm(v2)
+    v = np.cross(v1, v2)
+    c = np.dot(v1, v2)
+    if np.linalg.norm(v) < 1e-8:
+        return np.eye(3) if c > 0 else -np.eye(3)
+    vx = np.array([[0, -v[2], v[1]],
+                   [v[2], 0, -v[0]],
+                   [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * ((1 - c) / (np.linalg.norm(v) ** 2))
+
+
+def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Add ``speed_mps`` column to *work* derived from ``gps_df``."""
+    if gps_df is None or len(gps_df) < 3:
+        work["speed_mps"] = np.nan
+        return work
+    R_earth = 6_378_137.0
+    lat0 = np.deg2rad(gps_df["lat"].iat[0])
+    dx = (
+        R_earth
+        * np.deg2rad(gps_df["lon"] - gps_df["lon"].iat[0])
+        * np.cos(lat0)
+    )
+    dy = R_earth * np.deg2rad(gps_df["lat"] - gps_df["lat"].iat[0])
+    dt = np.diff(gps_df["time"])
+    v = np.hypot(np.diff(dx), np.diff(dy)) / dt
+    g2 = gps_df.iloc[1:].copy()
+    g2["speed_mps"] = v
+    out = pd.merge_asof(
+        work.sort_values("time_abs"),
+        g2[["time", "speed_mps"]].rename(columns={"time": "time_abs"}),
+        on="time_abs",
+        direction="nearest",
+    )
+    out["speed_mps"].interpolate(inplace=True, limit_direction="both")
+    return out
+
+
 G_STD = 9.80665
 FSR_2G = 2 * G_STD
 FSR_8G = 8 * G_STD
@@ -97,61 +140,46 @@ def first_frame_id(samples: list) -> str:
     return "sensor_native"
 
 
-def auto_vehicle_frame(df: pd.DataFrame,
-                       gps_df: pd.DataFrame | None) -> list | None:
+def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
+    """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``."""
+
+    # --- Z-axis via gravity vector -------------------------------------
+    if {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
+        g_sens = -df[["ax_corr", "ay_corr", "az_corr"]].mean().to_numpy()
+    else:
+        return None
+    if np.linalg.norm(g_sens) < 1:
+        return None
+    z_sens = g_sens / np.linalg.norm(g_sens)
+    R_z = rot_between(z_sens, np.array([0, 0, 1]))
+
+    # --- X-axis via GPS track ------------------------------------------
     if gps_df is None or len(gps_df) < 2:
         return None
-    if not {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
-        return None
-
     lat = np.deg2rad(gps_df["lat"].to_numpy())
     lon = np.deg2rad(gps_df["lon"].to_numpy())
-    dlat = np.diff(lat)
-    dlon = np.diff(lon)
-    if not len(dlat):
+    dx = np.diff(lon) * np.cos(lat[:-1])
+    dy = np.diff(lat)
+    track = np.stack([dx, dy]).mean(axis=1)
+    if np.allclose(track, 0):
         return None
-    x_comp = np.sum(dlon * np.cos(lat[:-1]))
-    y_comp = np.sum(dlat)
-    if x_comp == 0 and y_comp == 0:
-        return None
-    x_world = np.array([x_comp, y_comp])
-    x_world = x_world / np.linalg.norm(x_world)
-    z_body = (df[["ax", "ay", "az"]].to_numpy() -
-              df[["ax_corr", "ay_corr", "az_corr"]].to_numpy()).mean(axis=0)
-    if np.linalg.norm(z_body) == 0:
-        return None
-    z_body = z_body / np.linalg.norm(z_body)
+    x_world = track / np.linalg.norm(track)
 
-    def rot_between(v1, v2):
-        v1 = v1 / np.linalg.norm(v1)
-        v2 = v2 / np.linalg.norm(v2)
-        v = np.cross(v1, v2)
-        c = np.dot(v1, v2)
-        if np.linalg.norm(v) < 1e-8:
-            return np.eye(3) if c > 0 else -np.eye(3)
-        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-        return np.eye(3) + vx + vx @ vx * ((1 - c) / (np.linalg.norm(v) ** 2))
-
-    R_z = rot_between(z_body, np.array([0, 0, 1]))
-    x_cand = R_z @ np.array([1, 0, 0])
-    y_cand = R_z @ np.array([0, 1, 0])
-    cands = [x_cand, y_cand, -x_cand, -y_cand]
+    # candidates after R_z rotation
+    cands = [
+        R_z @ np.array([1, 0, 0]),
+        R_z @ np.array([0, 1, 0]),
+        R_z @ np.array([-1, 0, 0]),
+        R_z @ np.array([0, -1, 0]),
+    ]
     dots = [np.dot(c[:2], x_world) for c in cands]
-    idx = int(np.argmax(np.abs(dots)))
-    x_sel = cands[idx]
-    if dots[idx] < 0:
-        x_sel = -x_sel
-    y_sel = np.cross(np.array([0, 0, 1]), x_sel)
-    y_sel = y_sel / np.linalg.norm(y_sel)
-    R_wv = np.stack((x_sel, y_sel, np.array([0, 0, 1]))).T
-    R_sw = R_wv @ R_z
-    rot = [[round(c, 3) for c in row] for row in R_sw]
-    a_corr = df[["ax_corr", "ay_corr", "az_corr"]].to_numpy()
-    veh = a_corr @ np.array(rot).T
-    df["ax_veh"] = veh[:, 0]
-    df["ay_veh"] = veh[:, 1]
-    df["az_veh"] = veh[:, 2]
-    return rot
+    x_sens = cands[int(np.argmax(np.abs(dots)))]
+    if dots[np.argmax(np.abs(dots))] < 0:
+        x_sens = -x_sens
+    y_sens = np.cross(np.array([0, 0, 1]), x_sens)
+    y_sens /= np.linalg.norm(y_sens)
+    R_sv = np.stack([x_sens, y_sens, np.array([0, 0, 1])]).T @ R_z
+    return [[round(c, 3) for c in row] for row in R_sv]
 
 
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
@@ -216,12 +244,15 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 acc_corr = df[["ax", "ay", "az"]].to_numpy() - bias_vec
                 comp_type = "static_bias"
 
-            work["ax_corr"] = acc_corr[:, 0]
-            work["ay_corr"] = acc_corr[:, 1]
-            work["az_corr"] = acc_corr[:, 2]
+            work["ax_corr"], work["ay_corr"], work["az_corr"] = acc_corr.T
 
+            # Rotation & Beschleunigung transformieren
             rot_mat = auto_vehicle_frame(work, gps_df)
-            rot_avail = bool(rot_mat) or bool(has_quat)
+            rot_avail = bool(rot_mat)
+            if rot_avail:
+                R = np.array(rot_mat)
+                veh = acc_corr @ R.T
+                work["ax_veh"], work["ay_veh"], work["az_veh"] = veh.T
 
             if has_gyro:
                 abs_w = np.linalg.norm(gyro, axis=1)
@@ -237,6 +268,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             else:
                 fs = 0.0
 
+            work = add_speed(work, gps_df)
+
             header = {
                 "file_format": "imu_v1",
                 "sensor_topic": topic,
@@ -251,7 +284,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 "exporter_sha1": exporter_sha,
             }
 
-            cols = ["time", "time_abs", "ax", "ay", "az"]
+            cols = ["time", "time_abs", "ax", "ay", "az", "speed_mps"]
             if has_gyro:
                 cols += ["gx", "gy", "gz"]
             cols += ["ax_corr", "ay_corr", "az_corr"]
