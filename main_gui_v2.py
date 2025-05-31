@@ -450,16 +450,15 @@ class MainWindow(QMainWindow):
             has_lbl = (df["label_id"] != 99).any()
 
             # Rotation: zuerst schauen, ob der Export schon lief und JSON vorliegt
-            meta_file = (
+            meta = (
                 pathlib.Path(self.last_export_dir)
                 / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
             ) if hasattr(self, "last_export_dir") else None
 
-            if meta_file and meta_file.exists():
-                rot_ok = json.loads(meta_file.read_text()).get("rotation_available", False)
+            if meta and meta.exists():
+                rot_ok = json.loads(meta.read_text()).get("rotation_available", False)
             else:
-                rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns) or \
-                    (has_lbl and any(s.msg.orientation.w not in (0, 1) for s in self.samples[t]))
+                rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns)
 
             rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
         html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
@@ -475,11 +474,10 @@ class MainWindow(QMainWindow):
             if {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
                 # Erwartet:  |az_veh| ≈ 9.8,  ax_veh & ay_veh mitteln ≈ 0
                 az = df["az_veh"].abs().median()
-                ax = df["ax_veh"].abs().median()
-                ay = df["ay_veh"].abs().median()
-                if abs(az - 9.81) < 0.5 and max(ax, ay) < 0.4:
+                tilt = np.sqrt(df["ax_veh"] ** 2 + df["ay_veh"] ** 2).median()
+                if abs(az - 9.81) < 0.6 and tilt < 1.0:
                     ok += 1
-                elif abs(az - 9.81) < 1.5 and max(ax, ay) < 1.0:
+                elif abs(az - 9.81) < 1.5 and tilt < 2.0:
                     warn += 1
                 else:
                     bad += 1

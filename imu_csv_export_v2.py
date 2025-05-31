@@ -9,6 +9,12 @@ from scipy.spatial.transform import Rotation as R
 from scipy.signal import butter, filtfilt
 
 
+def lowpass(data: np.ndarray, fs: float, fc: float = 2.0) -> np.ndarray:
+    """Simple 2nd order Butterworth low-pass filter."""
+    b, a = butter(2, fc / (0.5 * fs))
+    return filtfilt(b, a, data, axis=0)
+
+
 def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
     """Return minimal rotation matrix mapping ``v1`` to ``v2``.
 
@@ -147,7 +153,10 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
 
     # --- Z-axis via gravity vector -------------------------------------
     if {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
-        g_sens = -df[["ax_corr", "ay_corr", "az_corr"]].mean().to_numpy()
+        # robust: Median in Stationärsegment suchen
+        mag = np.linalg.norm(df[["ax_corr", "ay_corr", "az_corr"]].to_numpy(), axis=1)
+        stat = np.abs(mag - 9.81) < 0.05
+        g_sens = -df.loc[stat, ["ax_corr", "ay_corr", "az_corr"]].median().to_numpy()
     else:
         return None
     if np.linalg.norm(g_sens) < 1:
@@ -246,7 +255,12 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 acc_corr = df[["ax", "ay", "az"]].to_numpy() - bias_vec
                 comp_type = "static_bias"
 
-            work["ax_corr"], work["ay_corr"], work["az_corr"] = acc_corr.T
+            if len(work["time"]) > 1:
+                fs = 1.0 / np.median(np.diff(work["time"]))
+            else:
+                fs = 0.0
+            smooth = lowpass(acc_corr, fs) if fs > 0 else acc_corr
+            work["ax_corr"], work["ay_corr"], work["az_corr"] = smooth.T
 
             # Rotation & Beschleunigung transformieren
             rot_mat = auto_vehicle_frame(work, gps_df)
