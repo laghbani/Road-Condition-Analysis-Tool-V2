@@ -424,7 +424,9 @@ class MainWindow(QMainWindow):
         for t, df in self.dfs.items():
             has_lbl = (df["label_id"] != 99).any()
             rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns)
-            rows.append((t, "✔" if has_lbl else "–", "ok" if rot_ok else "∅"))
+            rows.append((t,
+                         "✔" if has_lbl else "—",
+                         "✔" if rot_ok  else "—"))
         html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
         for r in rows:
             html += f"<tr><td>{r[0]}</td><td align=center>{r[1]}</td>" \

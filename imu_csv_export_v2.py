@@ -23,8 +23,9 @@ def sha1_of_file(path: Path) -> str:
 
 
 def detect_fsr(abs_a: np.ndarray) -> float:
-    vmax = np.percentile(abs_a, 99.5)  # robust gegen Ausreißer
-    return FSR_2G if vmax < 0.5 * FSR_8G else FSR_8G  # < ~40 m/s² → 2 g, sonst 8 g
+    """Heuristik:  ±2 g ↔ Werte < 22 m/s², sonst ±8 g."""
+    vmax = np.nanpercentile(abs_a, 99.9)        # robuster als .5-Perzentil
+    return FSR_2G if vmax < 22.0 else FSR_8G
 
 
 def find_stationary_bias(df: pd.DataFrame,
@@ -141,7 +142,15 @@ def auto_vehicle_frame(df: pd.DataFrame,
 
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     bag_root = Path(self.bag_path)
-    dest = bag_root.parent
+    from PySide6.QtWidgets import QFileDialog
+    folder = QFileDialog.getExistingDirectory(
+        self,
+        "Ziel-Ordner für CSV/JSON wählen",
+        str(Path(self.bag_path).parent),
+    )
+    if not folder:          # Dialog abgebrochen
+        return
+    dest = Path(folder)
     exporter_sha = sha1_of_file(Path(__file__))
     for topic, df in self.dfs.items():
         if not (df["label_id"] != 99).any():
@@ -163,8 +172,9 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                     for s in samps
                 ]
             )
-            norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
-            has_quat = norm_ok.any()  # mind. EIN gültiger Quaternion-Eintrag
+            norm_ok  = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
+            var_ok   = np.ptp(ori, axis=0).max() > 1e-3           # bewegt sich etwas?
+            has_quat = norm_ok.any() and var_ok
             has_gyro = not np.allclose(gyro, 0.0)
 
             work = df.copy()
