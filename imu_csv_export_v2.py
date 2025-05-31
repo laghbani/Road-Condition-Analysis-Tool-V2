@@ -219,6 +219,36 @@ def z_axis_from_quat(q: np.ndarray) -> np.ndarray:
     return -R.from_quat(q).apply([0, 0, G_STD]).mean(axis=0)
 
 
+def rot_from_quat_absolute(q: np.ndarray) -> list | None:
+    """Sensor→Vehicle-Rotation nur aus dem Quaternion (keine Bewegung, kein GPS nötig).
+
+    Annahmen:
+      • z_vehicle = +z_world  (Up)
+      • x_vehicle zeigt nach vorne ≈ x_world, so gut es geht
+    """
+    if len(q) < 5:
+        return None
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    Rw_s = R.from_quat(q)
+
+    z_s = -Rw_s.apply([0, 0, G_STD]).mean(axis=0)
+    z_s /= np.linalg.norm(z_s)
+    R_z = rot_between(z_s, [0, 0, 1])
+
+    x_w = Rw_s.apply([1, 0, 0]).mean(axis=0)
+    x_w[:2] /= np.linalg.norm(x_w[:2])
+
+    cands = [R_z @ np.array(v) for v in ([1, 0, 0], [0, 1, 0], [-1, 0, 0], [0, -1, 0])]
+    dots = [np.dot(c[:2], x_w[:2]) for c in cands]
+    idx = int(np.argmax(np.abs(dots)))
+    x_s = cands[idx]
+    if dots[idx] < 0:
+        x_s = -x_s
+    y_s = np.cross([0, 0, 1], x_s)
+    y_s /= np.linalg.norm(y_s)
+    return np.round(np.stack([x_s, y_s, [0, 0, 1]]).T @ R_z, 3).tolist()
+
+
 def rot_from_quat_static(q: np.ndarray,
                          gps_df: pd.DataFrame | None) -> list | None:
     z_sens = z_axis_from_quat(q)
@@ -390,16 +420,23 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
 
             # Rotation & Beschleunigung transformieren
             if comp_type == "quaternion":
-                if var_ok:
+                # immer zuerst der einfache, absolut-basierte Ansatz
+                rot_mat = rot_from_quat_absolute(ori[norm_ok])
+                # falls das fehlschlägt, Dynamic- bzw. GPS-Fallback
+                if rot_mat is None and var_ok:
                     rot_mat = rot_from_quat_dynamic(ori[norm_ok])
-                else:
+                if rot_mat is None:
                     rot_mat = rot_from_quat_static(ori[norm_ok], gps_df)
             else:
                 rot_mat = rot_from_gps(work, gps_df)
             rot_avail = bool(rot_mat)
             if rot_avail:
                 R = np.array(rot_mat)
-                veh = acc_corr @ R.T
+                # Für die Qualitätsprüfung wollen wir die Roh-Beschl. (inkl. g)
+                raw_fixed = df[["ax", "ay", "az"]].to_numpy() - (
+                    bias_vec if bias_vec is not None else 0
+                )
+                veh = raw_fixed @ R.T
                 work["ax_veh"], work["ay_veh"], work["az_veh"] = veh.T
 
             if has_gyro:
