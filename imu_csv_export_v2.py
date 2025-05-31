@@ -501,3 +501,10 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     from PyQt5.QtWidgets import QMessageBox
     QMessageBox.information(self, "Export fertig",
                             f"CSV + JSON liegen in:\n{dest}")
+
+    sel_topic = self.cmb_map.currentText()
+    rot_path = dest / f"{sel_topic.strip('/').replace('/', '__')}_{bag_root.stem}__imu_v1.json"
+    rot = None
+    if rot_path.exists():
+        rot = json.loads(rot_path.read_text()).get("vehicle_rot_mat")
+    self.map_widget.set_data(gps_df, rot)

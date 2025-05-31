@@ -21,6 +21,9 @@ import numpy as np
 import pandas as pd
 import json
 import os
+from pathlib import Path
+
+from map_widget import MapWidget
 
 # ---------------------------------------------------------------------------#
 # Matplotlib – robuster Style-Loader                                         #
@@ -72,6 +75,7 @@ try:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
+        QTabWidget,
     )
     from PyQt5.QtCore import Qt
 except ImportError:
@@ -79,6 +83,7 @@ except ImportError:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
+        QTabWidget,
     )
     from PySide6.QtCore import Qt
 
@@ -201,7 +206,18 @@ class MainWindow(QMainWindow):
 
         self.fig = Figure(constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
-        vbox.addWidget(self.canvas)
+
+        self.tabs = QTabWidget()
+        vbox.addWidget(self.tabs)
+
+        plot_page = QWidget()
+        plot_layout = QVBoxLayout(plot_page)
+        plot_layout.addWidget(self.canvas)
+        self.tabs.addTab(plot_page, "Plots")
+
+        self.map_widget = MapWidget()
+        self.tabs.addTab(self.map_widget, "Transformation-Hilfe")
+
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
 
         hl = QHBoxLayout()
@@ -211,6 +227,9 @@ class MainWindow(QMainWindow):
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
+        hl.addWidget(QLabel("Karten-Topic:"))
+        self.cmb_map = QComboBox()
+        hl.addWidget(self.cmb_map)
         hl.addStretch()
 
         # Umschalter: Sensor- vs. Vehicle-Frame
@@ -218,6 +237,8 @@ class MainWindow(QMainWindow):
         self.chk_veh.setEnabled(False)        # erst nach Bag-Laden
         self.chk_veh.stateChanged.connect(lambda _: self._draw_plots())
         hl.addWidget(self.chk_veh)
+        self.cmb_map.currentTextChanged.connect(
+            lambda _: self._update_map_from_selection())
 
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
@@ -312,6 +333,10 @@ class MainWindow(QMainWindow):
         self._build_dfs()
         self._set_defaults()
         self._draw_plots()
+
+        self.cmb_map.clear()
+        self.cmb_map.addItems(sorted(self.samples))
+        self._update_map_from_selection()
 
         self.act_topics.setEnabled(True)
         self.act_verify.setEnabled(True)
@@ -443,6 +468,26 @@ class MainWindow(QMainWindow):
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
         self.canvas.draw_idle()
 
+    def _update_map_from_selection(self) -> None:
+        sel_topic = self.cmb_map.currentText()
+        if not sel_topic:
+            self.map_widget.set_data(self._gps_df, None)
+            return
+        bag_root = pathlib.Path(self.bag_path).stem if self.bag_path else ""
+        meta_path = None
+        if hasattr(self, "last_export_dir"):
+            meta_path = (
+                pathlib.Path(self.last_export_dir)
+                / f"{sel_topic.strip('/').replace('/', '__')}_{bag_root}__imu_v1.json"
+            )
+        rot = None
+        if meta_path and meta_path.exists():
+            try:
+                rot = json.loads(meta_path.read_text()).get("vehicle_rot_mat")
+            except Exception:
+                rot = None
+        self.map_widget.set_data(self._gps_df, rot)
+
     def _check_export_status(self):
         rows = []
         bagstem = pathlib.Path(self.bag_path).stem
@@ -468,7 +513,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Export Readiness", html)
 
     def _show_quality(self):
-        bad, warn, ok = 0, 0, 0
+        bad = 0
         bagstem = pathlib.Path(self.bag_path).stem
         for t, df in self.dfs.items():
             meta_path = None
@@ -477,32 +522,18 @@ class MainWindow(QMainWindow):
                     pathlib.Path(self.last_export_dir)
                     / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
                 )
-            rot_flag = None
-            if meta_path and meta_path.exists():
-                rot_flag = json.loads(meta_path.read_text()).get(
-                    "rotation_available", False)
-
+            meta = json.loads(meta_path.read_text()) if meta_path and meta_path.exists() else {}
+            rot_ok = meta.get("rotation_available", False)
+            if not rot_ok:
+                bad += 1
+                continue
             if {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
-                # Erwartet:  |az_veh| ≈ 9.8,  ax_veh & ay_veh mitteln ≈ 0
                 az = df["az_veh"].mean()
                 rms = np.sqrt((df["ax_veh"]**2 + df["ay_veh"]**2).mean())
-                if abs(az - 9.81) < 0.5 and rms < 0.5:
-                    ok += 1
-                elif abs(az - 9.81) < 1.5 and rms < 1.5:
-                    warn += 1
-                else:
+                if not (abs(az - 9.81) < 0.5 and rms < 0.5):
                     bad += 1
-            else:
-                if rot_flag is False:
-                    warn += 1
-                else:
-                    bad += 1
-        if ok and not bad and not warn:
-            col, txt = "green", "Alles plausibel ✔"
-        elif bad:
-            col, txt = "red", f"{bad} Topic(s) unplausibel ✖"
-        else:
-            col, txt = "orange", f"{warn} Topic(s) grenzwertig ⚠"
+        col = "red" if bad else "green"
+        txt = f"{bad} Topic(s) ohne Rotation ✖" if bad else "Alles plausibel ✔"
         QMessageBox.information(
             self, "Rotation-Qualität",
             f"<h2 style='color:{col}'>{txt}</h2>")
