@@ -301,7 +301,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 "sensor_fs_accel_g": round(fsr / G_STD, 3),
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
                 "g_compensation": comp_type,
-                "vehicle_rot_mat": rot_mat,
+                "vehicle_rot_mat": rot_mat.tolist() if rot_mat is not None else None,
                 "rotation_available": rot_avail,
                 "sampling_rate_hz": round(fs, 2),
                 "exporter_sha1": exporter_sha,
@@ -329,19 +329,36 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 f" RMS(|a_corr|) = {rms_corr:.2f}"
             )
 
-            meta_path.write_text(json.dumps(header, indent=2))
+            def _conv(o):
+                if isinstance(o, np.ndarray):
+                    return o.tolist()
+                raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+            meta_path.write_text(json.dumps(header, indent=2, default=_conv))
             out_df.to_csv(csv_path, index=False)
 
         except Exception as exc:
-            QMessageBox = getattr(__import__("PySide6.QtWidgets", fromlist=["QMessageBox"]), "QMessageBox", None)
-            if QMessageBox is None:
-                from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
+            try:
+                from PySide6.QtWidgets import QMessageBox
+            except Exception:
+                try:
+                    from PyQt5.QtWidgets import QMessageBox
+                except Exception:
+                    print(f"{topic}: {exc}")
+                    continue
+            QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", buttons=QMessageBox.Ok)
             continue
 
     if hasattr(self, "statusBar"):
         self.statusBar().showMessage(f"Export abgeschlossen → {dest}")
 
-    from PyQt5.QtWidgets import QMessageBox
+    try:
+        from PySide6.QtWidgets import QMessageBox
+    except Exception:
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+        except Exception:
+            print(f"CSV + JSON liegen in: {dest}")
+            return
     QMessageBox.information(self, "Export fertig",
                             f"CSV + JSON liegen in:\n{dest}")
