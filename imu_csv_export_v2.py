@@ -10,7 +10,7 @@ from scipy.signal import butter, filtfilt
 
 
 def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-    """Return minimal rotation matrix mapping ``v1`` to ``v2``.
+    """Return minimal rotation matrix mapping `v1 to v2.
 
     Both vectors must be non-zero and are normalized internally.
     """
@@ -26,7 +26,7 @@ def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
 
 
 def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
-    """Add ``speed_mps`` column to *work* derived from ``gps_df``."""
+    """Add `speed_mps column to *work* derived from gps_df."""
     if gps_df is None or len(gps_df) < 3:
         work["speed_mps"] = np.nan
         return work
@@ -114,6 +114,24 @@ def gravity_from_quat(df: pd.DataFrame) -> np.ndarray:
     return rots.inv().apply(g_world)
 
 
+def remove_gravity_lowpass(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate gravity via low-pass filter and remove it from acceleration."""
+    bias_vec = find_stationary_bias(df) or np.zeros(3)
+    acc_bias = df[["ax", "ay", "az"]].to_numpy() - bias_vec
+
+    dt = np.median(np.diff(df["time"]))
+    fs = 1.0 / dt if dt > 0 else 100.0
+    fc = 0.15
+    b, a = butter(2, fc / (0.5 * fs), "low")
+    g_est = filtfilt(b, a, acc_bias, axis=0)
+
+    scale = G_STD / np.median(np.linalg.norm(g_est, axis=1))
+    g_est *= scale
+
+    acc_corr = acc_bias - g_est
+    return acc_corr, g_est, bias_vec
+
+
 def get_sensor_model(bag_root: Path, topic: str) -> str:
     meta_path = bag_root / "metadata.yaml"
     if meta_path.exists():
@@ -141,16 +159,19 @@ def first_frame_id(samples: list) -> str:
 
 
 def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
-    """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``."""
+    """Calculate 3x3 rotation matrix sensor→vehicle or return `None."""
 
     # --- Z-axis via gravity vector -------------------------------------
-    if {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
-        g_sens = -df[["ax_corr", "ay_corr", "az_corr"]].mean().to_numpy()
+    if {"g_x", "g_y", "g_z"}.issubset(df.columns):
+        z_sens = df[["g_x", "g_y", "g_z"]].mean().to_numpy()
+    elif {"ax", "ay", "az"}.issubset(df.columns):
+        g_sens = df[["ax", "ay", "az"]].mean().to_numpy()
+        if np.linalg.norm(g_sens) < 1:
+            return None
+        z_sens = g_sens / np.linalg.norm(g_sens)
     else:
         return None
-    if np.linalg.norm(g_sens) < 1:
-        return None
-    z_sens = g_sens / np.linalg.norm(g_sens)
+    z_sens /= np.linalg.norm(z_sens)
     R_z = rot_between(z_sens, np.array([0, 0, 1]))
 
     # --- X-axis via GPS track ------------------------------------------
@@ -235,16 +256,15 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 g_vec = gravity_from_quat(
                     pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
                 acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
+                g_est = g_vec
                 bias_vec = None
                 comp_type = "quaternion"
             else:
-                bias_vec = find_stationary_bias(df)
-                if bias_vec is None:
-                    bias_vec = np.zeros(3)
-                acc_corr = df[["ax", "ay", "az"]].to_numpy() - bias_vec
-                comp_type = "static_bias"
+                acc_corr, g_est, bias_vec = remove_gravity_lowpass(df)
+                comp_type = "lowpass_bias"
 
             work["ax_corr"], work["ay_corr"], work["az_corr"] = acc_corr.T
+            work["g_x"], work["g_y"], work["g_z"] = g_est.T
 
             # Rotation & Beschleunigung transformieren
             rot_mat = auto_vehicle_frame(work, gps_df)
@@ -269,6 +289,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 fs = 0.0
 
             work = add_speed(work, gps_df)
+            self.dfs[topic] = work
 
             header = {
                 "file_format": "imu_v1",
@@ -287,7 +308,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             cols = ["time", "time_abs", "ax", "ay", "az", "speed_mps"]
             if has_gyro:
                 cols += ["gx", "gy", "gz"]
-            cols += ["ax_corr", "ay_corr", "az_corr"]
+            cols += ["ax_corr", "ay_corr", "az_corr", "g_x", "g_y", "g_z"]
             if rot_mat is not None:
                 cols += ["ax_veh", "ay_veh", "az_veh"]
             cols += ["|a|_raw", "|ω|_raw", "clipped_flag", "label_id", "label_name"]
@@ -297,6 +318,15 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             stem = f"{topic.strip('/').replace('/', '__')}_{bag_root.stem}__imu_v1"
             csv_path = dest / f"{stem}.csv"
             meta_path = dest / f"{stem}.json"
+
+            # --- DEBUG: prüfen, ob g sauber entfernt wurde -------------------
+            vec_mean = acc_corr.mean(axis=0)
+            rms_corr = np.sqrt((acc_corr ** 2).mean())
+            print(
+                f"[{topic}]  μ(ax_corr, ay_corr, az_corr) = {vec_mean.round(2)}  "
+                f" RMS(|a_corr|) = {rms_corr:.2f}"
+            )
+
             meta_path.write_text(json.dumps(header, indent=2))
             out_df.to_csv(csv_path, index=False)
 
