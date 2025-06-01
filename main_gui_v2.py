@@ -433,7 +433,15 @@ class MainWindow(QMainWindow):
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
-            ax.legend(loc="upper left", ncol=3, fontsize="x-small")
+            handles, labels = ax.get_legend_handles_labels()
+            seen = set(); unique = []
+            for h, l in zip(handles, labels):
+                if l not in seen:
+                    seen.add(l)
+                    unique.append((h, l))
+            if unique:
+                ax.legend(*zip(*unique), loc="upper left",
+                          ncol=3, fontsize="x-small", framealpha=.85)
             self.ax_topic[ax] = topic
 
             # Span-Selector

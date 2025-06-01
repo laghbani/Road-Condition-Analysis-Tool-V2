@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation as R
 from scipy.signal import butter, filtfilt
+from typing import Tuple
 
 
 def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
@@ -150,6 +151,36 @@ def gravity_from_quat(df: pd.DataFrame) -> np.ndarray:
     return rots.inv().apply(g_world)
 
 
+# -------- Hilfs-Wrapper ----------------------------------------------------
+def compensate_gravity(df: pd.DataFrame, ori: np.ndarray | None) \
+        -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Gravity compensation via quaternion or low-pass.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing ``ax``, ``ay`` and ``az`` columns.
+    ori : np.ndarray | None
+        ``N×4`` array of quaternions (x, y, z, w). If ``None`` the low-pass
+        approach is used.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, str]
+        ``(acc_corr, g_vec, bias_vec, comp_type)`` where ``acc_corr`` is the
+        gravity compensated acceleration, ``g_vec`` is the estimated gravity per
+        sample, ``bias_vec`` is the bias vector used (or ``None``) and
+        ``comp_type`` denotes the method used.
+    """
+    if ori is not None:
+        g_vec = gravity_from_quat(
+            pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
+        return df[["ax", "ay", "az"]].to_numpy() - g_vec, g_vec, None, "quaternion"
+
+    acc_corr, g_est, bias_vec = remove_gravity_lowpass(df)
+    return acc_corr, g_est, bias_vec, "lowpass_bias"
+
+
 def get_sensor_model(bag_root: Path, topic: str) -> str:
     meta_path = bag_root / "metadata.yaml"
     if meta_path.exists():
@@ -269,30 +300,11 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             fsr = detect_fsr(abs_a)
             clipped = (df[["ax", "ay", "az"]].abs() >= 0.98 * fsr).any(axis=1)
 
-            if has_quat:
-                g_vec = gravity_from_quat(
-                    pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
-                acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
-                bias_vec = None
-                comp_type = "quaternion"
-            else:
-                bias_vec = find_stationary_bias(df)
-                if bias_vec is None:
-                    bias_vec = np.zeros(3)
-                acc_bias = df[["ax", "ay", "az"]].to_numpy() - bias_vec
+            ori_for_g = ori if has_quat else None
+            acc_corr, g_vec, bias_vec, comp_type = compensate_gravity(df, ori_for_g)
 
-                # --- LOW-PASS → Gravitation schätzen -----------------------
-                dt = np.median(np.diff(df["time"]))
-                fs = 1.0 / dt if dt > 0 else 100.0
-                from scipy.signal import butter, filtfilt
-                fc = 0.3  # Cut-off 0.3 Hz ≈ 5 s
-                b, a = butter(2, fc / (0.5 * fs), btype="low")
-                g_est = filtfilt(b, a, acc_bias, axis=0)
-
-                acc_corr = acc_bias - g_est
-                comp_type = "lowpass_bias"
-
-            work["ax_corr"], work["ay_corr"], work["az_corr"] = acc_corr.T
+            work[["ax_corr", "ay_corr", "az_corr"]] = acc_corr
+            work[["g_x", "g_y", "g_z"]] = g_vec
 
             # Rotation & Beschleunigung transformieren
             rot_mat = auto_vehicle_frame(work, gps_df)
