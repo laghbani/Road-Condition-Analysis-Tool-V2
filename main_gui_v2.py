@@ -362,6 +362,10 @@ class MainWindow(QMainWindow):
             ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
             ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
             ax.plot(df["time"], df["az"], label="az", color="tab:green")
+            if "ax_corr" in df.columns:
+                ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.3, ls="--")
+                ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.3, ls="--")
+                ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.3, ls="--")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")

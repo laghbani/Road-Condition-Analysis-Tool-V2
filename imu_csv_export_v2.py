@@ -238,11 +238,19 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 bias_vec = None
                 comp_type = "quaternion"
             else:
-                bias_vec = find_stationary_bias(df)
-                if bias_vec is None:
-                    bias_vec = np.zeros(3)
-                acc_corr = df[["ax", "ay", "az"]].to_numpy() - bias_vec
-                comp_type = "static_bias"
+                bias_vec = find_stationary_bias(df) or np.zeros(3)
+                acc_bias = df[["ax", "ay", "az"]].to_numpy() - bias_vec
+
+                # --- LOW-PASS → Gravitation schätzen -----------------------
+                dt = np.median(np.diff(df["time"]))
+                fs = 1.0 / dt if dt > 0 else 100.0
+                from scipy.signal import butter, filtfilt
+                fc = 0.3  # Cut-off 0.3 Hz ≈ 5 s
+                b, a = butter(2, fc / (0.5 * fs), btype="low")
+                g_est = filtfilt(b, a, acc_bias, axis=0)
+
+                acc_corr = acc_bias - g_est
+                comp_type = "lowpass_bias"
 
             work["ax_corr"], work["ay_corr"], work["az_corr"] = acc_corr.T
 
@@ -297,6 +305,14 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             stem = f"{topic.strip('/').replace('/', '__')}_{bag_root.stem}__imu_v1"
             csv_path = dest / f"{stem}.csv"
             meta_path = dest / f"{stem}.json"
+
+            # --- DEBUG: prüfen, ob g sauber entfernt wurde -------------------
+            abs_a_corr = np.linalg.norm(acc_corr, axis=1)
+            print(
+                f"[{topic}]  |a|_raw μ={abs_a.mean():.2f}  σ={abs_a.std():.2f}  "
+                f"|a|_corr μ={abs_a_corr.mean():.2f}  σ={abs_a_corr.std():.2f}"
+            )
+
             meta_path.write_text(json.dumps(header, indent=2))
             out_df.to_csv(csv_path, index=False)
 
