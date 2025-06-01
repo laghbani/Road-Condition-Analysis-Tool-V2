@@ -45,7 +45,9 @@ def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (np.linalg.norm(v) ** 2))
 
 
-def rot_from_gps(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
+def rot_from_gps(df: pd.DataFrame, gps_df: pd.DataFrame | None, cfg=None) -> list | None:
+    if cfg is None:
+        cfg = {"fc": 5.0, "win_pca": 10, "var_thr": 0.02}
     """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``.
 
     This GPS-based approach is used as fallback when no reliable orientation
@@ -61,7 +63,7 @@ def rot_from_gps(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
     # Kandidaten: Fenster mit kleiner Varianz UND Betrag nahe g
     w = 200                         # ~2 s bei 100 Hz
     var = pd.Series(mag).rolling(w, center=True).var().to_numpy()
-    cand = (var < 0.02) & (np.abs(mag - 9.81) < 0.2)
+    cand = (var < cfg["var_thr"]) & (np.abs(mag - 9.81) < 0.2)
     if not cand.any():
         return None                 # kein Ruhesegment → lieber abbrechen
     g_sens = -a[cand].mean(axis=0)
@@ -78,7 +80,7 @@ def rot_from_gps(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
     dx = np.diff(lon) * np.cos(lat[:-1])
     dy = np.diff(lat)
     # 5-s-Fenster mitteln → weniger Zick-Zack
-    win = max(3, int(5 / np.median(np.diff(gps_df["time"]))))
+    win = max(3, int(cfg["win_pca"] / np.median(np.diff(gps_df["time"]))))
     vx = pd.Series(dx).rolling(win).mean().dropna().to_numpy()
     vy = pd.Series(dy).rolling(win).mean().dropna().to_numpy()
     if len(vx) < 20:
@@ -205,11 +207,15 @@ def rot_from_quat_dynamic(q: np.ndarray) -> list | None:
 # ---------------------------------------------------------------- Hauptroutine
 def estimate_vehicle_rot(df: pd.DataFrame,
                          ori_q: np.ndarray,
-                         gps_df: pd.DataFrame | None):
+                         gps_df: pd.DataFrame | None,
+                         cfg: dict | None = None):
     """
     Liefert (R_sv | None, method:str, g_comp:str, meta:dict)
     meta = {"score":0-100, "az_mean":…, "rms_xy":…}
     """
+    if cfg is None:
+        cfg = {"fc": 5.0, "win_pca": 10, "var_thr": 0.02}
+
     if len(df) < 3:
         return None, "", "", {"score": 0, "az_mean": np.nan, "rms_xy": np.nan}
 
@@ -225,7 +231,7 @@ def estimate_vehicle_rot(df: pd.DataFrame,
         g_comp  = "static_bias"
 
     fs = 1 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
-    df[["ax_corr", "ay_corr", "az_corr"]] = _lowpass(acc_corr, fs) if fs else acc_corr
+    df[["ax_corr", "ay_corr", "az_corr"]] = _lowpass(acc_corr, fs, fc=cfg["fc"]) if fs else acc_corr
 
     # 2) Rotation ---------------------------------------------------------
     method = ""
@@ -237,7 +243,7 @@ def estimate_vehicle_rot(df: pd.DataFrame,
         if R_sv is None:
             R_sv = rot_from_quat_static(ori_q, gps_df); method = "quat_gps"
     if R_sv is None:
-        R_sv = rot_from_gps(df, gps_df);         method = "gps_only"
+        R_sv = rot_from_gps(df, gps_df, cfg);    method = "gps_only"
 
     # 3) Score ------------------------------------------------------------
     if R_sv is not None:
