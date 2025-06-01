@@ -89,7 +89,12 @@ try:
     from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
     from rclpy.serialization import deserialize_message
     from sensor_msgs.msg import Imu, NavSatFix
-    from imu_csv_export_v2 import export_csv_smart_v2
+    from imu_csv_export_v2 import (
+        export_csv_smart_v2,
+        remove_gravity_lowpass,
+        auto_vehicle_frame,
+        gravity_from_quat,
+    )
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -253,6 +258,11 @@ class MainWindow(QMainWindow):
         self.act_show_corr.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_corr)
 
+        self.act_show_veh = QAction("Show vehicle-frame acceleration", self, checkable=True)
+        self.act_show_veh.setChecked(False)
+        self.act_show_veh.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_veh)
+
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
         act_check.triggered.connect(self._check_export_status)
@@ -309,6 +319,7 @@ class MainWindow(QMainWindow):
         self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
 
         self._build_dfs()
+        self._preprocess_all()
         self._set_defaults()
         self._draw_plots()
 
@@ -335,6 +346,39 @@ class MainWindow(QMainWindow):
                 "label_name": [UNKNOWN_NAME] * len(tr),
             })
             self.dfs[t] = df
+
+    # ------------------------------------------------------------------ Preprocess
+    def _preprocess_all(self) -> None:
+        for topic, df in self.dfs.items():
+            samps = self.samples[topic]
+
+            # --- Prüfen, ob Quaternionen verwertbar ---------------------------
+            ori = np.array([[s.msg.orientation.x, s.msg.orientation.y,
+                            s.msg.orientation.z, s.msg.orientation.w]
+                            for s in samps])
+            norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
+            var_ok  = np.ptp(ori, axis=0).max() > 1e-3
+            has_quat = bool(norm_ok.any() and var_ok)
+
+            # --- g-Kompensation ----------------------------------------------
+            if has_quat:
+                g_vec = gravity_from_quat(
+                    pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"])
+                )
+                acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
+                g_est = g_vec
+            else:
+                acc_corr, g_est, _ = remove_gravity_lowpass(df)
+
+            df[["ax_corr", "ay_corr", "az_corr"]] = acc_corr
+            df[["g_x", "g_y", "g_z"]] = g_est
+
+            # --- Fahrzeug-Rahmen ---------------------------------------------
+            rot = auto_vehicle_frame(df, self._gps_df)
+            if rot:
+                R = np.array(rot)
+                veh = acc_corr @ R.T
+                df[["ax_veh", "ay_veh", "az_veh"]] = veh
 
     # ------------------------------------------------------------------ Defaults
     def _set_defaults(self) -> None:
@@ -374,13 +418,19 @@ class MainWindow(QMainWindow):
                 ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
                 ax.plot(df["time"], df["az"], label="az", color="tab:green")
             if self.act_show_corr.isChecked() and "ax_corr" in df.columns:
-                ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.3, ls="--")
-                ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.3, ls="--")
-                ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.3, ls="--")
+                ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.8, ls="--")
+                ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.8, ls="--")
+                ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.8, ls="--")
+            if self.act_show_veh.isChecked() and {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
+                ax.plot(df["time"], df["ax_veh"], label="ax_veh", color="tab:blue", alpha=0.6, ls=":")
+                ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
+                ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
-            ax.legend(loc="upper right")
+            h, l = ax.get_legend_handles_labels()
+            uniq = dict(zip(l, h))
+            ax.legend(uniq.values(), uniq.keys(), loc="upper right")
             self.ax_topic[ax] = topic
 
             # Span-Selector
@@ -489,4 +539,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
