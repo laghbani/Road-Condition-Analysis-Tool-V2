@@ -269,10 +269,10 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work["g_x"], work["g_y"], work["g_z"] = g_est.T
 
             # Rotation & Beschleunigung transformieren
-            rot_mat = auto_vehicle_frame(work, gps_df)
-            rot_avail = bool(rot_mat)
+            rot_mat = self._resolve_rotation(topic, work)
+            rot_avail = rot_mat is not None
             if rot_avail:
-                R = np.array(rot_mat)
+                R = np.asarray(rot_mat)
                 veh = acc_corr @ R.T
                 work["ax_veh"], work["ay_veh"], work["az_veh"] = veh.T
 
