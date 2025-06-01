@@ -243,6 +243,16 @@ class MainWindow(QMainWindow):
         self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
         m_view.addAction(self.act_verify)
 
+        self.act_show_raw = QAction("Show raw acceleration", self, checkable=True)
+        self.act_show_raw.setChecked(True)
+        self.act_show_raw.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_raw)
+
+        self.act_show_corr = QAction("Show g-corrected acceleration", self, checkable=True)
+        self.act_show_corr.setChecked(True)
+        self.act_show_corr.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_corr)
+
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
         act_check.triggered.connect(self._check_export_status)
@@ -359,10 +369,11 @@ class MainWindow(QMainWindow):
             row = i * (2 if verify else 1)
             ax = self.fig.add_subplot(gs[row])
             ax.set_title(f"{topic} – Linear Acc.")
-            ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
-            ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
-            ax.plot(df["time"], df["az"], label="az", color="tab:green")
-            if "ax_corr" in df.columns:
+            if self.act_show_raw.isChecked():
+                ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
+                ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
+                ax.plot(df["time"], df["az"], label="az", color="tab:green")
+            if self.act_show_corr.isChecked() and "ax_corr" in df.columns:
                 ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.3, ls="--")
                 ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.3, ls="--")
                 ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.3, ls="--")
