@@ -419,19 +419,10 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work["ax_corr"], work["ay_corr"], work["az_corr"] = smooth.T
 
             # Rotation & Beschleunigung transformieren
-            if comp_type == "quaternion":
-                # immer zuerst der einfache, absolut-basierte Ansatz
-                rot_mat = rot_from_quat_absolute(ori[norm_ok])
-                # falls das fehlschlägt, Dynamic- bzw. GPS-Fallback
-                if rot_mat is None and var_ok:
-                    rot_mat = rot_from_quat_dynamic(ori[norm_ok])
-                if rot_mat is None:
-                    rot_mat = rot_from_quat_static(ori[norm_ok], gps_df)
-            else:
-                rot_mat = rot_from_gps(work, gps_df)
-            rot_avail = bool(rot_mat)
+            rot_mat, rot_method, _, _ = estimate_vehicle_rot(work, ori, gps_df)
+            rot_avail = rot_mat is not None
             if rot_avail:
-                rot_mat_np = np.array(rot_mat)           # no shadowing
+                rot_mat_np = np.array(rot_mat)
                 # Roh-Beschleunigung (inkl. g) – Bias abziehen falls nötig
                 raw_fixed = df[["ax", "ay", "az"]].to_numpy() - (
                     bias_vec if bias_vec is not None else 0
@@ -460,6 +451,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 "coordinate_frame": first_frame_id(samps),
                 "sensor_fs_accel_g": round(fsr / G_STD, 3),
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
+                "rotation_method": rot_method,
                 "g_compensation": comp_type,
                 "vehicle_rot_mat": rot_mat,
                 "rotation_available": rot_avail,

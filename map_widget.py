@@ -48,8 +48,8 @@ class MapWidget(QWebEngineView):
             ).add_to(self._map)
 
             # --- Länge der Pfeile auf der Karte (Meter) ---
-            L_FWD = 30
-            L_LEFT = 15
+            L_FWD = 10  # Meter
+            L_LEFT = 5   # Meter
 
             # ► Endpunkte berechnen
             pt_fwd = geodesic(meters=L_FWD).destination((lat0, lon0), heading_deg)

@@ -189,7 +189,7 @@ class MainWindow(QMainWindow):
         self.dfs: dict[str, pd.DataFrame] = {}
         self.t0: float | None = None
         self._gps_df: pd.DataFrame | None = None
-        self.rot_info: dict[str, dict[str, object]] = {}
+        self.rot_info: dict[str, dict] = {}
 
         # Runtime-State
         self.active_topics: list[str] = []
@@ -337,21 +337,15 @@ class MainWindow(QMainWindow):
         # --- Rotation sofort abschätzen ---
         self.rot_info.clear()
         for topic, df in self.dfs.items():
-            samps = self.samples[topic]
-            ori = np.array([
+            quat = np.array([
                 [s.msg.orientation.x, s.msg.orientation.y,
                  s.msg.orientation.z, s.msg.orientation.w]
-                for s in samps
+                for s in self.samples[topic]
             ])
-            rot, method, g_comp = estimate_vehicle_rot(df, ori, self._gps_df)
-            self.rot_info[topic] = {
-                "rot_mat": rot,
-                "rot_method": method,
-                "g_comp": g_comp,
-            }
-            if rot is not None:
-                raw = df[["ax", "ay", "az"]].to_numpy()
-                df[["ax_veh", "ay_veh", "az_veh"]] = raw @ np.array(rot).T
+            R_sv, meth, gcmp, meta = estimate_vehicle_rot(df, quat, self._gps_df)
+            self.rot_info[topic] = {"R": R_sv, "meth": meth, "g": gcmp, **meta}
+            if R_sv is not None:
+                df[["ax_veh","ay_veh","az_veh"]] = df[["ax","ay","az"]].to_numpy() @ np.array(R_sv).T
 
         self._set_defaults()
         self._draw_plots()
@@ -495,79 +489,30 @@ class MainWindow(QMainWindow):
         if not sel_topic:
             self.map_widget.set_data(self._gps_df, None)
             return
-        rot = self.rot_info.get(sel_topic, {}).get("rot_mat")
-        if rot is None and hasattr(self, "last_export_dir"):
-            bag_root = pathlib.Path(self.bag_path).stem if self.bag_path else ""
-            meta_path = (
-                pathlib.Path(self.last_export_dir)
-                / f"{sel_topic.strip('/').replace('/', '__')}_{bag_root}__imu_v1.json"
-            )
-            if meta_path.exists():
-                try:
-                    rot = json.loads(meta_path.read_text()).get("vehicle_rot_mat")
-                except Exception:
-                    rot = None
-        self.map_widget.set_data(self._gps_df, rot)
+        R = self.rot_info.get(sel_topic, {}).get("R")
+        self.map_widget.set_data(self._gps_df, R)
 
     def _check_export_status(self):
-        rows = []
-        bagstem = pathlib.Path(self.bag_path).stem
+        html = ("<table><tr><th>Topic</th><th>Labeled?</th>"
+                "<th>Rot?</th><th>Method</th><th>g-comp</th></tr>")
         for t, df in self.dfs.items():
-            has_lbl = (df["label_id"] != 99).any()
-
-            info = self.rot_info.get(t, {})
-            rot_ok = info.get("rot_mat") is not None
-            if not rot_ok and hasattr(self, "last_export_dir"):
-                meta = (
-                    pathlib.Path(self.last_export_dir)
-                    / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
-                )
-                if meta.exists():
-                    try:
-                        rot_ok = json.loads(meta.read_text()).get(
-                            "rotation_available", False
-                        )
-                    except Exception:
-                        rot_ok = False
-
-            meth = info.get("rot_method", "—")
-            gcmp = info.get("g_comp", "—")
-
-            rows.append(
-                (t, "✔" if has_lbl else "—", "✔" if rot_ok else "—", meth, gcmp)
-            )
-
-        html = (
-            "<table><tr><th>Topic</th><th>Labeled?</th>"
-            "<th>Rotation</th><th>Method</th><th>g-comp</th></tr>"
-        )
-        for t, lab, rot, meth, gcmp in rows:
-            html += (
-                f"<tr><td>{t}</td><td align=center>{lab}</td>"
-                f"<td align=center>{rot}</td><td>{meth}</td><td>{gcmp}</td></tr>"
-            )
+            r = self.rot_info.get(t, {})
+            lab = "✔" if (df["label_id"]!=99).any() else "—"
+            rot = "✔" if r.get("R") is not None else "—"
+            html += (f"<tr><td>{t}</td><td align=center>{lab}</td>"
+                     f"<td align=center>{rot}</td><td>{r.get('meth','—')}</td>"
+                     f"<td>{r.get('g','—')}</td></tr>")
         html += "</table>"
         QMessageBox.information(self, "Export Readiness", html)
 
     def _show_quality(self):
-        html = (
-            "<table><tr><th>Topic</th><th>|az| mean</th>"
-            "<th>rms(ax,ay)</th><th>OK?</th></tr>"
-        )
-        for t, df in self.dfs.items():
-            info = self.rot_info.get(t, {})
-            if info.get("rot_mat") is None:
-                html += f"<tr><td>{t}</td><td colspan=3><b>no rotation</b></td></tr>"
-                continue
-            az = df["az_veh"].mean()
-            rms = np.sqrt((df["ax_veh"]**2 + df["ay_veh"]**2).mean())
-            ok = abs(az - 9.81) < 0.5 and rms < 0.5
-            col = "#27ae60" if ok else "#c0392b"
-            html += (
-                f"<tr><td>{t}</td><td>{az:5.2f}</td>"
-                f"<td>{rms:4.2f}</td>"
-                f"<td style='color:{col}'>{'✔' if ok else '✖'}</td></tr>"
-            )
+        html = "<table><tr><th>Topic</th><th>score</th><th>|az|</th><th>rms</th></tr>"
+        for t,r in self.rot_info.items():
+            if r.get("R") is None:
+                html += f"<tr><td>{t}</td><td colspan=3>no rotation</td></tr>"; continue
+            col = "#27ae60" if r['score']>80 else "#e67e22" if r['score']>50 else "#c0392b"
+            html += (f"<tr><td>{t}</td><td style='color:{col}'>{r['score']}</td>"
+                     f"<td>{r['az_mean']}</td><td>{r['rms_xy']}</td></tr>")
         html += "</table>"
         QMessageBox.information(self, "Rotation-Qualität", html)
 
