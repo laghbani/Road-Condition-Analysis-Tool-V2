@@ -19,7 +19,6 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import json
 import os
 
 # ---------------------------------------------------------------------------#
@@ -207,6 +206,12 @@ class MainWindow(QMainWindow):
         self.fig = Figure(constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
         vbox.addWidget(self.canvas)
+        # optional: navigation toolbar for easier zoom/pan
+        try:
+            nav = _plt.NavigationToolbar2QT(self.canvas, self)
+            vbox.addWidget(nav)
+        except Exception:
+            pass
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
 
         hl = QHBoxLayout()
@@ -243,6 +248,25 @@ class MainWindow(QMainWindow):
         m_imu.addAction(self.act_topics)
 
         m_view = mb.addMenu("&View")
+        self.act_show_raw = QAction("Show raw acceleration", self, checkable=True)
+        self.act_show_raw.setChecked(True)
+        self.act_show_raw.setShortcut("R")
+        self.act_show_raw.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_raw)
+
+        self.act_show_corr = QAction("Show g-corrected", self, checkable=True)
+        self.act_show_corr.setChecked(True)
+        self.act_show_corr.setShortcut("C")
+        self.act_show_corr.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_corr)
+
+        self.act_show_veh = QAction("Show vehicle frame", self, checkable=True)
+        self.act_show_veh.setChecked(False)
+        self.act_show_veh.setShortcut("V")
+        self.act_show_veh.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_veh)
+
+        m_view.addSeparator()
         self.act_verify = QAction("Verify your labeling", self)
         self.act_verify.setEnabled(False)
         self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
@@ -394,17 +418,22 @@ class MainWindow(QMainWindow):
             row = i * (2 if verify else 1)
             ax = self.fig.add_subplot(gs[row])
             ax.set_title(f"{topic} – Linear Acc.")
-            ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
-            ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
-            ax.plot(df["time"], df["az"], label="az", color="tab:green")
-            if "ax_corr" in df.columns:
+            if self.act_show_raw.isChecked():
+                ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
+                ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
+                ax.plot(df["time"], df["az"], label="az", color="tab:green")
+            if self.act_show_corr.isChecked() and {"ax_corr"}.issubset(df):
                 ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.3, ls="--")
                 ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.3, ls="--")
                 ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.3, ls="--")
+            if self.act_show_veh.isChecked() and {"ax_veh"}.issubset(df):
+                ax.plot(df["time"], df["ax_veh"], label="ax_veh", color="tab:purple", alpha=0.6, ls=":")
+                ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:brown", alpha=0.6, ls=":")
+                ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:pink", alpha=0.6, ls=":")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
-            ax.legend(loc="upper right")
+            ax.legend(loc="upper left", ncol=3, fontsize="x-small")
             self.ax_topic[ax] = topic
 
             # Span-Selector
@@ -461,28 +490,21 @@ class MainWindow(QMainWindow):
         ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
-        ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
+        ax.legend(uniq.values(), uniq.keys(), loc="upper left", ncol=3, fontsize="x-small")
         self.canvas.draw_idle()
+        # refresh export status after labeling
+        self._check_export_status()
 
     def _check_export_status(self):
         rows = []
-        bagstem = pathlib.Path(self.bag_path).stem
         for t, df in self.dfs.items():
             has_lbl = (df["label_id"] != 99).any()
 
-            # Rotation: zuerst schauen, ob der Export schon lief und JSON vorliegt
-            meta_file = (
-                pathlib.Path(self.last_export_dir)
-                / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
-            ) if hasattr(self, "last_export_dir") else None
+            rot_ok = {"ax_corr", "ay_corr", "az_corr",
+                      "ax_veh", "ay_veh", "az_veh"}.issubset(df.columns)
 
-            if meta_file and meta_file.exists():
-                rot_ok = json.loads(meta_file.read_text()).get("rotation_available", False)
-            else:
-                rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns) or \
-                    (has_lbl and any(s.msg.orientation.w not in (0, 1) for s in self.samples[t]))
-
-            rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
+            rows.append((t, "✔" if has_lbl else "—",
+                         "✔" if rot_ok else "—"))
         html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
         for r in rows:
             html += f"<tr><td>{r[0]}</td><td align=center>{r[1]}</td>" \
