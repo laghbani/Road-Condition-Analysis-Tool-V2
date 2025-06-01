@@ -13,16 +13,25 @@ from imu_csv_export_v2 import (
 )
 
 
-def estimate_vehicle_rot(df: pd.DataFrame, ori_quat: np.ndarray, gps_df: pd.DataFrame | None):
-    """Estimate sensor→vehicle rotation matrix.
+def estimate_vehicle_rot(
+    df: pd.DataFrame, ori_quat: np.ndarray, gps_df: pd.DataFrame | None
+) -> tuple[list | None, str, str]:
+    """Estimate sensor→vehicle rotation matrix and metadata.
 
     This mirrors the logic used during CSV export but omits any
     file-writing side effects. ``df`` is modified in-place to add the
     ``ax_corr``, ``ay_corr`` and ``az_corr`` columns required by the
     rotation helpers.
+
+    Returns
+    -------
+    tuple
+        ``(rot_mat, method, g_comp)`` where ``rot_mat`` is the 3×3 rotation
+        matrix or ``None``, ``method`` describes the algorithm used and
+        ``g_comp`` indicates the type of gravity compensation.
     """
     if len(df) == 0 or len(ori_quat) != len(df):
-        return None
+        return None, "", ""
 
     norm_ok = np.abs(np.linalg.norm(ori_quat, axis=1) - 1.0) < 0.05
     has_quat = bool(norm_ok.any())
@@ -53,13 +62,18 @@ def estimate_vehicle_rot(df: pd.DataFrame, ori_quat: np.ndarray, gps_df: pd.Data
     smooth = lowpass(acc_corr, fs) if fs > 0 else acc_corr
     df[["ax_corr", "ay_corr", "az_corr"]] = smooth
 
+    method = ""
     if comp_type == "quaternion":
         rot_mat = rot_from_quat_absolute(ori_quat[norm_ok]) if norm_ok.any() else None
+        method = "quat_abs"
         if rot_mat is None and var_ok:
             rot_mat = rot_from_quat_dynamic(ori_quat[norm_ok])
+            method = "quat_dyn"
         if rot_mat is None:
             rot_mat = rot_from_quat_static(ori_quat[norm_ok], gps_df)
+            method = "quat_gps"
     else:
         rot_mat = rot_from_gps(df, gps_df)
+        method = "gps_only"
 
-    return rot_mat
+    return rot_mat, method, comp_type
