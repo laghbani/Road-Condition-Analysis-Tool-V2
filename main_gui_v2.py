@@ -15,7 +15,8 @@ from __future__ import annotations
 import sys
 import pathlib
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, cast
+from enum import Enum, auto
 
 import numpy as np
 import pandas as pd
@@ -72,6 +73,8 @@ try:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
+        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+        QPushButton, QGroupBox, QRadioButton,
     )
     from PyQt5.QtCore import Qt
 except ImportError:
@@ -79,6 +82,8 @@ except ImportError:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
+        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+        QPushButton, QGroupBox, QRadioButton,
     )
     from PySide6.QtCore import Qt
 
@@ -98,6 +103,24 @@ try:
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
+
+# ===========================================================================
+# Rotation Modes & Default Overrides
+# ===========================================================================
+class RotMode(Enum):
+    OVERRIDE_FIRST = auto()
+    AUTO_FIRST = auto()
+    AUTO_ONLY = auto()
+
+# Default-Overrides (kann der User gleich im Dialog ändern)
+DEFAULT_OVERRIDES: dict[str, np.ndarray] = {
+    "/zed_right/zed_node/imu/data": np.array([[0, 1, 0],
+                                              [-1, 0, 0],
+                                              [0, 0, 1]], float),
+    "/zed_left/zed_node/imu/data": np.array([[0, -1, 0],
+                                             [1, 0, 0],
+                                             [0, 0, 1]], float),
+}
 
 # ===========================================================================
 # Label-Mapping
@@ -172,6 +195,128 @@ class TopicDialog(QDialog):
 
 
 # ===========================================================================
+# Mount-Dialog
+# ===========================================================================
+class MountDialog(QDialog):
+    """Dialog: Mounting-Override verwalten + Vorschau."""
+
+    def __init__(self, topics: list[str],
+                 overrides: dict[str, np.ndarray],
+                 mode: RotMode, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mounting Overrides")
+        self.resize(680, 520)
+
+        v = QVBoxLayout(self)
+
+        # Strategiewahl
+        grp_mode = QGroupBox("Anwendungs-Strategie")
+        rb1 = QRadioButton("Override ⟶ Auto (Override-first)")
+        rb2 = QRadioButton("Auto ⟶ Override (Auto-first)")
+        rb3 = QRadioButton("Nur Auto (Override deaktiviert)")
+        if mode is RotMode.OVERRIDE_FIRST:
+            rb1.setChecked(True)
+        elif mode is RotMode.AUTO_FIRST:
+            rb2.setChecked(True)
+        else:
+            rb3.setChecked(True)
+        hlm = QVBoxLayout(grp_mode)
+        hlm.addWidget(rb1)
+        hlm.addWidget(rb2)
+        hlm.addWidget(rb3)
+        v.addWidget(grp_mode)
+
+        # Topic-Tabelle
+        self.tbl = QTableWidget(len(topics), 5)
+        self.tbl.setHorizontalHeaderLabels([
+            "Topic", "Override aktiv", "Edit", "Ist-Achsen", "Neu-Achsen"
+        ])
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for row, t in enumerate(topics):
+            item = QTableWidgetItem(t)
+            item.setFlags(Qt.ItemIsEnabled)
+            self.tbl.setItem(row, 0, item)
+
+            chk = QCheckBox()
+            chk.setChecked(t in overrides)
+            self.tbl.setCellWidget(row, 1, chk)
+
+            btn = QPushButton("⚙")
+            btn.clicked.connect(lambda _=None, topic=t: self._edit_matrix(topic))
+            self.tbl.setCellWidget(row, 2, btn)
+
+            self.tbl.setCellWidget(row, 3, self._axes_widget(np.eye(3)))
+            R0 = overrides.get(t, np.eye(3))
+            self.tbl.setCellWidget(row, 4, self._axes_widget(R0))
+        v.addWidget(self.tbl)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        self.rb = (rb1, rb2, rb3)
+        self.topics = topics
+        self.overrides = overrides
+
+    @staticmethod
+    def _axes_widget(R: np.ndarray):
+        fig = Figure(figsize=(1.6, 1.6))
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_xlim([-1, 1])
+        ax.set_ylim([-1, 1])
+        ax.set_zlim([-1, 1])
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_zticks([])
+        origin = np.zeros((3, 1))
+        ax.quiver(*origin, *R[:, 0], color="r")
+        ax.quiver(*origin, *R[:, 1], color="g")
+        ax.quiver(*origin, *R[:, 2], color="b")
+        return canvas
+
+    def _edit_matrix(self, topic: str):
+        R0 = self.overrides.get(topic, np.eye(3))
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Override für {topic}")
+        l = QVBoxLayout(dlg)
+        tbl = QTableWidget(3, 3)
+        for i in range(3):
+            for j in range(3):
+                it = QTableWidgetItem(f"{R0[i, j]:.3f}")
+                tbl.setItem(i, j, it)
+        l.addWidget(tbl)
+        l.addWidget(QLabel("Einheit: Richtungskosinus"))
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        l.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        R_new = np.array([[float(tbl.item(i, j).text()) for j in range(3)] for i in range(3)])
+        self.overrides[topic] = R_new
+        self.tbl.setCellWidget(self._row_of(topic), 4, self._axes_widget(R_new))
+
+    def _row_of(self, topic):
+        return next(i for i, t in enumerate(self.topics) if t == topic)
+
+    def result(self):
+        if self.rb[0].isChecked():
+            mode = RotMode.OVERRIDE_FIRST
+        elif self.rb[1].isChecked():
+            mode = RotMode.AUTO_FIRST
+        else:
+            mode = RotMode.AUTO_ONLY
+
+        ov: dict[str, np.ndarray] = {}
+        for row, t in enumerate(self.topics):
+            if cast(QCheckBox, self.tbl.cellWidget(row, 1)).isChecked():
+                ov[t] = self.overrides.get(t, np.eye(3))
+        return mode, ov
+
+
+# ===========================================================================
 # Main-Window
 # ===========================================================================
 class MainWindow(QMainWindow):
@@ -194,6 +339,9 @@ class MainWindow(QMainWindow):
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
+
+        self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
+        self.rot_mode: RotMode = RotMode.AUTO_ONLY
 
         self._build_menu()
         self._build_ui()
@@ -241,6 +389,10 @@ class MainWindow(QMainWindow):
         self.act_topics.setEnabled(False)
         self.act_topics.triggered.connect(self._configure_topics)
         m_imu.addAction(self.act_topics)
+
+        act_mount = QAction("Mounting Overrides …", self)
+        act_mount.triggered.connect(self._open_mount_dialog)
+        m_imu.addAction(act_mount)
 
         m_view = mb.addMenu("&View")
         self.act_verify = QAction("Verify your labeling", self)
@@ -374,11 +526,21 @@ class MainWindow(QMainWindow):
             df[["g_x", "g_y", "g_z"]] = g_est
 
             # --- Fahrzeug-Rahmen ---------------------------------------------
-            rot = auto_vehicle_frame(df, self._gps_df)
-            if rot:
-                R = np.array(rot)
+            rot = self._resolve_rotation(topic, df)
+            if rot is not None:
+                R = np.asarray(rot)
                 veh = acc_corr @ R.T
                 df[["ax_veh", "ay_veh", "az_veh"]] = veh
+
+    def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
+        auto = auto_vehicle_frame(df, self._gps_df)
+        ov = self.mount_overrides.get(topic)
+
+        if self.rot_mode is RotMode.OVERRIDE_FIRST:
+            return ov if ov is not None else auto
+        if self.rot_mode is RotMode.AUTO_FIRST:
+            return auto if auto is not None else ov
+        return auto
 
     # ------------------------------------------------------------------ Defaults
     def _set_defaults(self) -> None:
@@ -515,6 +677,14 @@ class MainWindow(QMainWindow):
                     f"<td align=center>{r[2]}</td></tr>"
         html += "</table>"
         QMessageBox.information(self, "Export Readiness", html)
+
+    def _open_mount_dialog(self) -> None:
+        dlg = MountDialog(list(self.samples), self.mount_overrides.copy(), self.rot_mode, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.rot_mode, self.mount_overrides = dlg.result()
+        self._preprocess_all()
+        self._draw_plots()
 
     # ------------------------------------------------------------------ Settings-Dialog
     def _configure_topics(self) -> None:
