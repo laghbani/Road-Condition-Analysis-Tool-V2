@@ -75,7 +75,12 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
+        QActionGroup
     )
+    try:
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
+    except Exception:
+        QWebEngineView = None
     from PyQt5.QtCore import Qt
 except ImportError:
     from PySide6.QtWidgets import (
@@ -84,7 +89,12 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
+        QActionGroup
     )
+    try:
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+    except Exception:
+        QWebEngineView = None
     from PySide6.QtCore import Qt
 
 # ---------------------------------------------------------------------------#
@@ -428,9 +438,13 @@ class MainWindow(QMainWindow):
 
         w_map = QWidget()
         v_map = QVBoxLayout(w_map)
-        self.fig_map = Figure(constrained_layout=True)
-        self.canvas_map = FigureCanvas(self.fig_map)
-        v_map.addWidget(self.canvas_map)
+        if QWebEngineView is None:
+            self.fig_map = Figure(constrained_layout=True)
+            self.canvas_map = FigureCanvas(self.fig_map)
+            v_map.addWidget(self.canvas_map)
+        else:
+            self.web_map = QWebEngineView()
+            v_map.addWidget(self.web_map)
         self.tabs.addTab(w_map, "Map")
 
         self.tabs.currentChanged.connect(self._tab_changed)
@@ -450,6 +464,14 @@ class MainWindow(QMainWindow):
             lambda: export_csv_smart_v2(self, gps_df=self._gps_df))
         m_file.addAction(self.act_export)
 
+        act_save_cfg = QAction("Save settings …", self)
+        act_save_cfg.triggered.connect(self._save_config)
+        m_file.addAction(act_save_cfg)
+
+        act_load_cfg = QAction("Load settings …", self)
+        act_load_cfg.triggered.connect(self._load_config)
+        m_file.addAction(act_load_cfg)
+
         m_file.addSeparator()
         m_file.addAction("Beenden", lambda: QApplication.instance().quit())
 
@@ -467,9 +489,17 @@ class MainWindow(QMainWindow):
         act_peaks.triggered.connect(self._open_peak_dialog)
         m_imu.addAction(act_peaks)
 
+        from PyQt5.QtWidgets import QActionGroup
+        ag = QActionGroup(self)
+        self.act_comfort = QAction("Comfort mode weighting", self, checkable=True)
         self.act_health = QAction("Health mode weighting", self, checkable=True)
-        self.act_health.setChecked(False)
-        self.act_health.triggered.connect(self._toggle_iso_mode)
+        ag.addAction(self.act_comfort)
+        ag.addAction(self.act_health)
+        self.act_comfort.setChecked(self.iso_comfort)
+        self.act_health.setChecked(not self.iso_comfort)
+        self.act_comfort.triggered.connect(lambda: self._set_weighting(True))
+        self.act_health.triggered.connect(lambda: self._set_weighting(False))
+        m_imu.addAction(self.act_comfort)
         m_imu.addAction(self.act_health)
 
         m_view = mb.addMenu("&View")
@@ -800,30 +830,63 @@ class MainWindow(QMainWindow):
             self._draw_map()
 
     def _draw_map(self) -> None:
-        self.fig_map.clear()
-        if self._gps_df is None or not self.active_topics:
+        if QWebEngineView is None:
+            self.fig_map.clear()
+            if self._gps_df is None or not self.active_topics:
+                self.canvas_map.draw_idle()
+                return
+            topic = self.active_topics[0]
+            df = self.dfs[topic]
+            merged = pd.merge_asof(
+                df.sort_values("time_abs"),
+                self._gps_df[["time", "lat", "lon"]].rename(columns={"time": "time_abs"}),
+                on="time_abs",
+                direction="nearest",
+            )
+            ax = self.fig_map.add_subplot(111)
+            c = merged.get("awv", pd.Series(np.zeros(len(merged))))
+            sc = ax.scatter(merged["lon"], merged["lat"], c=c, cmap="plasma", s=5)
+            self.fig_map.colorbar(sc, ax=ax, label="awv")
+            peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+            if len(peaks):
+                ax.scatter(merged.loc[peaks, "lon"], merged.loc[peaks, "lat"],
+                           facecolors="none", edgecolors="black", s=40)
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title("GPS Track")
             self.canvas_map.draw_idle()
-            return
-        topic = self.active_topics[0]
-        df = self.dfs[topic]
-        merged = pd.merge_asof(
-            df.sort_values("time_abs"),
-            self._gps_df[["time", "lat", "lon"]].rename(columns={"time": "time_abs"}),
-            on="time_abs",
-            direction="nearest",
-        )
-        ax = self.fig_map.add_subplot(111)
-        c = merged.get("awv", pd.Series(np.zeros(len(merged))))
-        sc = ax.scatter(merged["lon"], merged["lat"], c=c, cmap="plasma", s=5)
-        self.fig_map.colorbar(sc, ax=ax, label="awv")
-        peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
-        if len(peaks):
-            ax.scatter(merged.loc[peaks, "lon"], merged.loc[peaks, "lat"],
-                       facecolors="none", edgecolors="black", s=40)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        ax.set_title("GPS Track")
-        self.canvas_map.draw_idle()
+        else:
+            if self._gps_df is None or not self.active_topics:
+                self.web_map.setHtml("<p>No GPS data.</p>")
+                return
+            topic = self.active_topics[0]
+            df = self.dfs[topic]
+            merged = pd.merge_asof(
+                df.sort_values("time_abs"),
+                self._gps_df[["time", "lat", "lon"]].rename(columns={"time": "time_abs"}),
+                on="time_abs",
+                direction="nearest",
+            )
+            import folium
+            import branca.colormap as cm
+            center = [merged["lat"].mean(), merged["lon"].mean()]
+            fmap = folium.Map(location=center, zoom_start=15)
+            cvals = merged.get("awv", pd.Series(np.zeros(len(merged))))
+            colormap = cm.LinearColormap("plasma", vmin=float(cvals.min()), vmax=float(cvals.max()))
+            for lat, lon, val in zip(merged["lat"], merged["lon"], cvals):
+                folium.CircleMarker(
+                    location=[lat, lon], radius=3,
+                    color=colormap(float(val)), fill=True, fill_opacity=0.9
+                ).add_to(fmap)
+            colormap.add_to(fmap)
+            peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+            for idx in peaks:
+                if 0 <= idx < len(merged):
+                    folium.CircleMarker(
+                        location=[merged.loc[idx, "lat"], merged.loc[idx, "lon"]],
+                        radius=6, color="black", fill=False
+                    ).add_to(fmap)
+            self.web_map.setHtml(fmap._repr_html_())
 
     def _assign_label(self, topic: str, xmin: float, xmax: float) -> None:
         df = self.dfs[topic]
@@ -882,8 +945,46 @@ class MainWindow(QMainWindow):
         self._preprocess_all()
         self._draw_plots()
 
-    def _toggle_iso_mode(self) -> None:
-        self.iso_comfort = not self.act_health.isChecked()
+    def _set_weighting(self, comfort: bool) -> None:
+        self.iso_comfort = comfort
+        self.act_comfort.setChecked(comfort)
+        self.act_health.setChecked(not comfort)
+        self._preprocess_all()
+        self._draw_plots()
+
+    def _save_config(self) -> None:
+        QFileDialog = _get_qt_widget(self, "QFileDialog")
+        if QFileDialog is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        if not path:
+            return
+        cfg = {
+            "mount_overrides": {k: v.tolist() for k, v in self.mount_overrides.items()},
+            "rot_mode": self.rot_mode.name,
+            "peak_threshold": self.peak_threshold,
+            "peak_distance": self.peak_distance,
+            "use_max_peak": self.use_max_peak,
+            "iso_comfort": self.iso_comfort,
+        }
+        pathlib.Path(path).write_text(json.dumps(cfg, indent=2))
+
+    def _load_config(self) -> None:
+        QFileDialog = _get_qt_widget(self, "QFileDialog")
+        if QFileDialog is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Load Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        if not path:
+            return
+        data = json.loads(pathlib.Path(path).read_text())
+        self.mount_overrides = {k: np.array(v) for k, v in data.get("mount_overrides", {}).items()}
+        self.rot_mode = RotMode[data.get("rot_mode", self.rot_mode.name)]
+        self.peak_threshold = float(data.get("peak_threshold", self.peak_threshold))
+        self.peak_distance = float(data.get("peak_distance", self.peak_distance))
+        self.use_max_peak = bool(data.get("use_max_peak", self.use_max_peak))
+        self.iso_comfort = bool(data.get("iso_comfort", self.iso_comfort))
+        self.act_comfort.setChecked(self.iso_comfort)
+        self.act_health.setChecked(not self.iso_comfort)
         self._preprocess_all()
         self._draw_plots()
 
