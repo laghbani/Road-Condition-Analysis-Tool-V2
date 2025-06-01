@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import json
 import os
+from scipy.signal import find_peaks
 
 # ---------------------------------------------------------------------------#
 # Matplotlib – robuster Style-Loader                                         #
@@ -74,7 +75,7 @@ try:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox,
     )
     from PyQt5.QtCore import Qt
 except ImportError:
@@ -83,7 +84,7 @@ except ImportError:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox,
     )
     from PySide6.QtCore import Qt
 
@@ -317,6 +318,45 @@ class MountDialog(QDialog):
 
 
 # ===========================================================================
+# Peak Settings Dialog
+# ===========================================================================
+class PeakDialog(QDialog):
+    def __init__(self, threshold: float, min_dt: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Peak Detection Settings")
+
+        v = QVBoxLayout(self)
+
+        hl1 = QHBoxLayout()
+        hl1.addWidget(QLabel("Threshold [m/s²]"))
+        self.sp_thresh = QDoubleSpinBox()
+        self.sp_thresh.setRange(0.0, 100.0)
+        self.sp_thresh.setDecimals(2)
+        self.sp_thresh.setValue(threshold)
+        self.sp_thresh.setSingleStep(0.1)
+        hl1.addWidget(self.sp_thresh)
+        v.addLayout(hl1)
+
+        hl2 = QHBoxLayout()
+        hl2.addWidget(QLabel("Min. distance [s]"))
+        self.sp_dist = QDoubleSpinBox()
+        self.sp_dist.setRange(0.0, 10.0)
+        self.sp_dist.setDecimals(2)
+        self.sp_dist.setValue(min_dt)
+        self.sp_dist.setSingleStep(0.1)
+        hl2.addWidget(self.sp_dist)
+        v.addLayout(hl2)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+    def result(self) -> tuple[float, float]:
+        return self.sp_thresh.value(), self.sp_dist.value()
+
+
+# ===========================================================================
 # Main-Window
 # ===========================================================================
 class MainWindow(QMainWindow):
@@ -339,6 +379,10 @@ class MainWindow(QMainWindow):
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
+
+        self.peak_threshold: float = 5.0
+        self.peak_min_dt: float = 0.5
+        self.peaks: dict[str, pd.DataFrame] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
@@ -393,6 +437,11 @@ class MainWindow(QMainWindow):
         act_mount = QAction("Mounting Overrides …", self)
         act_mount.triggered.connect(self._open_mount_dialog)
         m_imu.addAction(act_mount)
+
+        self.act_peaks = QAction("Peak Detection …", self)
+        self.act_peaks.setEnabled(False)
+        self.act_peaks.triggered.connect(self._configure_peaks)
+        m_imu.addAction(self.act_peaks)
 
         m_view = mb.addMenu("&View")
         self.act_verify = QAction("Verify your labeling", self)
@@ -488,6 +537,7 @@ class MainWindow(QMainWindow):
 
         self._build_dfs()
         self._preprocess_all()
+        self._update_all_peaks()
         self._set_defaults()
         self._draw_plots()
 
@@ -495,6 +545,7 @@ class MainWindow(QMainWindow):
         self.act_verify.setEnabled(True)
         self.act_export.setEnabled(True)
         self.act_check.setEnabled(True)
+        self.act_peaks.setEnabled(True)
 
     # ------------------------------------------------------------------ DataFrame
     def _build_dfs(self) -> None:
@@ -562,6 +613,25 @@ class MainWindow(QMainWindow):
             return ov
         return auto
 
+    # ------------------------------------------------------------------ Peaks
+    def _detect_peaks(self, df: pd.DataFrame) -> pd.DataFrame:
+        cols = ["ax_corr", "ay_corr", "az_corr"] if {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns) else ["ax", "ay", "az"]
+        acc = df[cols].to_numpy()
+        mag = np.linalg.norm(acc, axis=1)
+        if len(mag) < 2:
+            return pd.DataFrame(columns=["time", "value", "time_abs"])
+        dt = np.median(np.diff(df["time"]))
+        min_samples = max(1, int(self.peak_min_dt / dt)) if dt > 0 else 1
+        idx, _ = find_peaks(mag, height=self.peak_threshold, distance=min_samples)
+        return pd.DataFrame({
+            "time": df["time"].iloc[idx].to_numpy(),
+            "value": mag[idx],
+            "time_abs": df["time_abs"].iloc[idx].to_numpy(),
+        })
+
+    def _update_all_peaks(self) -> None:
+        self.peaks = {t: self._detect_peaks(df) for t, df in self.dfs.items()}
+
     # ------------------------------------------------------------------ Defaults
     def _set_defaults(self) -> None:
         pref = [
@@ -616,6 +686,11 @@ class MainWindow(QMainWindow):
                     ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
                 if self.act_show_z.isChecked():
                     ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
+            peaks_df = self.peaks.get(topic)
+            if peaks_df is not None and not peaks_df.empty:
+                ax.plot(peaks_df["time"], peaks_df["value"], "k*", label="peaks")
+                for t_val, y_val, ta in zip(peaks_df["time"], peaks_df["value"], peaks_df["time_abs"]):
+                    ax.text(t_val, y_val, f"{ta:.1f}", fontsize="x-small", rotation=90, va="bottom")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
@@ -713,6 +788,7 @@ class MainWindow(QMainWindow):
             return
         self.rot_mode, self.mount_overrides = dlg.result()
         self._preprocess_all()
+        self._update_all_peaks()
         self._draw_plots()
 
     # ------------------------------------------------------------------ Settings-Dialog
@@ -725,6 +801,15 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Hinweis", "Mindestens ein Topic aktivieren.")
             return
         self.active_topics = sel
+        self._update_all_peaks()
+        self._draw_plots()
+
+    def _configure_peaks(self) -> None:
+        dlg = PeakDialog(self.peak_threshold, self.peak_min_dt, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.peak_threshold, self.peak_min_dt = dlg.result()
+        self._update_all_peaks()
         self._draw_plots()
 
 
