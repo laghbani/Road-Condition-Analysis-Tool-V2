@@ -109,6 +109,7 @@ try:
         remove_gravity_lowpass,
         auto_vehicle_frame,
         gravity_from_quat,
+        _get_qt_widget,
     )
     from iso_weighting import calc_awv
 except ModuleNotFoundError:
