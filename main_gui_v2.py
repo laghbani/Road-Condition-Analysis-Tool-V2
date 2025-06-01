@@ -76,7 +76,7 @@ try:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-        QTabWidget,
+        QTabWidget, QFormLayout, QSpinBox, QDoubleSpinBox,
     )
     from PyQt5.QtCore import Qt
 except ImportError:
@@ -84,7 +84,7 @@ except ImportError:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-        QTabWidget,
+        QTabWidget, QFormLayout, QSpinBox, QDoubleSpinBox,
     )
     from PySide6.QtCore import Qt
 
@@ -172,6 +172,34 @@ class TopicDialog(QDialog):
         return sel
 
 
+class ParamDialog(QDialog):
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.setWindowTitle("Parameter – Rotation / Filter")
+        lay = QFormLayout(self)
+
+        self.spin_fc = QDoubleSpinBox(); self.spin_fc.setRange(0.1, 20)
+        self.spin_fc.setValue(cfg["fc"])
+        lay.addRow("Low-Pass fc [Hz]", self.spin_fc)
+
+        self.spin_win = QSpinBox(); self.spin_win.setRange(3, 100)
+        self.spin_win.setValue(cfg["win_pca"])
+        lay.addRow("PCA-Fenster [s]", self.spin_win)
+
+        self.spin_thr = QDoubleSpinBox(); self.spin_thr.setRange(0.001, 1)
+        self.spin_thr.setDecimals(3); self.spin_thr.setValue(cfg["var_thr"])
+        lay.addRow("Var-Schwelle g²", self.spin_thr)
+
+        btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        lay.addWidget(btn)
+        btn.accepted.connect(self.accept); btn.rejected.connect(self.reject)
+
+    def values(self):
+        return dict(fc=self.spin_fc.value(),
+                    win_pca=self.spin_win.value(),
+                    var_thr=self.spin_thr.value())
+
+
 # ===========================================================================
 # Main-Window
 # ===========================================================================
@@ -190,6 +218,7 @@ class MainWindow(QMainWindow):
         self.t0: float | None = None
         self._gps_df: pd.DataFrame | None = None
         self.rot_info: dict[str, dict] = {}
+        self.cfg_rot = {"fc": 5.0, "win_pca": 10, "var_thr": 0.02}
 
         # Runtime-State
         self.active_topics: list[str] = []
@@ -239,6 +268,11 @@ class MainWindow(QMainWindow):
         self.chk_veh.setEnabled(False)        # erst nach Bag-Laden
         self.chk_veh.stateChanged.connect(lambda _: self._draw_plots())
         hl.addWidget(self.chk_veh)
+
+        self.chk_rawcorr = QCheckBox("Corr. anzeigen")
+        self.chk_rawcorr.setEnabled(False)
+        self.chk_rawcorr.stateChanged.connect(lambda _: self._draw_plots())
+        hl.addWidget(self.chk_rawcorr)
         self.cmb_map.currentTextChanged.connect(
             lambda _: self._update_map_from_selection())
 
@@ -282,6 +316,11 @@ class MainWindow(QMainWindow):
         act_check.triggered.connect(self._check_export_status)
         m_view.addAction(act_check)
         self.act_check = act_check
+
+        m_tools = mb.addMenu("&Tools")
+        act_params = QAction("Rotations-Parameter …", self)
+        act_params.triggered.connect(self._open_param_dialog)
+        m_tools.addAction(act_params)
 
     # ------------------------------------------------------------------ Bag
     def _open_bag(self) -> None:
@@ -335,20 +374,9 @@ class MainWindow(QMainWindow):
         self._build_dfs()
 
         # --- Rotation sofort abschätzen ---
-        self.rot_info.clear()
-        for topic, df in self.dfs.items():
-            quat = np.array([
-                [s.msg.orientation.x, s.msg.orientation.y,
-                 s.msg.orientation.z, s.msg.orientation.w]
-                for s in self.samples[topic]
-            ])
-            R_sv, meth, gcmp, meta = estimate_vehicle_rot(df, quat, self._gps_df)
-            self.rot_info[topic] = {"R": R_sv, "meth": meth, "g": gcmp, **meta}
-            if R_sv is not None:
-                df[["ax_veh","ay_veh","az_veh"]] = df[["ax","ay","az"]].to_numpy() @ np.array(R_sv).T
+        self._recompute_rotation()
 
         self._set_defaults()
-        self._draw_plots()
 
         self.cmb_map.clear()
         self.cmb_map.addItems(sorted(self.samples))
@@ -359,6 +387,7 @@ class MainWindow(QMainWindow):
         self.act_export.setEnabled(True)
         self.act_check.setEnabled(True)
         self.chk_veh.setEnabled(True)
+        self.chk_rawcorr.setEnabled(True)
         self.act_quality.setEnabled(True)
 
     # ------------------------------------------------------------------ DataFrame
@@ -413,17 +442,22 @@ class MainWindow(QMainWindow):
             row = i * (2 if verify else 1)
             ax = self.fig.add_subplot(gs[row])
             ax.set_title(f"{topic} – Linear Acc.")
+            ax.plot(df["time"], df["ax"], ls=":", color="tab:blue", label="ax raw", alpha=0.5)
+            ax.plot(df["time"], df["ay"], ls=":", color="tab:orange", label="ay raw", alpha=0.5)
+            ax.plot(df["time"], df["az"], ls=":", color="tab:green", label="az raw", alpha=0.5)
+
+            if self.chk_rawcorr.isChecked() and {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
+                ax.plot(df["time"], df["ax_corr"], color="tab:blue", alpha=0.7, label="ax corr")
+                ax.plot(df["time"], df["ay_corr"], color="tab:orange", alpha=0.7, label="ay corr")
+                ax.plot(df["time"], df["az_corr"], color="tab:green", alpha=0.7, label="az corr")
+
             if self.chk_veh.isChecked() and {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
-                ax.plot(df["time"], df["ax_veh"], label="ax (veh)", color="tab:blue")
-                ax.plot(df["time"], df["ay_veh"], label="ay (veh)", color="tab:orange")
-                ax.plot(df["time"], df["az_veh"], label="az (veh)", color="tab:green")
-            else:
-                ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
-                ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
-                ax.plot(df["time"], df["az"], label="az", color="tab:green")
+                ax.plot(df["time"], df["ax_veh"], color="tab:blue", lw=2, label="ax veh")
+                ax.plot(df["time"], df["ay_veh"], color="tab:orange", lw=2, label="ay veh")
+                ax.plot(df["time"], df["az_veh"], color="tab:green", lw=2, label="az veh")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
-            ax.set_ylabel("m/s² (vehicle)" if self.chk_veh.isChecked() else "m/s² (sensor)")
+            ax.set_ylabel("m/s²")
             ax.legend(loc="upper right")
             self.ax_topic[ax] = topic
 
@@ -515,6 +549,30 @@ class MainWindow(QMainWindow):
                      f"<td>{r['az_mean']}</td><td>{r['rms_xy']}</td></tr>")
         html += "</table>"
         QMessageBox.information(self, "Rotation-Qualität", html)
+
+    def _open_param_dialog(self):
+        dlg = ParamDialog(self, self.cfg_rot)
+        if dlg.exec() == QDialog.Accepted:
+            self.cfg_rot.update(dlg.values())
+            self._recompute_rotation()
+
+    def _recompute_rotation(self):
+        self.rot_info.clear()
+        for topic, df in self.dfs.items():
+            q = np.array([[s.msg.orientation.x, s.msg.orientation.y,
+                           s.msg.orientation.z, s.msg.orientation.w]
+                          for s in self.samples[topic]])
+            Rsv, meth, gcmp, meta = estimate_vehicle_rot(
+                df, q, self._gps_df, cfg=self.cfg_rot
+            )
+            self.rot_info[topic] = {"R": Rsv, "meth": meth, "g": gcmp, **meta}
+            if Rsv is not None:
+                M = np.array(Rsv)
+                df[["ax_veh", "ay_veh", "az_veh"]] = (
+                    df[["ax", "ay", "az"]].to_numpy() @ M.T
+                )
+        self._draw_plots()
+        self._update_map_from_selection()
 
     # ------------------------------------------------------------------ Settings-Dialog
     def _configure_topics(self) -> None:
