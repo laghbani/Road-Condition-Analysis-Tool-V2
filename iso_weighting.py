@@ -96,7 +96,9 @@ def exponential_running_rms(x: np.ndarray, fs: float, tau: float = 1.0) -> np.nd
 
 
 def calc_awv(ax: np.ndarray, ay: np.ndarray, az: np.ndarray,
-             fs: float, comfort: bool = True) -> dict[str, np.ndarray | float]:
+             fs: float, comfort: bool = True,
+             peak_height: float = 3.19, peak_dist: float = 0.0,
+             max_peak: bool = False) -> dict[str, np.ndarray | float]:
     """Calculate weighted vibration values for three axes.
 
     Returns a dictionary with the weighted signals, running RMS of each
@@ -119,7 +121,11 @@ def calc_awv(ax: np.ndarray, ay: np.ndarray, az: np.ndarray,
     awv = np.sqrt((kx * rms_x) ** 2 + (ky * rms_y) ** 2 + (kz * rms_z) ** 2)
     awv_total = float(np.sqrt(np.mean(awv ** 2)))
 
-    peaks, _ = find_peaks(awv, height=3.19)
+    dist_samples = int(peak_dist * fs) if peak_dist > 0 else None
+    peaks, _ = find_peaks(awv, height=peak_height,
+                          distance=dist_samples)
+    if max_peak and len(peaks):
+        peaks = np.array([peaks[np.argmax(awv[peaks])]])
 
     a8 = awv_total * np.sqrt( (8 * 3600) / (len(ax) / fs) )
     crest = float(np.max(np.abs(awv)) / awv_total) if awv_total else float('nan')

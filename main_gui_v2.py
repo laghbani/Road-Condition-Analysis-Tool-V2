@@ -74,7 +74,7 @@ try:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
     )
     from PyQt5.QtCore import Qt
 except ImportError:
@@ -83,7 +83,7 @@ except ImportError:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
     )
     from PySide6.QtCore import Qt
 
@@ -318,6 +318,52 @@ class MountDialog(QDialog):
 
 
 # ===========================================================================
+# Peak Settings Dialog
+# ===========================================================================
+class PeakDialog(QDialog):
+    """Dialog to configure peak detection parameters."""
+
+    def __init__(self, thr: float, dist: float, use_max: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Peak Detection Settings")
+        self.resize(300, 180)
+
+        v = QVBoxLayout(self)
+
+        form = QVBoxLayout()
+
+        lbl_thr = QLabel("Peak threshold")
+        self.sb_thr = QDoubleSpinBox()
+        self.sb_thr.setRange(0.0, 100.0)
+        self.sb_thr.setDecimals(2)
+        self.sb_thr.setValue(thr)
+        form.addWidget(lbl_thr)
+        form.addWidget(self.sb_thr)
+
+        lbl_dist = QLabel("Min. time between peaks [s]")
+        self.sb_dist = QDoubleSpinBox()
+        self.sb_dist.setRange(0.0, 10.0)
+        self.sb_dist.setDecimals(2)
+        self.sb_dist.setValue(dist)
+        form.addWidget(lbl_dist)
+        form.addWidget(self.sb_dist)
+
+        self.chk_max = QCheckBox("Only mark maximum peak")
+        self.chk_max.setChecked(use_max)
+        form.addWidget(self.chk_max)
+
+        v.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+    def result(self) -> tuple[float, float, bool]:
+        return self.sb_thr.value(), self.sb_dist.value(), self.chk_max.isChecked()
+
+
+# ===========================================================================
 # Main-Window
 # ===========================================================================
 class MainWindow(QMainWindow):
@@ -345,6 +391,9 @@ class MainWindow(QMainWindow):
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
         self.iso_comfort: bool = True  # ISO weighting mode
         self.iso_metrics: dict[str, dict] = {}
+        self.peak_threshold: float = 3.19
+        self.peak_distance: float = 0.0
+        self.use_max_peak: bool = False
 
         self._build_menu()
         self._build_ui()
@@ -355,19 +404,36 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         vbox = QVBoxLayout(central)
 
+        self.tabs = QTabWidget()
+        vbox.addWidget(self.tabs)
+
+        w_plot = QWidget()
+        v_plot = QVBoxLayout(w_plot)
+
         self.fig = Figure(constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
-        vbox.addWidget(self.canvas)
+        v_plot.addWidget(self.canvas)
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
 
         hl = QHBoxLayout()
-        vbox.addLayout(hl)
+        v_plot.addLayout(hl)
         hl.addWidget(QLabel("Segment Label:"))
         self.cmb = QComboBox()
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
         hl.addStretch()
+
+        self.tabs.addTab(w_plot, "Plots")
+
+        w_map = QWidget()
+        v_map = QVBoxLayout(w_map)
+        self.fig_map = Figure(constrained_layout=True)
+        self.canvas_map = FigureCanvas(self.fig_map)
+        v_map.addWidget(self.canvas_map)
+        self.tabs.addTab(w_map, "Map")
+
+        self.tabs.currentChanged.connect(self._tab_changed)
 
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
@@ -396,6 +462,10 @@ class MainWindow(QMainWindow):
         act_mount = QAction("Mounting Overrides …", self)
         act_mount.triggered.connect(self._open_mount_dialog)
         m_imu.addAction(act_mount)
+
+        act_peaks = QAction("Peak detection …", self)
+        act_peaks.triggered.connect(self._open_peak_dialog)
+        m_imu.addAction(act_peaks)
 
         self.act_health = QAction("Health mode weighting", self, checkable=True)
         self.act_health.setChecked(False)
@@ -508,6 +578,7 @@ class MainWindow(QMainWindow):
         self._preprocess_all()
         self._set_defaults()
         self._draw_plots()
+        self._draw_map()
 
         self.act_topics.setEnabled(True)
         self.act_verify.setEnabled(True)
@@ -569,8 +640,13 @@ class MainWindow(QMainWindow):
 
             # --- ISO 2631 weighting -----------------------------------------
             fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
-            res = calc_awv(acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
-                           comfort=self.iso_comfort)
+            res = calc_awv(
+                acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
+                comfort=self.iso_comfort,
+                peak_height=self.peak_threshold,
+                peak_dist=self.peak_distance,
+                max_peak=self.use_max_peak,
+            )
             df[["awx", "awy", "awz"]] = np.column_stack(
                 (res["awx"], res["awy"], res["awz"]))
             df[["rms_x", "rms_y", "rms_z"]] = np.column_stack(
@@ -589,13 +665,17 @@ class MainWindow(QMainWindow):
 
         if self.rot_mode is RotMode.OVERRIDE_FIRST:
             if ov is not None:
-                return ov
-            return auto
+                rot = ov
+            else:
+                rot = auto
         if self.rot_mode is RotMode.AUTO_FIRST:
             if auto is not None:
-                return auto
-            return ov
-        return auto
+                rot = auto
+            else:
+                rot = ov
+        else:
+            rot = auto
+        return np.asarray(rot) if rot is not None else None
 
     # ------------------------------------------------------------------ Defaults
     def _set_defaults(self) -> None:
@@ -653,12 +733,12 @@ class MainWindow(QMainWindow):
                     ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
             if self.act_show_iso.isChecked() and {"awx", "awy", "awz", "awv"}.issubset(df.columns):
                 if self.act_show_x.isChecked():
-                    ax.plot(df["time"], df["awx"], label="awx", color="purple")
+                    ax.plot(df["time"], df["awx"], label="awx", color="tab:blue")
                 if self.act_show_y.isChecked():
-                    ax.plot(df["time"], df["awy"], label="awy", color="brown")
+                    ax.plot(df["time"], df["awy"], label="awy", color="tab:orange")
                 if self.act_show_z.isChecked():
-                    ax.plot(df["time"], df["awz"], label="awz", color="olive")
-                ax.plot(df["time"], df["awv"], label="awv", color="red", lw=1.5)
+                    ax.plot(df["time"], df["awz"], label="awz", color="tab:green")
+                ax.plot(df["time"], df["awv"], label="awv", color="tab:red", lw=1.5)
                 if self.act_show_peaks.isChecked():
                     peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
                     if len(peaks):
@@ -700,6 +780,8 @@ class MainWindow(QMainWindow):
                 ax_tr.legend(fontsize="x-small", ncol=3, loc="upper right")
 
         self.canvas.draw_idle()
+        if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
+            self._draw_map()
 
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
@@ -712,6 +794,36 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         self._assign_label(topic, xmin, xmax)
+
+    def _tab_changed(self, idx: int) -> None:
+        if idx == 1:
+            self._draw_map()
+
+    def _draw_map(self) -> None:
+        self.fig_map.clear()
+        if self._gps_df is None or not self.active_topics:
+            self.canvas_map.draw_idle()
+            return
+        topic = self.active_topics[0]
+        df = self.dfs[topic]
+        merged = pd.merge_asof(
+            df.sort_values("time_abs"),
+            self._gps_df[["time", "lat", "lon"]].rename(columns={"time": "time_abs"}),
+            on="time_abs",
+            direction="nearest",
+        )
+        ax = self.fig_map.add_subplot(111)
+        c = merged.get("awv", pd.Series(np.zeros(len(merged))))
+        sc = ax.scatter(merged["lon"], merged["lat"], c=c, cmap="plasma", s=5)
+        self.fig_map.colorbar(sc, ax=ax, label="awv")
+        peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+        if len(peaks):
+            ax.scatter(merged.loc[peaks, "lon"], merged.loc[peaks, "lat"],
+                       facecolors="none", edgecolors="black", s=40)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_title("GPS Track")
+        self.canvas_map.draw_idle()
 
     def _assign_label(self, topic: str, xmin: float, xmax: float) -> None:
         df = self.dfs[topic]
@@ -759,6 +871,14 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         self.rot_mode, self.mount_overrides = dlg.result()
+        self._preprocess_all()
+        self._draw_plots()
+
+    def _open_peak_dialog(self) -> None:
+        dlg = PeakDialog(self.peak_threshold, self.peak_distance, self.use_max_peak, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.peak_threshold, self.peak_distance, self.use_max_peak = dlg.result()
         self._preprocess_all()
         self._draw_plots()
 
