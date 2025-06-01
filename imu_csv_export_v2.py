@@ -8,6 +8,8 @@ import pandas as pd
 from scipy.spatial.transform import Rotation as R
 from scipy.signal import butter, filtfilt
 
+from qt_utils import get_qt_widget as _get_qt_widget
+
 
 def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
     """Return minimal rotation matrix mapping `v1 to v2.
@@ -26,10 +28,15 @@ def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
 
 
 def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
-    """Add `speed_mps column to *work* derived from gps_df."""
+    """Ensure ``speed_mps`` exists in ``work`` using data from ``gps_df``.
+
+    Any existing ``speed_mps`` column is dropped to avoid merge suffixes.
+    """
+    work = work.drop(columns=["speed_mps"], errors="ignore").copy()
     if gps_df is None or len(gps_df) < 3:
         work["speed_mps"] = np.nan
         return work
+
     R_earth = 6_378_137.0
     lat0 = np.deg2rad(gps_df["lat"].iat[0])
     dx = (
@@ -56,23 +63,6 @@ G_STD = 9.80665
 FSR_2G = 2 * G_STD
 FSR_8G = 8 * G_STD
 CAND_G = np.array([2, 4, 8, 16]) * G_STD        #  19.6, 39.2 … 156.9 m/s²
-
-
-def _get_qt_widget(obj, name: str):
-    """Return a Qt widget class from the same binding as *obj*."""
-    pkg = obj.__class__.__module__.split('.')[0]
-    try:
-        mod = __import__(f"{pkg}.QtWidgets", fromlist=[name])
-        return getattr(mod, name)
-    except Exception:
-        pass
-    for pkg in ("PyQt5", "PySide6"):
-        try:
-            mod = __import__(f"{pkg}.QtWidgets", fromlist=[name])
-            return getattr(mod, name)
-        except Exception:
-            continue
-    return None
 
 
 def sha1_of_file(path: Path) -> str:
@@ -311,9 +301,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             else:
                 fs = 0.0
 
-            # Ensure speed column is present; add_speed may be skipped earlier
-            if "speed_mps" not in work.columns:
-                work["speed_mps"] = np.nan
+            # Recalculate speed from GPS if available
             work = add_speed(work, gps_df)
             self.dfs[topic] = work
 

@@ -111,6 +111,7 @@ try:
         gravity_from_quat,
     )
     from iso_weighting import calc_awv
+    from qt_utils import get_qt_widget as _get_qt_widget
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
