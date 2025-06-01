@@ -89,7 +89,12 @@ try:
     from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
     from rclpy.serialization import deserialize_message
     from sensor_msgs.msg import Imu, NavSatFix
-    from imu_csv_export_v2 import export_csv_smart_v2
+    from imu_csv_export_v2 import (
+        export_csv_smart_v2,
+        remove_gravity_lowpass,
+        gravity_from_quat,
+        auto_vehicle_frame,
+    )
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -299,6 +304,8 @@ class MainWindow(QMainWindow):
         self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
 
         self._build_dfs()
+        for topic in self.samples:
+            self._process_imu_df(topic)
         self._set_defaults()
         self._draw_plots()
 
@@ -325,6 +332,34 @@ class MainWindow(QMainWindow):
                 "label_name": [UNKNOWN_NAME] * len(tr),
             })
             self.dfs[t] = df
+
+    def _process_imu_df(self, topic: str) -> None:
+        df = self.dfs[topic]
+        samps = self.samples[topic]
+
+        # ---------- Quaternion vorhanden? ----------
+        ori = np.array([[s.msg.orientation.x, s.msg.orientation.y,
+                         s.msg.orientation.z, s.msg.orientation.w] for s in samps])
+        norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
+        var_ok = np.ptp(ori, axis=0).max() > 1e-3
+        has_quat = bool(norm_ok.any() and var_ok)
+
+        if has_quat:
+            g_vec = gravity_from_quat(pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
+            acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
+            df[["ax_corr", "ay_corr", "az_corr"]] = acc_corr
+            df[["g_x", "g_y", "g_z"]] = g_vec
+        else:
+            acc_corr, g_est, _ = remove_gravity_lowpass(df)
+            df[["ax_corr", "ay_corr", "az_corr"]] = acc_corr
+            df[["g_x", "g_y", "g_z"]] = g_est
+
+        # ---------- Rotation in Fahrzeugrahmen ----------
+        rot_mat = auto_vehicle_frame(df, self._gps_df)
+        if rot_mat:
+            R = np.array(rot_mat)
+            veh = acc_corr @ R.T
+            df[["ax_veh", "ay_veh", "az_veh"]] = veh
 
     # ------------------------------------------------------------------ Defaults
     def _set_defaults(self) -> None:

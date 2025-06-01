@@ -106,6 +106,36 @@ def find_stationary_bias(df: pd.DataFrame,
     return None
 
 
+def remove_gravity_lowpass(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate gravity via low-pass filter and remove it from accelerations.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with ``ax``, ``ay`` and ``az`` columns.
+
+    Returns
+    -------
+    tuple
+        ``(acc_corr, g_est, bias_vec)`` where ``acc_corr`` is the gravity
+        compensated acceleration array (``N×3``), ``g_est`` is the estimated
+        gravity vector per sample and ``bias_vec`` is the stationary bias
+        estimate used for compensation.
+    """
+    bias_vec = find_stationary_bias(df) or np.zeros(3)
+    acc_bias = df[["ax", "ay", "az"]].to_numpy() - bias_vec
+
+    # --- LOW-PASS → Gravitation schätzen -------------------------------
+    dt = np.median(np.diff(df["time"]))
+    fs = 1.0 / dt if dt > 0 else 100.0
+    fc = 0.3  # Cut-off 0.3 Hz ≈ 5 s
+    b, a = butter(2, fc / (0.5 * fs), btype="low")
+    g_est = filtfilt(b, a, acc_bias, axis=0)
+
+    acc_corr = acc_bias - g_est
+    return acc_corr, g_est, bias_vec
+
+
 def gravity_from_quat(df: pd.DataFrame) -> np.ndarray:
     q = df[["ox", "oy", "oz", "ow"]].to_numpy()
     q /= np.linalg.norm(q, axis=1, keepdims=True)
