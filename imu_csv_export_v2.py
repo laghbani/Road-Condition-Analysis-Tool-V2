@@ -26,7 +26,7 @@ def rot_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
 
 
 def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
-    """Add `speed_mps column to *work* derived from gps_df."""
+    """Add `speed_mps` column to *work* derived from *gps_df*."""
     if gps_df is None or len(gps_df) < 3:
         work["speed_mps"] = np.nan
         return work

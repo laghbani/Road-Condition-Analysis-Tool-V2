@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import json
 import os
+from iso_weighting import calc_awv, col_for
 
 # ---------------------------------------------------------------------------#
 # Matplotlib – robuster Style-Loader                                         #
@@ -74,7 +75,7 @@ try:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QTabWidget,
     )
     from PyQt5.QtCore import Qt
 except ImportError:
@@ -83,7 +84,7 @@ except ImportError:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QTabWidget,
     )
     from PySide6.QtCore import Qt
 
@@ -340,31 +341,46 @@ class MainWindow(QMainWindow):
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
 
+        self.weight_comfort: bool = True
+
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
+        self.show_weight: bool = False
+        self.show_rms: bool = False
 
         self._build_menu()
         self._build_ui()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        vbox = QVBoxLayout(central)
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        plot_page = QWidget()
+        pv = QVBoxLayout(plot_page)
 
         self.fig = Figure(constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
-        vbox.addWidget(self.canvas)
+        pv.addWidget(self.canvas)
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
 
         hl = QHBoxLayout()
-        vbox.addLayout(hl)
+        pv.addLayout(hl)
         hl.addWidget(QLabel("Segment Label:"))
         self.cmb = QComboBox()
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
         hl.addStretch()
+
+        self.tabs.addTab(plot_page, "Signals")
+
+        self.map_page = QWidget()
+        mv = QVBoxLayout(self.map_page)
+        self.btn_open_map = QPushButton("Open Map")
+        self.btn_open_map.clicked.connect(self._open_map)
+        mv.addWidget(self.btn_open_map)
+        self.tabs.addTab(self.map_page, "Map")
 
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
@@ -393,6 +409,15 @@ class MainWindow(QMainWindow):
         act_mount = QAction("Mounting Overrides …", self)
         act_mount.triggered.connect(self._open_mount_dialog)
         m_imu.addAction(act_mount)
+
+        m_imu.addSeparator()
+        self.act_weight_comfort = QAction("Comfort weighting", self, checkable=True)
+        self.act_weight_health = QAction("Health weighting", self, checkable=True)
+        self.act_weight_comfort.setChecked(True)
+        self.act_weight_comfort.triggered.connect(lambda: self._set_weight_mode(True))
+        self.act_weight_health.triggered.connect(lambda: self._set_weight_mode(False))
+        m_imu.addAction(self.act_weight_comfort)
+        m_imu.addAction(self.act_weight_health)
 
         m_view = mb.addMenu("&View")
         self.act_verify = QAction("Verify your labeling", self)
@@ -430,6 +455,16 @@ class MainWindow(QMainWindow):
         self.act_show_z.setChecked(True)
         self.act_show_z.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_z)
+
+        self.act_show_weight = QAction("Show weighted", self, checkable=True)
+        self.act_show_weight.setChecked(False)
+        self.act_show_weight.triggered.connect(self._toggle_show_weight)
+        m_view.addAction(self.act_show_weight)
+
+        self.act_show_rms = QAction("Show awv", self, checkable=True)
+        self.act_show_rms.setChecked(False)
+        self.act_show_rms.triggered.connect(self._toggle_show_rms)
+        m_view.addAction(self.act_show_rms)
 
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
@@ -548,6 +583,23 @@ class MainWindow(QMainWindow):
                 veh = acc_corr @ R.T
                 df[["ax_veh", "ay_veh", "az_veh"]] = veh
 
+            if len(df["time"]) > 1:
+                fs = 1.0 / np.median(np.diff(df["time"]))
+            else:
+                fs = 0.0
+            base = df[["ax_veh", "ay_veh", "az_veh"]] if "ax_veh" in df else df[["ax_corr", "ay_corr", "az_corr"]]
+            ax_w, ay_w, az_w = (base.iloc[:, 0].to_numpy(),
+                               base.iloc[:, 1].to_numpy(),
+                               base.iloc[:, 2].to_numpy())
+            aw = calc_awv(ax_w, ay_w, az_w, fs, comfort=self.weight_comfort)
+            df[["awx", "awy", "awz"]] = np.column_stack([aw["awx"], aw["awy"], aw["awz"]])
+            df[["rms_x", "rms_y", "rms_z"]] = np.column_stack([aw["rms_x"], aw["rms_y"], aw["rms_z"]])
+            df["awv"] = aw["awv"]
+            df["peak"] = False
+            if len(aw["peaks"]):
+                df.loc[aw["peaks"], "peak"] = True
+            df["color"] = [col_for(v) for v in aw["awv"]]
+
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
         ov = self.mount_overrides.get(topic)
@@ -616,6 +668,18 @@ class MainWindow(QMainWindow):
                     ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
                 if self.act_show_z.isChecked():
                     ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
+            if self.show_weight and {"awx", "awy", "awz"}.issubset(df.columns):
+                if self.act_show_x.isChecked():
+                    ax.plot(df["time"], df["awx"], label="awx", color="tab:blue", ls="-.")
+                if self.act_show_y.isChecked():
+                    ax.plot(df["time"], df["awy"], label="awy", color="tab:orange", ls="-.")
+                if self.act_show_z.isChecked():
+                    ax.plot(df["time"], df["awz"], label="awz", color="tab:green", ls="-.")
+            if self.show_rms and "awv" in df:
+                ax.scatter(df["time"], df["awv"], c=df["color"], s=10, label="awv")
+                pk = df["peak"] == True
+                if pk.any():
+                    ax.scatter(df.loc[pk, "time"], df.loc[pk, "awv"], s=80, marker="*", color="k")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
@@ -707,12 +771,65 @@ class MainWindow(QMainWindow):
         html += "</table>"
         QMessageBox.information(self, "Export Readiness", html)
 
+    def _open_map(self) -> None:
+        if self._gps_df is None:
+            QMessageBox.information(self, "No GPS", "Keine GPS-Daten vorhanden.")
+            return
+        if not self.active_topics:
+            return
+        topic = self.active_topics[0]
+        df = self.dfs.get(topic)
+        if df is None or "awv" not in df:
+            QMessageBox.information(self, "No weighting", "Bitte Daten laden.")
+            return
+        gps = pd.merge_asof(
+            self._gps_df.sort_values("time"),
+            df[["time_abs", "awv", "peak", "color"]].sort_values("time_abs"),
+            left_on="time",
+            right_on="time_abs",
+            direction="nearest",
+        )
+        import folium, webbrowser, tempfile
+        m = folium.Map(location=[gps["lat"].mean(), gps["lon"].mean()], zoom_start=15)
+        for _, r in gps.iterrows():
+            folium.CircleMarker(
+                location=(r["lat"], r["lon"]),
+                radius=4,
+                fill=True,
+                color=None,
+                fill_color=r["color"],
+                fill_opacity=0.9,
+            ).add_to(m)
+            if r["peak"]:
+                folium.Marker(
+                    location=(r["lat"], r["lon"]),
+                    icon=folium.Icon(color="red", icon="star"),
+                ).add_to(m)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".html")
+        m.save(tmp.name)
+        webbrowser.open(f"file://{tmp.name}")
+
     def _open_mount_dialog(self) -> None:
         dlg = MountDialog(list(self.samples), self.mount_overrides.copy(), self.rot_mode, self)
         if dlg.exec() != QDialog.Accepted:
             return
         self.rot_mode, self.mount_overrides = dlg.result()
         self._preprocess_all()
+        self._draw_plots()
+
+    def _set_weight_mode(self, comfort: bool) -> None:
+        self.weight_comfort = comfort
+        self.act_weight_comfort.setChecked(comfort)
+        self.act_weight_health.setChecked(not comfort)
+        self._preprocess_all()
+        self._draw_plots()
+
+    def _toggle_show_weight(self) -> None:
+        self.show_weight = self.act_show_weight.isChecked()
+        self._draw_plots()
+
+    def _toggle_show_rms(self) -> None:
+        self.show_rms = self.act_show_rms.isChecked()
         self._draw_plots()
 
     # ------------------------------------------------------------------ Settings-Dialog
