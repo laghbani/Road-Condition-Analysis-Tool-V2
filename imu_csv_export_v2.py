@@ -116,7 +116,9 @@ def gravity_from_quat(df: pd.DataFrame) -> np.ndarray:
 
 def remove_gravity_lowpass(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Estimate gravity via low-pass filter and remove it from acceleration."""
-    bias_vec = find_stationary_bias(df) or np.zeros(3)
+    bias_vec = find_stationary_bias(df)
+    if bias_vec is None:
+        bias_vec = np.zeros(3)
     acc_bias = df[["ax", "ay", "az"]].to_numpy() - bias_vec
 
     dt = np.median(np.diff(df["time"]))
