@@ -100,6 +100,7 @@ try:
         auto_vehicle_frame,
         gravity_from_quat,
     )
+    from iso_weighting import calc_awv
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -342,6 +343,8 @@ class MainWindow(QMainWindow):
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
+        self.iso_comfort: bool = True  # ISO weighting mode
+        self.iso_metrics: dict[str, dict] = {}
 
         self._build_menu()
         self._build_ui()
@@ -394,6 +397,11 @@ class MainWindow(QMainWindow):
         act_mount.triggered.connect(self._open_mount_dialog)
         m_imu.addAction(act_mount)
 
+        self.act_health = QAction("Health mode weighting", self, checkable=True)
+        self.act_health.setChecked(False)
+        self.act_health.triggered.connect(self._toggle_iso_mode)
+        m_imu.addAction(self.act_health)
+
         m_view = mb.addMenu("&View")
         self.act_verify = QAction("Verify your labeling", self)
         self.act_verify.setEnabled(False)
@@ -430,6 +438,16 @@ class MainWindow(QMainWindow):
         self.act_show_z.setChecked(True)
         self.act_show_z.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_z)
+
+        self.act_show_iso = QAction("Show ISO weighted", self, checkable=True)
+        self.act_show_iso.setChecked(False)
+        self.act_show_iso.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_iso)
+
+        self.act_show_peaks = QAction("Show ISO peaks", self, checkable=True)
+        self.act_show_peaks.setChecked(True)
+        self.act_show_peaks.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_peaks)
 
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
@@ -517,6 +535,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Preprocess
     def _preprocess_all(self) -> None:
+        self.iso_metrics.clear()
         for topic, df in self.dfs.items():
             samps = self.samples[topic]
 
@@ -547,6 +566,22 @@ class MainWindow(QMainWindow):
                 R = np.asarray(rot)
                 veh = acc_corr @ R.T
                 df[["ax_veh", "ay_veh", "az_veh"]] = veh
+
+            # --- ISO 2631 weighting -----------------------------------------
+            fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
+            res = calc_awv(acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
+                           comfort=self.iso_comfort)
+            df[["awx", "awy", "awz"]] = np.column_stack(
+                (res["awx"], res["awy"], res["awz"]))
+            df[["rms_x", "rms_y", "rms_z"]] = np.column_stack(
+                (res["rms_x"], res["rms_y"], res["rms_z"]))
+            df["awv"] = res["awv"]
+            self.iso_metrics[topic] = {
+                "awv_total": res["awv_total"],
+                "A8": res["A8"],
+                "crest_factor": res["crest_factor"],
+                "peaks": res["peaks"].tolist(),
+            }
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
@@ -616,6 +651,18 @@ class MainWindow(QMainWindow):
                     ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
                 if self.act_show_z.isChecked():
                     ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
+            if self.act_show_iso.isChecked() and {"awx", "awy", "awz", "awv"}.issubset(df.columns):
+                if self.act_show_x.isChecked():
+                    ax.plot(df["time"], df["awx"], label="awx", color="purple")
+                if self.act_show_y.isChecked():
+                    ax.plot(df["time"], df["awy"], label="awy", color="brown")
+                if self.act_show_z.isChecked():
+                    ax.plot(df["time"], df["awz"], label="awz", color="olive")
+                ax.plot(df["time"], df["awv"], label="awv", color="red", lw=1.5)
+                if self.act_show_peaks.isChecked():
+                    peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+                    if len(peaks):
+                        ax.plot(df.loc[peaks, "time"], df.loc[peaks, "awv"], "k*", markersize=8, label="peaks")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
@@ -712,6 +759,11 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         self.rot_mode, self.mount_overrides = dlg.result()
+        self._preprocess_all()
+        self._draw_plots()
+
+    def _toggle_iso_mode(self) -> None:
+        self.iso_comfort = not self.act_health.isChecked()
         self._preprocess_all()
         self._draw_plots()
 
