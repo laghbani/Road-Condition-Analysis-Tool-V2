@@ -189,7 +189,7 @@ class MainWindow(QMainWindow):
         self.dfs: dict[str, pd.DataFrame] = {}
         self.t0: float | None = None
         self._gps_df: pd.DataFrame | None = None
-        self.rot_by_topic: dict[str, list | None] = {}
+        self.rot_info: dict[str, dict[str, object]] = {}
 
         # Runtime-State
         self.active_topics: list[str] = []
@@ -335,7 +335,7 @@ class MainWindow(QMainWindow):
         self._build_dfs()
 
         # --- Rotation sofort abschätzen ---
-        self.rot_by_topic.clear()
+        self.rot_info.clear()
         for topic, df in self.dfs.items():
             samps = self.samples[topic]
             ori = np.array([
@@ -343,8 +343,12 @@ class MainWindow(QMainWindow):
                  s.msg.orientation.z, s.msg.orientation.w]
                 for s in samps
             ])
-            rot = estimate_vehicle_rot(df, ori, self._gps_df)
-            self.rot_by_topic[topic] = rot
+            rot, method, g_comp = estimate_vehicle_rot(df, ori, self._gps_df)
+            self.rot_info[topic] = {
+                "rot_mat": rot,
+                "rot_method": method,
+                "g_comp": g_comp,
+            }
             if rot is not None:
                 raw = df[["ax", "ay", "az"]].to_numpy()
                 df[["ax_veh", "ay_veh", "az_veh"]] = raw @ np.array(rot).T
@@ -491,7 +495,7 @@ class MainWindow(QMainWindow):
         if not sel_topic:
             self.map_widget.set_data(self._gps_df, None)
             return
-        rot = self.rot_by_topic.get(sel_topic)
+        rot = self.rot_info.get(sel_topic, {}).get("rot_mat")
         if rot is None and hasattr(self, "last_export_dir"):
             bag_root = pathlib.Path(self.bag_path).stem if self.bag_path else ""
             meta_path = (
@@ -511,56 +515,56 @@ class MainWindow(QMainWindow):
         for t, df in self.dfs.items():
             has_lbl = (df["label_id"] != 99).any()
 
-            rot_ok = self.rot_by_topic.get(t) is not None
-            if not rot_ok and hasattr(self, "last_export_dir"):
-                meta = (
-                    pathlib.Path(self.last_export_dir)
-                    / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
-                )
-                if meta.exists():
-                    try:
-                        rot_ok = json.loads(meta.read_text()).get("rotation_available", False)
-                    except Exception:
-                        rot_ok = False
+        info = self.rot_info.get(t, {})
+        rot_ok = info.get("rot_mat") is not None
+        if not rot_ok and hasattr(self, "last_export_dir"):
+            meta = (
+                pathlib.Path(self.last_export_dir)
+                / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
+            )
+            if meta.exists():
+                try:
+                    rot_ok = json.loads(meta.read_text()).get("rotation_available", False)
+                except Exception:
+                    rot_ok = False
 
-            rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
-        html = "<table><tr><th>Topic</th><th>Labeled?</th><th>Rotation</th></tr>"
-        for r in rows:
-            html += f"<tr><td>{r[0]}</td><td align=center>{r[1]}</td>" \
-                    f"<td align=center>{r[2]}</td></tr>"
-        html += "</table>"
-        QMessageBox.information(self, "Export Readiness", html)
+        meth = info.get("rot_method", "—")
+        gcmp = info.get("g_comp", "—")
+
+        rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—", meth, gcmp))
+    html = (
+        "<table><tr><th>Topic</th><th>Labeled?</th>"
+        "<th>Rotation</th><th>Method</th><th>g-comp</th></tr>"
+    )
+    for t, lab, rot, meth, gcmp in rows:
+        html += (
+            f"<tr><td>{t}</td><td align=center>{lab}</td>"
+            f"<td align=center>{rot}</td><td>{meth}</td><td>{gcmp}</td></tr>"
+        )
+    html += "</table>"
+    QMessageBox.information(self, "Export Readiness", html)
 
     def _show_quality(self):
-        bad = 0
-        bagstem = pathlib.Path(self.bag_path).stem
+        html = (
+            "<table><tr><th>Topic</th><th>|az| mean</th>"
+            "<th>rms(ax,ay)</th><th>OK?</th></tr>"
+        )
         for t, df in self.dfs.items():
-            rot = self.rot_by_topic.get(t)
-            rot_ok = rot is not None
-            if not rot_ok and hasattr(self, "last_export_dir"):
-                meta_path = (
-                    pathlib.Path(self.last_export_dir)
-                    / f"{t.strip('/').replace('/', '__')}_{bagstem}__imu_v1.json"
-                )
-                if meta_path.exists():
-                    try:
-                        meta = json.loads(meta_path.read_text())
-                        rot_ok = meta.get("rotation_available", False)
-                    except Exception:
-                        rot_ok = False
-            if not rot_ok:
-                bad += 1
+            info = self.rot_info.get(t, {})
+            if info.get("rot_mat") is None:
+                html += f"<tr><td>{t}</td><td colspan=3><b>no rotation</b></td></tr>"
                 continue
-            if {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
-                az = df["az_veh"].mean()
-                rms = np.sqrt((df["ax_veh"]**2 + df["ay_veh"]**2).mean())
-                if not (abs(az - 9.81) < 0.5 and rms < 0.5):
-                    bad += 1
-        col = "red" if bad else "green"
-        txt = f"{bad} Topic(s) ohne Rotation ✖" if bad else "Alles plausibel ✔"
-        QMessageBox.information(
-            self, "Rotation-Qualität",
-            f"<h2 style='color:{col}'>{txt}</h2>")
+            az = df["az_veh"].mean()
+            rms = np.sqrt((df["ax_veh"]**2 + df["ay_veh"]**2).mean())
+            ok = abs(az - 9.81) < 0.5 and rms < 0.5
+            col = "#27ae60" if ok else "#c0392b"
+            html += (
+                f"<tr><td>{t}</td><td>{az:5.2f}</td>"
+                f"<td>{rms:4.2f}</td>"
+                f"<td style='color:{col}'>{'✔' if ok else '✖'}</td></tr>"
+            )
+        html += "</table>"
+        QMessageBox.information(self, "Rotation-Qualität", html)
 
     # ------------------------------------------------------------------ Settings-Dialog
     def _configure_topics(self) -> None:
