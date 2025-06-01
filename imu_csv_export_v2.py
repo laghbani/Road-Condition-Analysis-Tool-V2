@@ -269,10 +269,10 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work["g_x"], work["g_y"], work["g_z"] = g_est.T
 
             # Rotation & Beschleunigung transformieren
-            rot_mat = auto_vehicle_frame(work, gps_df)
-            rot_avail = bool(rot_mat)
+            rot_mat = self._resolve_rotation(topic, work)
+            rot_avail = rot_mat is not None
             if rot_avail:
-                R = np.array(rot_mat)
+                R = np.asarray(rot_mat)
                 veh = acc_corr @ R.T
                 work["ax_veh"], work["ay_veh"], work["az_veh"] = veh.T
 
@@ -301,7 +301,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 "sensor_fs_accel_g": round(fsr / G_STD, 3),
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
                 "g_compensation": comp_type,
-                "vehicle_rot_mat": rot_mat,
+                "vehicle_rot_mat": rot_mat.tolist() if isinstance(rot_mat, np.ndarray) else rot_mat,
                 "rotation_available": rot_avail,
                 "sampling_rate_hz": round(fs, 2),
                 "exporter_sha1": exporter_sha,
@@ -333,9 +333,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             out_df.to_csv(csv_path, index=False)
 
         except Exception as exc:
-            QMessageBox = getattr(__import__("PySide6.QtWidgets", fromlist=["QMessageBox"]), "QMessageBox", None)
-            if QMessageBox is None:
-                from PyQt5.QtWidgets import QMessageBox
+            from PyQt5.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
             continue
 
