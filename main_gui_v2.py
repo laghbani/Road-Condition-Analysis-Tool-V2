@@ -415,6 +415,22 @@ class MainWindow(QMainWindow):
         self.act_show_veh.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_veh)
 
+        # Axis visibility
+        self.act_show_x = QAction("Show X axis", self, checkable=True)
+        self.act_show_x.setChecked(True)
+        self.act_show_x.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_x)
+
+        self.act_show_y = QAction("Show Y axis", self, checkable=True)
+        self.act_show_y.setChecked(True)
+        self.act_show_y.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_y)
+
+        self.act_show_z = QAction("Show Z axis", self, checkable=True)
+        self.act_show_z.setChecked(True)
+        self.act_show_z.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_z)
+
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
         act_check.triggered.connect(self._check_export_status)
@@ -550,8 +566,8 @@ class MainWindow(QMainWindow):
     def _set_defaults(self) -> None:
         pref = [
             "/zed_rear/zed_node/imu/data",
-            "/ouster_rear/imu",
-            "/ouster_front/imu",
+            "/zed_left/zed_node/imu/data",
+            "/zed_right/zed_node/imu/data",
         ]
         available = list(self.samples)
         sel = [p for p in pref if p in available]
@@ -580,17 +596,26 @@ class MainWindow(QMainWindow):
             ax = self.fig.add_subplot(gs[row])
             ax.set_title(f"{topic} – Linear Acc.")
             if self.act_show_raw.isChecked():
-                ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
-                ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
-                ax.plot(df["time"], df["az"], label="az", color="tab:green")
+                if self.act_show_x.isChecked():
+                    ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
+                if self.act_show_y.isChecked():
+                    ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
+                if self.act_show_z.isChecked():
+                    ax.plot(df["time"], df["az"], label="az", color="tab:green")
             if self.act_show_corr.isChecked() and "ax_corr" in df.columns:
-                ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.8, ls="--")
-                ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.8, ls="--")
-                ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.8, ls="--")
+                if self.act_show_x.isChecked():
+                    ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.8, ls="--")
+                if self.act_show_y.isChecked():
+                    ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.8, ls="--")
+                if self.act_show_z.isChecked():
+                    ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.8, ls="--")
             if self.act_show_veh.isChecked() and {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
-                ax.plot(df["time"], df["ax_veh"], label="ax_veh", color="tab:blue", alpha=0.6, ls=":")
-                ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
-                ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
+                if self.act_show_x.isChecked():
+                    ax.plot(df["time"], df["ax_veh"], label="ax_veh", color="tab:blue", alpha=0.6, ls=":")
+                if self.act_show_y.isChecked():
+                    ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
+                if self.act_show_z.isChecked():
+                    ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
