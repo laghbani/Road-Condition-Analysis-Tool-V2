@@ -58,6 +58,23 @@ FSR_8G = 8 * G_STD
 CAND_G = np.array([2, 4, 8, 16]) * G_STD        #  19.6, 39.2 … 156.9 m/s²
 
 
+def _get_qt_widget(obj, name: str):
+    """Return a Qt widget class from the same binding as *obj*."""
+    pkg = obj.__class__.__module__.split('.')[0]
+    try:
+        mod = __import__(f"{pkg}.QtWidgets", fromlist=[name])
+        return getattr(mod, name)
+    except Exception:
+        pass
+    for pkg in ("PyQt5", "PySide6"):
+        try:
+            mod = __import__(f"{pkg}.QtWidgets", fromlist=[name])
+            return getattr(mod, name)
+        except Exception:
+            continue
+    return None
+
+
 def sha1_of_file(path: Path) -> str:
     h = hashlib.sha1()
     with open(path, "rb") as f:
@@ -207,7 +224,11 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
 
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     bag_root = Path(self.bag_path)
-    from PyQt5.QtWidgets import QFileDialog
+
+    QFileDialog = _get_qt_widget(self, "QFileDialog")
+    if QFileDialog is None:
+        print("Qt not available for file dialog")
+        return
 
     folder = QFileDialog.getExistingDirectory(
         self,
@@ -301,7 +322,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 "sensor_fs_accel_g": round(fsr / G_STD, 3),
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
                 "g_compensation": comp_type,
-                "vehicle_rot_mat": rot_mat,
+                "vehicle_rot_mat": rot_mat.tolist() if rot_mat is not None else None,
                 "rotation_available": rot_avail,
                 "sampling_rate_hz": round(fs, 2),
                 "exporter_sha1": exporter_sha,
@@ -329,19 +350,29 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 f" RMS(|a_corr|) = {rms_corr:.2f}"
             )
 
-            meta_path.write_text(json.dumps(header, indent=2))
+            def _conv(o):
+                if isinstance(o, np.ndarray):
+                    return o.tolist()
+                raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+            meta_path.write_text(json.dumps(header, indent=2, default=_conv))
             out_df.to_csv(csv_path, index=False)
 
         except Exception as exc:
-            QMessageBox = getattr(__import__("PySide6.QtWidgets", fromlist=["QMessageBox"]), "QMessageBox", None)
+            QMessageBox = _get_qt_widget(self, "QMessageBox")
             if QMessageBox is None:
-                from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
+                print(f"{topic}: {exc}")
+            else:
+                QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
             continue
+        
 
     if hasattr(self, "statusBar"):
         self.statusBar().showMessage(f"Export abgeschlossen → {dest}")
 
-    from PyQt5.QtWidgets import QMessageBox
-    QMessageBox.information(self, "Export fertig",
-                            f"CSV + JSON liegen in:\n{dest}")
+    QMessageBox = _get_qt_widget(self, "QMessageBox")
+    if QMessageBox is None:
+        print(f"CSV + JSON liegen in: {dest}")
+    else:
+        QMessageBox.information(self, "Export fertig",
+                                f"CSV + JSON liegen in:\n{dest}")
