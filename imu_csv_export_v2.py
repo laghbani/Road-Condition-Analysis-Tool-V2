@@ -134,6 +134,10 @@ def remove_gravity_lowpass(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np
     b, a = butter(2, fc / (0.5 * fs), btype="low")
     g_est = filtfilt(b, a, acc_bias, axis=0)
 
+    # --- Norm-Scaling auf 1 g -----------------------------------------
+    scale = 9.80665 / np.median(np.linalg.norm(g_est, axis=1))
+    g_est *= scale
+
     acc_corr = acc_bias - g_est
     return acc_corr, g_est, bias_vec
 
@@ -175,14 +179,16 @@ def first_frame_id(samples: list) -> str:
 def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | None:
     """Calculate 3x3 rotation matrix sensor→vehicle or return ``None``."""
 
-    # --- Z-axis via gravity vector -------------------------------------
-    if {"ax_corr", "ay_corr", "az_corr"}.issubset(df.columns):
-        g_sens = -df[["ax_corr", "ay_corr", "az_corr"]].mean().to_numpy()
+    # ---------- Z-Achse -------------------------------------------------
+    if {"g_x", "g_y", "g_z"}.issubset(df.columns):
+        z_sens = df[["g_x", "g_y", "g_z"]].mean().to_numpy()
+    elif {"ax", "ay", "az"}.issubset(df.columns):
+        z_sens = df[["ax", "ay", "az"]].mean().to_numpy()
     else:
         return None
-    if np.linalg.norm(g_sens) < 1:
+    if np.linalg.norm(z_sens) < 3:
         return None
-    z_sens = g_sens / np.linalg.norm(g_sens)
+    z_sens /= np.linalg.norm(z_sens)
     R_z = rot_between(z_sens, np.array([0, 0, 1]))
 
     # --- X-axis via GPS track ------------------------------------------
