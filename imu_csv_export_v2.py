@@ -311,6 +311,9 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             else:
                 fs = 0.0
 
+            # Ensure speed column is present; add_speed may be skipped earlier
+            if "speed_mps" not in work.columns:
+                work["speed_mps"] = np.nan
             work = add_speed(work, gps_df)
             self.dfs[topic] = work
 
