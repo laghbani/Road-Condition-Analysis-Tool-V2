@@ -81,7 +81,7 @@ try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PyQt5.QtCore import Qt, QSettings
+    from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
     from PyQt5.QtGui import QKeySequence
 except ImportError:
     from PySide6.QtWidgets import (
@@ -96,7 +96,7 @@ except ImportError:
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PySide6.QtCore import Qt, QSettings
+    from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal
     from PySide6.QtGui import QKeySequence
 
 # ---------------------------------------------------------------------------#
@@ -170,6 +170,50 @@ class ImuSample:
     def lin_acc(self) -> Tuple[float, float, float]:
         la = self.msg.linear_acceleration
         return la.x, la.y, la.z
+
+
+class BagReaderWorker(QThread):
+    """Worker-Thread zum asynchronen Einlesen der Bag-Datei."""
+
+    progress = pyqtSignal(int)
+    set_maximum = pyqtSignal(int)
+    finished = pyqtSignal(object, object, object)
+
+    def __init__(self, bag_path: pathlib.Path, imu_topics: list[str], gps_topic: str | None) -> None:
+        super().__init__()
+        self.bag_path = bag_path
+        self.imu_topics = imu_topics
+        self.gps_topic = gps_topic
+
+    def run(self) -> None:
+        try:
+            reader = SequentialReader()
+            reader.open(
+                StorageOptions(str(self.bag_path), "sqlite3"),
+                ConverterOptions("cdr", "cdr"),
+            )
+            try:
+                total = reader.get_metadata().message_count
+            except Exception:
+                total = 0
+            self.set_maximum.emit(total)
+            count = 0
+            samples = {t: [] for t in self.imu_topics}
+            gps: list[tuple] = []
+            while reader.has_next():
+                topic, data, ts = reader.read_next()
+                if topic in samples:
+                    samples[topic].append(ImuSample(ts, deserialize_message(data, Imu)))
+                elif self.gps_topic and topic == self.gps_topic:
+                    msg = deserialize_message(data, NavSatFix)
+                    gps.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
+                count += 1
+                if count % 500 == 0:
+                    self.progress.emit(count)
+            self.progress.emit(total)
+            self.finished.emit(samples, gps, None)
+        except Exception as exc:
+            self.finished.emit(None, None, exc)
 
 
 # ===========================================================================
@@ -765,8 +809,7 @@ class MainWindow(QMainWindow):
         steps = [
             "Öffne Bag-Datei",
             "Ermittle Topics",
-            "Lese IMU-Daten",
-            "Lese GPS-Daten",
+            "Lese Daten",
             "Erzeuge DataFrames",
             "Vorverarbeitung (g-Korrektur, ISO-Weights …)",
             "Erstelle Plots",
@@ -778,7 +821,10 @@ class MainWindow(QMainWindow):
             if not progress.advance("Öffne Bag-Datei …"):
                 return
             reader = SequentialReader()
-            reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
+            reader.open(
+                StorageOptions(str(self.bag_path), "sqlite3"),
+                ConverterOptions("cdr", "cdr"),
+            )
 
             if not progress.advance("Ermittle Topics …"):
                 return
@@ -797,31 +843,31 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        if not progress.advance("Lese IMU-Daten …"):
+        # -- Daten asynchron laden -------------------------------------------
+        progress.lbl_step.setText("Lese Daten …")
+        progress.lst.setCurrentRow(2)
+
+        self.worker = BagReaderWorker(self.bag_path, imu_topics, gps_topic)
+        self.worker.set_maximum.connect(progress.set_bar_range)
+        self.worker.progress.connect(progress.set_bar_value)
+        self.worker.finished.connect(lambda s, g, e: self._reader_done(s, g, e, progress))
+        self.worker.start()
+
+    def _reader_done(self, samples: dict | None, gps: list | None, err: Exception | None, progress: ProgressWindow) -> None:
+        """Callback nach dem asynchronen Lese-Vorgang."""
+        if progress.wasCanceled():
             progress.accept()
             return
-        gps_samples: list[tuple] = []
-        try:
-            while reader.has_next():
-                if progress.wasCanceled():
-                    progress.accept()
-                    return
-                topic, data, ts = reader.read_next()
-                if topic in self.samples:
-                    self.samples[topic].append(ImuSample(ts, deserialize_message(data, Imu)))
-                elif gps_topic and topic == gps_topic:
-                    msg = deserialize_message(data, NavSatFix)
-                    gps_samples.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
-        except Exception as exc:
-            QMessageBox.critical(self, "Lesefehler", f"Fehler beim Lesen:\n{exc}")
-            progress.accept()
-            return
-        if not progress.advance("Lese GPS-Daten …"):
+        if err:
+            QMessageBox.critical(self, "Lesefehler", str(err))
             progress.accept()
             return
 
-        self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
+        assert samples is not None
+        self.samples = cast(dict[str, list[ImuSample]], samples)
+        self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
 
+        progress.set_bar_steps(3)
         if not progress.advance("Erzeuge DataFrames …"):
             progress.accept()
             return

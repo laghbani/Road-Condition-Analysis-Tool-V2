@@ -1,4 +1,7 @@
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QListWidget, QProgressBar, QPushButton, QApplication
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QLabel, QListWidget,
+    QProgressBar, QPushButton, QApplication,
+)
 from PyQt5.QtCore import Qt
 
 class ProgressWindow(QDialog):
@@ -16,7 +19,8 @@ class ProgressWindow(QDialog):
         vbox.addWidget(self.lbl_step)
 
         self.bar = QProgressBar()
-        self.bar.setRange(0, len(steps))
+        self.total_steps = len(steps)
+        self.bar.setRange(0, self.total_steps)
         self.bar.setValue(0)
         vbox.addWidget(self.bar)
 
@@ -43,6 +47,23 @@ class ProgressWindow(QDialog):
         self.lst.setCurrentRow(new_val)
         QApplication.processEvents()
         return not self.wasCanceled()
+
+    # ------------------------------------------------------------------
+    def set_bar_range(self, maximum: int) -> None:
+        """Extern den Fortschrittsbalken neu skalieren."""
+        self.bar.setMaximum(maximum)
+        QApplication.processEvents()
+
+    def set_bar_value(self, value: int) -> None:
+        """Extern den Fortschritt setzen."""
+        self.bar.setValue(value)
+        QApplication.processEvents()
+
+    def set_bar_steps(self, step: int) -> None:
+        """Zurück auf Schritt-basierten Fortschritt setzen."""
+        self.bar.setMaximum(self.total_steps)
+        self.bar.setValue(step)
+        QApplication.processEvents()
 
     def wasCanceled(self) -> bool:
         return self.result() == QDialog.Rejected
