@@ -126,6 +126,7 @@ try:
     )
     from iso_weighting import calc_awv
     from progress_ui import ProgressWindow
+    from videopc_widget import VideoPointCloudTab
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -673,6 +674,10 @@ class MainWindow(QMainWindow):
             v_map.addWidget(self.web_map)
         self.tabs.addTab(w_map, "Map")
 
+        # ------------------------------------------------------ Videos + PC
+        self.tab_vpc = VideoPointCloudTab()
+        self.tabs.addTab(self.tab_vpc, "Videos + PC")
+
         self.tabs.currentChanged.connect(self._tab_changed)
 
     # ------------------------------------------------------------------ Settings
@@ -1191,6 +1196,9 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, idx: int) -> None:
         if idx == 1:
             self._draw_map()
+        elif idx == 2:
+            # Placeholder: show message when switching to video/PC tab
+            self.tab_vpc.show_pointcloud_placeholder("No data loaded")
 
     def _draw_map(self) -> None:
         log.debug("Drawing map")
