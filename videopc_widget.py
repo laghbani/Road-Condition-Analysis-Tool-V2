@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QDoubleSpinBox
+    QPushButton, QDoubleSpinBox, QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap, QImage
@@ -61,6 +61,8 @@ class VideoPointCloudTab(QWidget):
         self.lbl_video.setAlignment(Qt.AlignCenter)
         self.lbl_video.setMinimumSize(320, 240)
         vcol.addWidget(self.lbl_video, stretch=1)
+        self.cmb_video = QComboBox()
+        vcol.addWidget(self.cmb_video)
         hbox.addLayout(vcol, stretch=1)
 
         # ------------------------------ Point cloud column
@@ -73,6 +75,8 @@ class VideoPointCloudTab(QWidget):
         self.lbl_placeholder.setAlignment(Qt.AlignCenter)
         self.lbl_placeholder.hide()
         pcol.addWidget(self.lbl_placeholder, stretch=1)
+        self.cmb_pc = QComboBox()
+        pcol.addWidget(self.cmb_pc)
         hbox.addLayout(pcol, stretch=1)
 
         ctrl.addWidget(QLabel("Point size:"))

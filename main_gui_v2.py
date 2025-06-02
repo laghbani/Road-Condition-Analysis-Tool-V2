@@ -116,7 +116,12 @@ except ImportError:
 try:
     from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
     from rclpy.serialization import deserialize_message
-    from sensor_msgs.msg import Imu, NavSatFix
+    from sensor_msgs.msg import (
+        Imu, NavSatFix, Image, CompressedImage, PointCloud2
+    )
+    from cv_bridge import CvBridge
+    from sensor_msgs_py import point_cloud2 as pc2
+    import cv2
     from imu_csv_export_v2 import (
         export_csv_smart_v2,
         remove_gravity_lowpass,
@@ -208,15 +213,21 @@ class BagReaderWorker(QThread):
 
             self.stepChanged.emit("Ermittle Topics …")
             topics_info = reader.get_all_topics_and_types()
-            imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
+            topic_types = {t.name: t.type for t in topics_info}
+            imu_topics = [t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/Imu"]
+            gps_topic = next((t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/NavSatFix"), None)
+            image_topics = [t for t, ty in topic_types.items() if ty in ("sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage")]
+            pc_topics = [t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/PointCloud2"]
 
             total = reader.get_metadata().message_count
             self.setMaximum.emit(total)
 
             samples = {t: [] for t in imu_topics}
             gps: list[tuple] = []
+            video_frames_by_topic: dict[str, list[np.ndarray]] = {t: [] for t in image_topics}
+            pc_frames_by_topic: dict[str, list[np.ndarray]] = {t: [] for t in pc_topics}
             cnt = 0
+            bridge = CvBridge()
 
             self.stepChanged.emit("Lese Daten …")
             while reader.has_next():
@@ -226,6 +237,23 @@ class BagReaderWorker(QThread):
                 elif gps_topic and topic == gps_topic:
                     msg = deserialize_message(data, NavSatFix)
                     gps.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
+                elif topic in video_frames_by_topic:
+                    mtype = topic_types[topic]
+                    if mtype == "sensor_msgs/msg/Image":
+                        img_msg = deserialize_message(data, Image)
+                        cv_img = bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
+                    else:
+                        img_msg = deserialize_message(data, CompressedImage)
+                        buf = np.frombuffer(img_msg.data, dtype=np.uint8)
+                        cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    video_frames_by_topic[topic].append(cv_img)
+                elif topic in pc_frames_by_topic:
+                    pc_msg = deserialize_message(data, PointCloud2)
+                    xyz = np.asarray([
+                        [p[0], p[1], p[2]]
+                        for p in pc2.read_points(pc_msg, field_names=("x", "y", "z"), skip_nans=True)
+                    ], dtype=np.float32)
+                    pc_frames_by_topic[topic].append(xyz)
                 cnt += 1
                 if cnt % 200 == 0:
                     self.progress.emit(cnt)
@@ -233,7 +261,19 @@ class BagReaderWorker(QThread):
             self.progress.emit(total)
             available = [t for t, vals in samples.items() if vals]
             log.debug("BagReaderWorker finished reading")
-            self.finished.emit((samples, gps, available, gps_topic), None)
+            self.finished.emit(
+                (
+                    samples,
+                    gps,
+                    available,
+                    gps_topic,
+                    image_topics,
+                    pc_topics,
+                    video_frames_by_topic,
+                    pc_frames_by_topic,
+                ),
+                None,
+            )
         except Exception as exc:
             log.exception("BagReaderWorker error")
             self.finished.emit(None, exc)
@@ -617,6 +657,12 @@ class MainWindow(QMainWindow):
         self.peak_distance: float = 0.0
         self.use_max_peak: bool = False
 
+        # Video/PointCloud playback
+        self.video_topic: str | None = None
+        self.pc_topic: str | None = None
+        self.video_frames_by_topic: dict[str, list[np.ndarray]] = {}
+        self.pc_frames_by_topic: dict[str, list[np.ndarray]] = {}
+
         self._build_menu()
         self._build_ui()
 
@@ -677,6 +723,8 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------ Videos + PC
         self.tab_vpc = VideoPointCloudTab()
         self.tabs.addTab(self.tab_vpc, "Videos + PC")
+        self.tab_vpc.cmb_video.currentTextChanged.connect(self._change_video_topic)
+        self.tab_vpc.cmb_pc.currentTextChanged.connect(self._change_pc_topic)
 
         self.tabs.currentChanged.connect(self._tab_changed)
 
@@ -867,7 +915,9 @@ class MainWindow(QMainWindow):
             return
 
         assert result is not None
-        samples, gps, available, gps_topic = result
+        (samples, gps, available, gps_topic,
+         image_topics, pc_topics,
+         vid_frames, pc_frames) = result
         if not available:
             QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
             progress.accept()
@@ -877,7 +927,20 @@ class MainWindow(QMainWindow):
         self.samples = cast(dict[str, list[ImuSample]], {t: samples[t] for t in available})
         self.available_topics = available
         self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
+        self.video_frames_by_topic = vid_frames
+        self.pc_frames_by_topic = pc_frames
         log.debug("Available topics: %s", self.available_topics)
+
+        self.tab_vpc.cmb_video.clear()
+        self.tab_vpc.cmb_video.addItems(image_topics)
+        self.tab_vpc.cmb_pc.clear()
+        self.tab_vpc.cmb_pc.addItems(pc_topics)
+        if image_topics:
+            self.tab_vpc.cmb_video.setCurrentIndex(0)
+            self._change_video_topic(image_topics[0])
+        if pc_topics:
+            self.tab_vpc.cmb_pc.setCurrentIndex(0)
+            self._change_pc_topic(pc_topics[0])
 
         progress.set_bar_steps(3)
         if not progress.advance("Erzeuge DataFrames …"):
@@ -1213,22 +1276,24 @@ class MainWindow(QMainWindow):
             if not self.tab_vpc.video_frames:
                 self.tab_vpc.show_pointcloud_placeholder("No data loaded")
 
+    def _change_video_topic(self, t: str) -> None:
+        self.video_topic = t if t else None
+        vframes = self.video_frames_by_topic.get(t, [])
+        pframes = self.pc_frames_by_topic.get(self.pc_topic, [])
+        self.tab_vpc.load_arrays(vframes, pframes)
+
+    def _change_pc_topic(self, t: str) -> None:
+        self.pc_topic = t if t else None
+        vframes = self.video_frames_by_topic.get(self.video_topic, [])
+        pframes = self.pc_frames_by_topic.get(t, [])
+        self.tab_vpc.load_arrays(vframes, pframes)
+
     def _show_peak_video(self, topic: str, t_peak: float) -> None:
-        pre = float(self.tab_vpc.spn_pre.value())
-        post = float(self.tab_vpc.spn_post.value())
-        times = np.arange(t_peak - pre, t_peak + post, 0.1)
-        video_frames: list[np.ndarray] = []
-        pc_frames: list[np.ndarray] = []
-        for t in times:
-            val = int(255 * (t - times[0]) / max(times[-1] - times[0], 0.1))
-            img = np.full((240, 320, 3), val, dtype=np.uint8)
-            video_frames.append(img)
-
-            pts = np.random.normal(size=(500, 3)).astype(np.float32)
-            pts[:, 2] += 0.1 * t
-            pc_frames.append(pts)
-
-        self.tab_vpc.load_arrays(video_frames, pc_frames)
+        vframes = self.video_frames_by_topic.get(self.video_topic or "", [])
+        pframes = self.pc_frames_by_topic.get(self.pc_topic or "", [])
+        if not vframes and not pframes:
+            return
+        self.tab_vpc.load_arrays(vframes, pframes)
         self.tabs.setCurrentIndex(2)
         self.tab_vpc.play()
 
