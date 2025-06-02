@@ -17,11 +17,22 @@ import pathlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, cast
 from enum import Enum, auto
+import logging
 
 import numpy as np
 import pandas as pd
 import json
 import os
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('debug.log', mode='w', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------#
 # Matplotlib – robuster Style-Loader                                         #
@@ -81,7 +92,7 @@ try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PyQt5.QtCore import Qt, QSettings
+    from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
     from PyQt5.QtGui import QKeySequence
 except ImportError:
     from PySide6.QtWidgets import (
@@ -96,7 +107,7 @@ except ImportError:
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PySide6.QtCore import Qt, QSettings
+    from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal
     from PySide6.QtGui import QKeySequence
 
 # ---------------------------------------------------------------------------#
@@ -114,6 +125,7 @@ try:
         _get_qt_widget,
     )
     from iso_weighting import calc_awv
+    from progress_ui import ProgressWindow
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -169,6 +181,61 @@ class ImuSample:
     def lin_acc(self) -> Tuple[float, float, float]:
         la = self.msg.linear_acceleration
         return la.x, la.y, la.z
+
+
+class BagReaderWorker(QThread):
+    """Worker-Thread zum asynchronen Einlesen der Bag-Datei."""
+
+    stepChanged = pyqtSignal(str)
+    setMaximum  = pyqtSignal(int)
+    progress    = pyqtSignal(int)
+    finished    = pyqtSignal(object, object)
+
+    def __init__(self, bag_path: pathlib.Path) -> None:
+        super().__init__()
+        self.bag_path = bag_path
+
+    def run(self) -> None:
+        try:
+            log.debug("BagReaderWorker started")
+            self.stepChanged.emit("Öffne Bag-Datei …")
+            reader = SequentialReader()
+            reader.open(
+                StorageOptions(str(self.bag_path), "sqlite3"),
+                ConverterOptions("cdr", "cdr"),
+            )
+
+            self.stepChanged.emit("Ermittle Topics …")
+            topics_info = reader.get_all_topics_and_types()
+            imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
+            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
+
+            total = reader.get_metadata().message_count
+            self.setMaximum.emit(total)
+
+            samples = {t: [] for t in imu_topics}
+            gps: list[tuple] = []
+            cnt = 0
+
+            self.stepChanged.emit("Lese Daten …")
+            while reader.has_next():
+                topic, data, ts = reader.read_next()
+                if topic in samples:
+                    samples[topic].append(ImuSample(ts, deserialize_message(data, Imu)))
+                elif gps_topic and topic == gps_topic:
+                    msg = deserialize_message(data, NavSatFix)
+                    gps.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
+                cnt += 1
+                if cnt % 200 == 0:
+                    self.progress.emit(cnt)
+
+            self.progress.emit(total)
+            available = [t for t, vals in samples.items() if vals]
+            log.debug("BagReaderWorker finished reading")
+            self.finished.emit((samples, gps, available, gps_topic), None)
+        except Exception as exc:
+            log.exception("BagReaderWorker error")
+            self.finished.emit(None, exc)
 
 
 # ===========================================================================
@@ -376,6 +443,55 @@ class PeakDialog(QDialog):
         return self.sb_thr.value(), self.sb_dist.value(), self.chk_max.isChecked()
 
 
+class LabelManagerDialog(QDialog):
+    """Advanced dialog to edit existing label segments."""
+
+    def __init__(self, dfs: dict[str, pd.DataFrame], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Labels")
+        self.resize(600, 400)
+
+        self.dfs = dfs
+        self.tbl = QTableWidget(self)
+        self.tbl.setColumnCount(4)
+        self.tbl.setHorizontalHeaderLabels(["Topic", "Label", "Start", "End"])
+
+        rows = []
+        for topic, df in dfs.items():
+            mask = df["label_name"] != UNKNOWN_NAME
+            if not mask.any():
+                continue
+            seg_id = (df["label_name"] != df["label_name"].shift()).cumsum()
+            for _, grp in df[mask].groupby(seg_id):
+                rows.append((topic, grp["label_name"].iat[0], grp["time"].iat[0], grp["time"].iat[-1]))
+
+        self.tbl.setRowCount(len(rows))
+        for i, (t, lbl, s, e) in enumerate(rows):
+            self.tbl.setItem(i, 0, QTableWidgetItem(t))
+            it_lbl = QTableWidgetItem(lbl)
+            it_lbl.setFlags(it_lbl.flags() | Qt.ItemIsEditable)
+            self.tbl.setItem(i, 1, it_lbl)
+            self.tbl.setItem(i, 2, QTableWidgetItem(f"{s:.2f}"))
+            self.tbl.setItem(i, 3, QTableWidgetItem(f"{e:.2f}"))
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tbl)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+    def result(self) -> dict[str, list[tuple[str, float, float]]]:
+        res: dict[str, list[tuple[str, float, float]]] = {}
+        for r in range(self.tbl.rowCount()):
+            topic = self.tbl.item(r, 0).text()
+            label = self.tbl.item(r, 1).text()
+            s = float(self.tbl.item(r, 2).text())
+            e = float(self.tbl.item(r, 3).text())
+            res.setdefault(topic, []).append((label, s, e))
+        return res
+
+
 # ===========================================================================
 # Undo/Redo Commands
 # ===========================================================================
@@ -480,6 +596,7 @@ class MainWindow(QMainWindow):
         self.dfs: dict[str, pd.DataFrame] = {}
         self.t0: float | None = None
         self._gps_df: pd.DataFrame | None = None
+        self.available_topics: list[str] = []
 
         # Runtime-State
         self.active_topics: list[str] = []
@@ -611,6 +728,10 @@ class MainWindow(QMainWindow):
         m_edit.addAction(act_undo)
         m_edit.addAction(act_redo)
 
+        act_manage = QAction("Manage labels …", self)
+        act_manage.triggered.connect(self._open_label_manager)
+        m_edit.addAction(act_manage)
+
         m_imu = mb.addMenu("&IMU Settings")
         self.act_topics = QAction("Topics auswählen …", self)
         self.act_topics.setEnabled(False)
@@ -707,44 +828,102 @@ class MainWindow(QMainWindow):
         self.samples.clear()
         self.dfs.clear()
         self.t0 = None
+        self.available_topics.clear()
 
-        try:
-            reader = SequentialReader()
-            reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
-            topics_info = reader.get_all_topics_and_types()
-            imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
-            for t in imu_topics:
-                self.samples[t] = []
-        except Exception as exc:
-            QMessageBox.critical(self, "Lesefehler", str(exc))
+        steps = [
+            "Öffne Bag-Datei",
+            "Ermittle Topics",
+            "Lese Daten",
+            "Erzeuge DataFrames",
+            "Vorverarbeitung (g-Korrektur, ISO-Weights …)",
+            "Erstelle Plots",
+            "Erstelle Karte",
+        ]
+        progress = ProgressWindow("Bag einlesen", steps, parent=self)
+
+        self.worker = BagReaderWorker(self.bag_path)
+        self.worker.stepChanged.connect(progress.advance)
+        self.worker.setMaximum.connect(progress.set_bar_range)
+        self.worker.progress.connect(progress.set_bar_value)
+        self.worker.finished.connect(lambda res, err: self._reader_done(res, err, progress))
+        self.worker.start()
+
+    def _reader_done(self, result: tuple | None, err: Exception | None, progress: ProgressWindow) -> None:
+        """Callback nach dem asynchronen Lese-Vorgang."""
+        log.debug("Reader done callback invoked")
+        if progress.wasCanceled():
+            log.debug("Progress dialog was canceled")
+            progress.accept()
+            return
+        if err:
+            log.error("Error from worker: %s", err)
+            QMessageBox.critical(self, "Lesefehler", str(err))
+            progress.accept()
             return
 
-        if not self.samples:
+        assert result is not None
+        samples, gps, available, gps_topic = result
+        if not available:
             QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
+            progress.accept()
             return
 
-        # Daten einlesen
-        gps_samples: list[tuple] = []
+        # nur Topics mit Daten behalten
+        self.samples = cast(dict[str, list[ImuSample]], {t: samples[t] for t in available})
+        self.available_topics = available
+        self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
+        log.debug("Available topics: %s", self.available_topics)
+
+        progress.set_bar_steps(3)
+        if not progress.advance("Erzeuge DataFrames …"):
+            log.debug("Aborted during DataFrame generation")
+            progress.accept()
+            return
         try:
-            while reader.has_next():
-                topic, data, ts = reader.read_next()
-                if topic in self.samples:
-                    self.samples[topic].append(ImuSample(ts, deserialize_message(data, Imu)))
-                elif gps_topic and topic == gps_topic:
-                    msg = deserialize_message(data, NavSatFix)
-                    gps_samples.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
-        except Exception as exc:
-            QMessageBox.critical(self, "Lesefehler", f"Fehler beim Lesen:\n{exc}")
+            self._build_dfs()
+            log.debug("DataFrames built")
+        except Exception:
+            log.exception("Error while building DataFrames")
+            progress.accept()
             return
 
-        self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
+        if not progress.advance("Vorverarbeitung …"):
+            log.debug("Aborted during preprocessing")
+            progress.accept()
+            return
+        try:
+            self._preprocess_all()
+            log.debug("Preprocessing done")
+        except Exception:
+            log.exception("Error during preprocessing")
+            progress.accept()
+            return
 
-        self._build_dfs()
-        self._preprocess_all()
+        if not progress.advance("Erstelle Plots …"):
+            log.debug("Aborted before plotting")
+            progress.accept()
+            return
         self._set_defaults()
-        self._draw_plots()
-        self._draw_map()
+        try:
+            self._draw_plots()
+            log.debug("Plots drawn")
+        except Exception:
+            log.exception("Error while drawing plots")
+            progress.accept()
+            return
+
+        if not progress.advance("Erstelle Karte …"):
+            log.debug("Aborted before map creation")
+            progress.accept()
+            return
+        try:
+            self._draw_map()
+            log.debug("Map drawn")
+        except Exception:
+            log.exception("Error while drawing map")
+            progress.accept()
+            return
+        progress.accept()
 
         self.act_topics.setEnabled(True)
         self.act_verify.setEnabled(True)
@@ -753,25 +932,28 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ DataFrame
     def _build_dfs(self) -> None:
+        log.debug("Building DataFrames")
         for t, samps in self.samples.items():
             if not samps:
                 continue
             ta = np.array([s.time_abs for s in samps])
             if self.t0 is None:
                 self.t0 = ta[0]
-            tr = ta - self.t0
+            tr = np.maximum(ta - self.t0, 0)
             df = pd.DataFrame({
                 "time": tr, "time_abs": ta,
-                "ax": [s.lin_acc[0] for s in samps],
-                "ay": [s.lin_acc[1] for s in samps],
-                "az": [s.lin_acc[2] for s in samps],
+                "accel_x": [s.lin_acc[0] for s in samps],
+                "accel_y": [s.lin_acc[1] for s in samps],
+                "accel_z": [s.lin_acc[2] for s in samps],
                 "label_id": np.full_like(tr, UNKNOWN_ID, int),
                 "label_name": [UNKNOWN_NAME] * len(tr),
             })
             self.dfs[t] = df
+        log.debug("DataFrames created: %s", list(self.dfs))
 
     # ------------------------------------------------------------------ Preprocess
     def _preprocess_all(self) -> None:
+        log.debug("Preprocessing all topics")
         self.iso_metrics.clear()
         for topic, df in self.dfs.items():
             samps = self.samples[topic]
@@ -789,20 +971,20 @@ class MainWindow(QMainWindow):
                 g_vec = gravity_from_quat(
                     pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"])
                 )
-                acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
+                acc_corr = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - g_vec
                 g_est = g_vec
             else:
                 acc_corr, g_est, _ = remove_gravity_lowpass(df)
 
-            df[["ax_corr", "ay_corr", "az_corr"]] = acc_corr
-            df[["g_x", "g_y", "g_z"]] = g_est
+            df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
+            df[["grav_x", "grav_y", "grav_z"]] = g_est
 
             # --- Fahrzeug-Rahmen ---------------------------------------------
             rot = self._resolve_rotation(topic, df)
             if rot is not None:
                 R = np.asarray(rot)
                 veh = acc_corr @ R.T
-                df[["ax_veh", "ay_veh", "az_veh"]] = veh
+                df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
 
             # --- ISO 2631 weighting -----------------------------------------
             fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
@@ -824,6 +1006,7 @@ class MainWindow(QMainWindow):
                 "crest_factor": res["crest_factor"],
                 "peaks": res["peaks"].tolist(),
             }
+        log.debug("Preprocessing finished")
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
@@ -850,7 +1033,10 @@ class MainWindow(QMainWindow):
             "/zed_left/zed_node/imu/data",
             "/zed_right/zed_node/imu/data",
         ]
-        available = list(self.samples)
+        available = self.available_topics or list(self.dfs)
+        if not available:
+            self.active_topics = []
+            return
         sel = [p for p in pref if p in available]
         for t in available:
             if len(sel) >= 3:
@@ -861,6 +1047,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Plots
     def _draw_plots(self, verify: bool = False) -> None:
+        log.debug("Drawing plots (verify=%s)", verify)
         self.fig.clear()
         self.ax_topic.clear()
         for sel in self.span_selector.values():
@@ -879,25 +1066,25 @@ class MainWindow(QMainWindow):
             ax.set_title(f"{topic} – Linear Acc.")
             if self.act_show_raw.isChecked():
                 if self.act_show_x.isChecked():
-                    ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
+                    ax.plot(df["time"], df["accel_x"], label="accel_x", color="tab:blue")
                 if self.act_show_y.isChecked():
-                    ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
+                    ax.plot(df["time"], df["accel_y"], label="accel_y", color="tab:orange")
                 if self.act_show_z.isChecked():
-                    ax.plot(df["time"], df["az"], label="az", color="tab:green")
-            if self.act_show_corr.isChecked() and "ax_corr" in df.columns:
+                    ax.plot(df["time"], df["accel_z"], label="accel_z", color="tab:green")
+            if self.act_show_corr.isChecked() and "accel_corr_x" in df.columns:
                 if self.act_show_x.isChecked():
-                    ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.8, ls="--")
+                    ax.plot(df["time"], df["accel_corr_x"], label="accel_corr_x", color="tab:blue", alpha=0.8, ls="--")
                 if self.act_show_y.isChecked():
-                    ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.8, ls="--")
+                    ax.plot(df["time"], df["accel_corr_y"], label="accel_corr_y", color="tab:orange", alpha=0.8, ls="--")
                 if self.act_show_z.isChecked():
-                    ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.8, ls="--")
-            if self.act_show_veh.isChecked() and {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
+                    ax.plot(df["time"], df["accel_corr_z"], label="accel_corr_z", color="tab:green", alpha=0.8, ls="--")
+            if self.act_show_veh.isChecked() and {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(df.columns):
                 if self.act_show_x.isChecked():
-                    ax.plot(df["time"], df["ax_veh"], label="ax_veh", color="tab:blue", alpha=0.6, ls=":")
+                    ax.plot(df["time"], df["accel_veh_x"], label="accel_veh_x", color="tab:blue", alpha=0.6, ls=":")
                 if self.act_show_y.isChecked():
-                    ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
+                    ax.plot(df["time"], df["accel_veh_y"], label="accel_veh_y", color="tab:orange", alpha=0.6, ls=":")
                 if self.act_show_z.isChecked():
-                    ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
+                    ax.plot(df["time"], df["accel_veh_z"], label="accel_veh_z", color="tab:green", alpha=0.6, ls=":")
             if self.act_show_iso.isChecked() and {"awx", "awy", "awz", "awv"}.issubset(df.columns):
                 if self.act_show_x.isChecked():
                     ax.plot(df["time"], df["awx"], label="awx", color="tab:blue")
@@ -954,6 +1141,7 @@ class MainWindow(QMainWindow):
                 ax_tr.legend(fontsize="x-small", ncol=3, loc="upper right")
 
         self.canvas.draw_idle()
+        log.debug("Plots updated")
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
             self._draw_map()
 
@@ -1005,6 +1193,7 @@ class MainWindow(QMainWindow):
             self._draw_map()
 
     def _draw_map(self) -> None:
+        log.debug("Drawing map")
         if self._gps_df is None or not self.active_topics:
             if QWebEngineView is None:
                 self.fig_map.clear()
@@ -1084,6 +1273,7 @@ class MainWindow(QMainWindow):
             fmap.save(map_file)
             gps.to_csv(map_file.replace(".html", "_gps.csv"), index=False)
             self.web_map.load(QUrl.fromLocalFile(map_file))
+        log.debug("Map updated")
 
     def _assign_label(self, topic: str, xmin: float, xmax: float,
                       lname: str | None = None) -> None:
@@ -1162,7 +1352,7 @@ class MainWindow(QMainWindow):
             if meta_file and meta_file.exists():
                 rot_ok = json.loads(meta_file.read_text()).get("rotation_available", False)
             else:
-                rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns) or \
+                rot_ok = {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(df.columns) or \
                     (has_lbl and any(s.msg.orientation.w not in (0, 1) for s in self.samples[t]))
 
             rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
@@ -1187,6 +1377,21 @@ class MainWindow(QMainWindow):
             return
         self.peak_threshold, self.peak_distance, self.use_max_peak = dlg.result()
         self._preprocess_all()
+        self._draw_plots()
+
+    def _open_label_manager(self) -> None:
+        dlg = LabelManagerDialog(self.dfs, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        result = dlg.result()
+        for topic, segs in result.items():
+            df = self.dfs[topic]
+            df["label_id"] = UNKNOWN_ID
+            df["label_name"] = UNKNOWN_NAME
+            for lbl, s, e in segs:
+                lid = self.LABEL_IDS.get(lbl, UNKNOWN_ID)
+                mask = (df["time"] >= s) & (df["time"] <= e)
+                df.loc[mask, ["label_id", "label_name"]] = [lid, lbl]
         self._draw_plots()
 
     def _set_weighting(self, comfort: bool) -> None:
