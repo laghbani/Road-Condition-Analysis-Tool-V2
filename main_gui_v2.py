@@ -75,13 +75,14 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup
+        QActionGroup, QUndoStack, QUndoCommand
     )
     try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PyQt5.QtCore import Qt
+    from PyQt5.QtCore import Qt, QSettings
+    from PyQt5.QtGui import QKeySequence
 except ImportError:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
@@ -89,13 +90,14 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup
+        QActionGroup, QUndoStack, QUndoCommand
     )
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QSettings
+    from PySide6.QtGui import QKeySequence
 
 # ---------------------------------------------------------------------------#
 # ROS-Import                                                                 #
@@ -375,6 +377,86 @@ class PeakDialog(QDialog):
 
 
 # ===========================================================================
+# Undo/Redo Commands
+# ===========================================================================
+class AddLabelCmd(QUndoCommand):
+    """Undoable command: add label to a time range."""
+
+    def __init__(self, win, topic: str, xmin: float, xmax: float, lname: str):
+        super().__init__(f"Add {lname}")
+        self.win = win
+        self.topic = topic
+        self.xmin = xmin
+        self.xmax = xmax
+        self.lname = lname
+        df = win.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        self.prev = df.loc[mask, ["label_id", "label_name"]].copy()
+
+    def redo(self) -> None:  # type: ignore[override]
+        self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
+
+    def undo(self) -> None:  # type: ignore[override]
+        df = self.win.dfs[self.topic]
+        mask = (df["time"] >= self.xmin) & (df["time"] <= self.xmax)
+        df.loc[mask, ["label_id", "label_name"]] = self.prev.values
+        ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
+        self.win._restore_labels(ax, self.topic)
+        self.win.canvas.draw_idle()
+
+
+class DeleteLabelCmd(QUndoCommand):
+    """Undoable command: delete labels in a range."""
+
+    def __init__(self, win, topic: str, xmin: float, xmax: float):
+        super().__init__("Delete labels")
+        self.win = win
+        self.topic = topic
+        self.xmin = xmin
+        self.xmax = xmax
+        df = win.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        self.prev = df.loc[mask, ["label_id", "label_name"]].copy()
+
+    def redo(self) -> None:  # type: ignore[override]
+        self.win._delete_label_range(self.topic, self.xmin, self.xmax)
+
+    def undo(self) -> None:  # type: ignore[override]
+        df = self.win.dfs[self.topic]
+        mask = (df["time"] >= self.xmin) & (df["time"] <= self.xmax)
+        df.loc[mask, ["label_id", "label_name"]] = self.prev.values
+        ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
+        self.win._restore_labels(ax, self.topic)
+        self.win.canvas.draw_idle()
+
+
+class EditLabelCmd(QUndoCommand):
+    """Undoable command: change label in a range."""
+
+    def __init__(self, win, topic: str, xmin: float, xmax: float, lname: str):
+        super().__init__(f"Edit → {lname}")
+        self.win = win
+        self.topic = topic
+        self.xmin = xmin
+        self.xmax = xmax
+        self.lname = lname
+        df = win.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        self.prev = df.loc[mask, ["label_id", "label_name"]].copy()
+
+    def redo(self) -> None:  # type: ignore[override]
+        self.win._delete_label_range(self.topic, self.xmin, self.xmax)
+        self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
+
+    def undo(self) -> None:  # type: ignore[override]
+        df = self.win.dfs[self.topic]
+        mask = (df["time"] >= self.xmin) & (df["time"] <= self.xmax)
+        df.loc[mask, ["label_id", "label_name"]] = self.prev.values
+        ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
+        self.win._restore_labels(ax, self.topic)
+        self.win.canvas.draw_idle()
+
+# ===========================================================================
 # Main-Window
 # ===========================================================================
 class MainWindow(QMainWindow):
@@ -384,6 +466,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("ROS 2 IMU-Labeling Tool")
         self.resize(1500, 900)
+
+        # Persistent settings
+        self.settings = QSettings("FH-Zürich", "IMU-LabelTool")
+        self.undo = QUndoStack(self)
 
         # Daten-Strukturen
         self.bag_path: pathlib.Path | None = None
@@ -410,6 +496,9 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+
+        # Restore persisted window state
+        self._restore_settings()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -464,6 +553,24 @@ class MainWindow(QMainWindow):
 
         self.tabs.currentChanged.connect(self._tab_changed)
 
+    # ------------------------------------------------------------------ Settings
+    def _restore_settings(self) -> None:
+        geom = self.settings.value("geom", b"")
+        if isinstance(geom, (bytes, bytearray)):
+            self.restoreGeometry(geom)
+        state = self.settings.value("state", b"")
+        if isinstance(state, (bytes, bytearray)):
+            self.restoreState(state)
+        topics = self.settings.value("active_topics")
+        if isinstance(topics, list):
+            self.active_topics = [str(t) for t in topics]
+
+    def closeEvent(self, e) -> None:
+        self.settings.setValue("geom", self.saveGeometry())
+        self.settings.setValue("state", self.saveState())
+        self.settings.setValue("active_topics", self.active_topics)
+        super().closeEvent(e)
+
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
         mb = self.menuBar()
@@ -489,6 +596,15 @@ class MainWindow(QMainWindow):
 
         m_file.addSeparator()
         m_file.addAction("Beenden", lambda: QApplication.instance().quit())
+
+        # Edit menu with Undo/Redo
+        m_edit = mb.addMenu("&Edit")
+        act_undo = self.undo.createUndoAction(self, "Undo")
+        act_redo = self.undo.createRedoAction(self, "Redo")
+        act_undo.setShortcut(QKeySequence.Undo)
+        act_redo.setShortcut(QKeySequence.Redo)
+        m_edit.addAction(act_undo)
+        m_edit.addAction(act_redo)
 
         m_imu = mb.addMenu("&IMU Settings")
         self.act_topics = QAction("Topics auswählen …", self)
@@ -867,7 +983,8 @@ class MainWindow(QMainWindow):
         xmin, xmax = self.current_span[topic]
         if xmax <= xmin:
             return
-        self._assign_label(topic, xmin, xmax)
+        lname = self.cmb.currentData()
+        self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
 
     def _tab_changed(self, idx: int) -> None:
         if idx == 1:
@@ -954,9 +1071,11 @@ class MainWindow(QMainWindow):
             gps.to_csv(map_file.replace(".html", "_gps.csv"), index=False)
             self.web_map.load(QUrl.fromLocalFile(map_file))
 
-    def _assign_label(self, topic: str, xmin: float, xmax: float) -> None:
+    def _assign_label(self, topic: str, xmin: float, xmax: float,
+                      lname: str | None = None) -> None:
         df = self.dfs[topic]
-        lname = self.cmb.currentData()
+        if lname is None:
+            lname = self.cmb.currentData()
         lid = self.LABEL_IDS[lname]
         color = ANOMALY_TYPES[lname]["color"]
         mask = (df["time"] >= xmin) & (df["time"] <= xmax)
@@ -991,7 +1110,8 @@ class MainWindow(QMainWindow):
         xmin, xmax = self.current_span[t]
         if xmax <= xmin:
             return
-        self._assign_label(t, xmin, xmax)
+        lname = self.cmb.currentData()
+        self.undo.push(AddLabelCmd(self, t, xmin, xmax, lname))
 
     def _button_edit_label(self) -> None:
         t = self.last_selected_topic
@@ -1000,15 +1120,15 @@ class MainWindow(QMainWindow):
         xmin, xmax = self.current_span[t]
         if xmax <= xmin:
             return
-        self._delete_label_range(t, xmin, xmax)
-        self._assign_label(t, xmin, xmax)
+        lname = self.cmb.currentData()
+        self.undo.push(EditLabelCmd(self, t, xmin, xmax, lname))
 
     def _button_delete_label(self) -> None:
         t = self.last_selected_topic
         if not t or t not in self.current_span:
             return
         xmin, xmax = self.current_span[t]
-        self._delete_label_range(t, xmin, xmax)
+        self.undo.push(DeleteLabelCmd(self, t, xmin, xmax))
 
     def _check_export_status(self):
         rows = []

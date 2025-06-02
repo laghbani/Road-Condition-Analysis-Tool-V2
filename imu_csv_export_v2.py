@@ -273,6 +273,11 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 work["gy"] = gyro[:, 1]
                 work["gz"] = gyro[:, 2]
 
+            # Speed must be present before rotation handling
+            if "speed_mps" not in work.columns:
+                work["speed_mps"] = np.nan
+            work = add_speed(work, gps_df)
+
             abs_a = np.linalg.norm(df[["ax", "ay", "az"]].to_numpy(), axis=1)
             fsr = detect_fsr(abs_a)
             clipped = (df[["ax", "ay", "az"]].abs() >= 0.98 * fsr).any(axis=1)
@@ -313,10 +318,6 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             else:
                 fs = 0.0
 
-            # Ensure speed column is present; add_speed may be skipped earlier
-            if "speed_mps" not in work.columns:
-                work["speed_mps"] = np.nan
-            work = add_speed(work, gps_df)
             self.dfs[topic] = work
 
             header = {
