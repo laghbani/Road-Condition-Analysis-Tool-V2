@@ -942,9 +942,9 @@ class MainWindow(QMainWindow):
             tr = ta - self.t0
             df = pd.DataFrame({
                 "time": tr, "time_abs": ta,
-                "ax": [s.lin_acc[0] for s in samps],
-                "ay": [s.lin_acc[1] for s in samps],
-                "az": [s.lin_acc[2] for s in samps],
+                "accel_x": [s.lin_acc[0] for s in samps],
+                "accel_y": [s.lin_acc[1] for s in samps],
+                "accel_z": [s.lin_acc[2] for s in samps],
                 "label_id": np.full_like(tr, UNKNOWN_ID, int),
                 "label_name": [UNKNOWN_NAME] * len(tr),
             })
@@ -971,20 +971,20 @@ class MainWindow(QMainWindow):
                 g_vec = gravity_from_quat(
                     pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"])
                 )
-                acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
+                acc_corr = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - g_vec
                 g_est = g_vec
             else:
                 acc_corr, g_est, _ = remove_gravity_lowpass(df)
 
-            df[["ax_corr", "ay_corr", "az_corr"]] = acc_corr
-            df[["g_x", "g_y", "g_z"]] = g_est
+            df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
+            df[["grav_x", "grav_y", "grav_z"]] = g_est
 
             # --- Fahrzeug-Rahmen ---------------------------------------------
             rot = self._resolve_rotation(topic, df)
             if rot is not None:
                 R = np.asarray(rot)
                 veh = acc_corr @ R.T
-                df[["ax_veh", "ay_veh", "az_veh"]] = veh
+                df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
 
             # --- ISO 2631 weighting -----------------------------------------
             fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
@@ -1066,25 +1066,25 @@ class MainWindow(QMainWindow):
             ax.set_title(f"{topic} – Linear Acc.")
             if self.act_show_raw.isChecked():
                 if self.act_show_x.isChecked():
-                    ax.plot(df["time"], df["ax"], label="ax", color="tab:blue")
+                    ax.plot(df["time"], df["accel_x"], label="accel_x", color="tab:blue")
                 if self.act_show_y.isChecked():
-                    ax.plot(df["time"], df["ay"], label="ay", color="tab:orange")
+                    ax.plot(df["time"], df["accel_y"], label="accel_y", color="tab:orange")
                 if self.act_show_z.isChecked():
-                    ax.plot(df["time"], df["az"], label="az", color="tab:green")
-            if self.act_show_corr.isChecked() and "ax_corr" in df.columns:
+                    ax.plot(df["time"], df["accel_z"], label="accel_z", color="tab:green")
+            if self.act_show_corr.isChecked() and "accel_corr_x" in df.columns:
                 if self.act_show_x.isChecked():
-                    ax.plot(df["time"], df["ax_corr"], label="ax_corr", color="tab:blue", alpha=0.8, ls="--")
+                    ax.plot(df["time"], df["accel_corr_x"], label="accel_corr_x", color="tab:blue", alpha=0.8, ls="--")
                 if self.act_show_y.isChecked():
-                    ax.plot(df["time"], df["ay_corr"], label="ay_corr", color="tab:orange", alpha=0.8, ls="--")
+                    ax.plot(df["time"], df["accel_corr_y"], label="accel_corr_y", color="tab:orange", alpha=0.8, ls="--")
                 if self.act_show_z.isChecked():
-                    ax.plot(df["time"], df["az_corr"], label="az_corr", color="tab:green", alpha=0.8, ls="--")
-            if self.act_show_veh.isChecked() and {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns):
+                    ax.plot(df["time"], df["accel_corr_z"], label="accel_corr_z", color="tab:green", alpha=0.8, ls="--")
+            if self.act_show_veh.isChecked() and {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(df.columns):
                 if self.act_show_x.isChecked():
-                    ax.plot(df["time"], df["ax_veh"], label="ax_veh", color="tab:blue", alpha=0.6, ls=":")
+                    ax.plot(df["time"], df["accel_veh_x"], label="accel_veh_x", color="tab:blue", alpha=0.6, ls=":")
                 if self.act_show_y.isChecked():
-                    ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
+                    ax.plot(df["time"], df["accel_veh_y"], label="accel_veh_y", color="tab:orange", alpha=0.6, ls=":")
                 if self.act_show_z.isChecked():
-                    ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
+                    ax.plot(df["time"], df["accel_veh_z"], label="accel_veh_z", color="tab:green", alpha=0.6, ls=":")
             if self.act_show_iso.isChecked() and {"awx", "awy", "awz", "awv"}.issubset(df.columns):
                 if self.act_show_x.isChecked():
                     ax.plot(df["time"], df["awx"], label="awx", color="tab:blue")
@@ -1352,7 +1352,7 @@ class MainWindow(QMainWindow):
             if meta_file and meta_file.exists():
                 rot_ok = json.loads(meta_file.read_text()).get("rotation_available", False)
             else:
-                rot_ok = {"ax_veh", "ay_veh", "az_veh"}.issubset(df.columns) or \
+                rot_ok = {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(df.columns) or \
                     (has_lbl and any(s.msg.orientation.w not in (0, 1) for s in self.samples[t]))
 
             rows.append((t, "✔" if has_lbl else "—", "✔" if rot_ok else "—"))
