@@ -175,45 +175,56 @@ class ImuSample:
 class BagReaderWorker(QThread):
     """Worker-Thread zum asynchronen Einlesen der Bag-Datei."""
 
-    progress = pyqtSignal(int)
-    set_maximum = pyqtSignal(int)
-    finished = pyqtSignal(object, object, object)
+    stepChanged = pyqtSignal(str)
+    setMaximum  = pyqtSignal(int)
+    progress    = pyqtSignal(int)
+    finished    = pyqtSignal(object, object)
 
-    def __init__(self, bag_path: pathlib.Path, imu_topics: list[str], gps_topic: str | None) -> None:
+    def __init__(self, bag_path: pathlib.Path) -> None:
         super().__init__()
         self.bag_path = bag_path
-        self.imu_topics = imu_topics
-        self.gps_topic = gps_topic
 
     def run(self) -> None:
         try:
+            self.stepChanged.emit("Öffne Bag-Datei …")
             reader = SequentialReader()
             reader.open(
                 StorageOptions(str(self.bag_path), "sqlite3"),
                 ConverterOptions("cdr", "cdr"),
             )
-            try:
-                total = reader.get_metadata().message_count
-            except Exception:
-                total = 0
-            self.set_maximum.emit(total)
-            count = 0
-            samples = {t: [] for t in self.imu_topics}
+
+            self.stepChanged.emit("Ermittle Topics …")
+            topics_info = reader.get_all_topics_and_types()
+            imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
+            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
+
+            total = reader.get_metadata().message_count
+            self.setMaximum.emit(total)
+
+            samples = {t: [] for t in imu_topics}
             gps: list[tuple] = []
+            cnt = 0
+
+            self.stepChanged.emit("Lese Daten …")
             while reader.has_next():
                 topic, data, ts = reader.read_next()
                 if topic in samples:
                     samples[topic].append(ImuSample(ts, deserialize_message(data, Imu)))
-                elif self.gps_topic and topic == self.gps_topic:
+                elif gps_topic and topic == gps_topic:
                     msg = deserialize_message(data, NavSatFix)
                     gps.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
-                count += 1
-                if count % 500 == 0:
-                    self.progress.emit(count)
+                cnt += 1
+                if cnt % 200 == 0:
+                    self.progress.emit(cnt)
+
+            available = [t for t, vals in samples.items() if len(vals)]
+            if not available:
+                raise RuntimeError("Keine IMU-Nachrichten im Bag gefunden.")
+
             self.progress.emit(total)
-            self.finished.emit(samples, gps, None)
+            self.finished.emit((samples, gps, available, gps_topic), None)
         except Exception as exc:
-            self.finished.emit(None, None, exc)
+            self.finished.emit(None, exc)
 
 
 # ===========================================================================
@@ -577,6 +588,7 @@ class MainWindow(QMainWindow):
 
         # Runtime-State
         self.active_topics: list[str] = []
+        self.available_topics: list[str] = []
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
@@ -805,6 +817,7 @@ class MainWindow(QMainWindow):
         self.samples.clear()
         self.dfs.clear()
         self.t0 = None
+        self.available_topics.clear()
 
         steps = [
             "Öffne Bag-Datei",
@@ -817,43 +830,14 @@ class MainWindow(QMainWindow):
         ]
         progress = ProgressWindow("Bag einlesen", steps, parent=self)
 
-        try:
-            if not progress.advance("Öffne Bag-Datei …"):
-                return
-            reader = SequentialReader()
-            reader.open(
-                StorageOptions(str(self.bag_path), "sqlite3"),
-                ConverterOptions("cdr", "cdr"),
-            )
-
-            if not progress.advance("Ermittle Topics …"):
-                return
-            topics_info = reader.get_all_topics_and_types()
-            imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
-            for t in imu_topics:
-                self.samples[t] = []
-        except Exception as exc:
-            QMessageBox.critical(self, "Lesefehler", str(exc))
-            progress.accept()
-            return
-
-        if not self.samples:
-            QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
-            progress.accept()
-            return
-
-        # -- Daten asynchron laden -------------------------------------------
-        progress.lbl_step.setText("Lese Daten …")
-        progress.lst.setCurrentRow(2)
-
-        self.worker = BagReaderWorker(self.bag_path, imu_topics, gps_topic)
-        self.worker.set_maximum.connect(progress.set_bar_range)
+        self.worker = BagReaderWorker(self.bag_path)
+        self.worker.stepChanged.connect(progress.advance)
+        self.worker.setMaximum.connect(progress.set_bar_range)
         self.worker.progress.connect(progress.set_bar_value)
-        self.worker.finished.connect(lambda s, g, e: self._reader_done(s, g, e, progress))
+        self.worker.finished.connect(lambda res, err: self._reader_done(res, err, progress))
         self.worker.start()
 
-    def _reader_done(self, samples: dict | None, gps: list | None, err: Exception | None, progress: ProgressWindow) -> None:
+    def _reader_done(self, result: tuple | None, err: Exception | None, progress: ProgressWindow) -> None:
         """Callback nach dem asynchronen Lese-Vorgang."""
         if progress.wasCanceled():
             progress.accept()
@@ -863,7 +847,15 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        assert samples is not None
+        assert result is not None
+        samples, gps, available, gps_topic = result
+        self.available_topics = list(available)
+        print("[DEBUG] available topics:", self.available_topics)
+        if not self.available_topics:
+            QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
+            progress.accept()
+            return
+
         self.samples = cast(dict[str, list[ImuSample]], samples)
         self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
 
@@ -994,17 +986,23 @@ class MainWindow(QMainWindow):
             "/zed_left/zed_node/imu/data",
             "/zed_right/zed_node/imu/data",
         ]
-        available = list(self.samples)
-        sel = [p for p in pref if p in available]
-        for t in available:
+        avail = set(self.available_topics) or set(self.dfs)
+        sel = [p for p in pref if p in avail]
+        for t in avail:
             if len(sel) >= 3:
                 break
             if t not in sel:
                 sel.append(t)
-        self.active_topics = sel or available[:3]
+        self.active_topics = list(sel)
 
     # ------------------------------------------------------------------ Plots
     def _draw_plots(self, verify: bool = False) -> None:
+        print("[DEBUG] draw_plots, active topics:", self.active_topics)
+        if not self.active_topics:
+            self.fig.clear()
+            self.canvas.draw_idle()
+            return
+
         self.fig.clear()
         self.ax_topic.clear()
         for sel in self.span_selector.values():
