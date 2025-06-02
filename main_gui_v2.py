@@ -146,12 +146,25 @@ class RotMode(Enum):
 
 # Default-Overrides (kann der User gleich im Dialog ändern)
 DEFAULT_OVERRIDES: dict[str, np.ndarray] = {
-    "/zed_right/zed_node/imu/data": np.array([[0, 1, 0],
-                                              [-1, 0, 0],
-                                              [0, 0, 1]], float),
-    "/zed_left/zed_node/imu/data": np.array([[0, -1, 0],
-                                             [1, 0, 0],
+    # ZED rear camera: flipped by 180° around X and Y (equals 180° around Z)
+    "/zed_rear/zed_node/imu/data": np.array([[-1, 0, 0],
+                                             [0, -1, 0],
                                              [0, 0, 1]], float),
+
+    # Ouster rear lidar IMU: same orientation as the rear ZED
+    "/ouster_rear/imu": np.array([[-1, 0, 0],
+                                  [0, -1, 0],
+                                  [0, 0, 1]], float),
+
+    # ZED left camera: rotate 90° to the right (clockwise around Z)
+    "/zed_left/zed_node/imu/data": np.array([[0, 1, 0],
+                                             [-1, 0, 0],
+                                             [0, 0, 1]], float),
+
+    # ZED right camera: rotate 90° to the left (counter-clockwise around Z)
+    "/zed_right/zed_node/imu/data": np.array([[0, -1, 0],
+                                              [1, 0, 0],
+                                              [0, 0, 1]], float),
 }
 
 # ===========================================================================
@@ -656,7 +669,7 @@ class MainWindow(QMainWindow):
         self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
-        self.rot_mode: RotMode = RotMode.AUTO_ONLY
+        self.rot_mode: RotMode = RotMode.OVERRIDE_FIRST
         self.iso_comfort: bool = True  # ISO weighting mode
         self.iso_metrics: dict[str, dict] = {}
         self.peak_threshold: float = 3.19
@@ -1096,7 +1109,7 @@ class MainWindow(QMainWindow):
                 rot = ov
             else:
                 rot = auto
-        if self.rot_mode is RotMode.AUTO_FIRST:
+        elif self.rot_mode is RotMode.AUTO_FIRST:
             if auto is not None:
                 rot = auto
             else:
@@ -1111,18 +1124,19 @@ class MainWindow(QMainWindow):
             "/zed_rear/zed_node/imu/data",
             "/zed_left/zed_node/imu/data",
             "/zed_right/zed_node/imu/data",
+            "/ouster_rear/imu",
         ]
         available = self.available_topics or list(self.dfs)
         if not available:
             self.active_topics = []
             return
+
         sel = [p for p in pref if p in available]
         for t in available:
-            if len(sel) >= 3:
-                break
             if t not in sel:
                 sel.append(t)
-        self.active_topics = sel or available[:3]
+
+        self.active_topics = sel
 
     # ------------------------------------------------------------------ Plots
     def _draw_plots(self, verify: bool = False) -> None:
