@@ -1,12 +1,109 @@
 import hashlib
 import json
 from pathlib import Path
+from datetime import datetime
 
 import yaml
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from iso_weighting import calc_awv
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation as R
 from scipy.signal import butter, filtfilt
+from progress_ui import ProgressWindow
+
+
+CITY_BBOX = {
+    "Merseburg": ((51.34, 51.38), (11.95, 12.07)),
+    "Halle": ((51.45, 51.55), (11.85, 12.05)),
+    "Leipzig": ((51.28, 51.42), (12.20, 12.48)),
+    "Berlin": ((52.30, 52.65), (13.00, 13.80)),
+    "Munich": ((48.09, 48.23), (11.45, 11.65)),
+}
+
+
+def guess_city(lat: float, lon: float) -> str:
+    for name, ((la0, la1), (lo0, lo1)) in CITY_BBOX.items():
+        if la0 <= lat <= la1 and lo0 <= lon <= lo1:
+            return name
+    return f"{lat:.2f}_{lon:.2f}"
+
+
+def c_for(v: float) -> str:
+    if v < 1.72:
+        return "green"
+    elif v < 2.12:
+        return "yellow"
+    elif v < 2.54:
+        return "orange"
+    elif v < 3.19:
+        return "red"
+    else:
+        return "purple"
+
+
+def save_plot(df: pd.DataFrame, cols: list[str], path: Path, title: str) -> None:
+    plt.figure()
+    for col in cols:
+        if col not in df.columns:
+            continue
+        plt.plot(df["time"], df[col], label=col)
+    plt.xlabel("time [s]")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def prepare_gps(gps_df: pd.DataFrame, df: pd.DataFrame, comfort: bool,
+                peak_height: float, peak_dist: float, max_peak: bool) -> pd.DataFrame:
+    if df.empty:
+        return gps_df.copy()
+    fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 100.0
+    res = calc_awv(
+        df["accel_corr_x"], df["accel_corr_y"], df["accel_corr_z"], fs,
+        comfort=comfort,
+        peak_height=peak_height,
+        peak_dist=peak_dist,
+        max_peak=max_peak,
+    )
+    gps = gps_df.copy()
+    gps["awv"] = np.interp(gps["time"], df["time_abs"], res["awv"])
+    gps["color"] = gps["awv"].apply(c_for)
+    gps["peak"] = False
+    if len(res["peaks"]):
+        peak_times = df.loc[res["peaks"], "time_abs"].to_numpy()
+        tol = 0.1
+        gps["peak"] = gps["time"].apply(lambda t: bool(np.any(np.abs(t - peak_times) <= tol)))
+    return gps
+
+
+def save_map(gps: pd.DataFrame, path: Path) -> None:
+    try:
+        import folium
+    except Exception:
+        return
+    if gps.empty:
+        return
+    lat0 = gps["lat"].mean()
+    lon0 = gps["lon"].mean()
+    fmap = folium.Map(location=[lat0, lon0], zoom_start=16, max_zoom=30, min_zoom=10)
+    for row in gps.itertuples():
+        if row.peak:
+            folium.Marker(
+                location=[row.lat, row.lon],
+                icon=folium.Icon(color="black", icon="star"),
+                popup=f"Peak@{row.time:.2f}"
+            ).add_to(fmap)
+        else:
+            folium.CircleMarker(
+                location=[row.lat, row.lon], radius=4,
+                color=row.color, fill=True
+            ).add_to(fmap)
+    fmap.save(str(path))
 
 
 
@@ -99,6 +196,16 @@ def sha1_of_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def write_gpx(df: pd.DataFrame, path: Path) -> None:
+    """Write GPS data *df* to a very small GPX file."""
+    with open(path, "w") as f:
+        f.write('<gpx version="1.1">\n<trk><trkseg>\n')
+        for _, row in df.iterrows():
+            t = datetime.utcfromtimestamp(float(row["time"])).isoformat() + "Z"
+            f.write(f'<trkpt lat="{row.lat}" lon="{row.lon}"><ele>{row.alt}</ele><time>{t}</time></trkpt>\n')
+        f.write('</trkseg></trk></gpx>')
+
+
 def detect_fsr(abs_a: np.ndarray) -> float:
     """
     Versucht die Full-Scale-Range ausschließlich aus den Daten abzuleiten.
@@ -126,7 +233,7 @@ def find_stationary_bias(df: pd.DataFrame,
     dt = np.median(np.diff(df["time"]))
     fs = 1.0 / dt if dt > 0 else 1.0
     win = max(1, int(win_s * fs))
-    mag = np.linalg.norm(df[["ax", "ay", "az"]].to_numpy(), axis=1)
+    mag = np.linalg.norm(df[["accel_x", "accel_y", "accel_z"]].to_numpy(), axis=1)
     ser = pd.Series(mag)
     std = ser.rolling(win, center=True).std()
     mean = ser.rolling(win, center=True).mean()
@@ -135,7 +242,7 @@ def find_stationary_bias(df: pd.DataFrame,
         idx = mask.idxmax()
         j0 = max(0, idx - win // 2)
         j1 = min(len(df), idx + win // 2 + 1)
-        return df.iloc[j0:j1][["ax", "ay", "az"]].mean().to_numpy()
+        return df.iloc[j0:j1][["accel_x", "accel_y", "accel_z"]].mean().to_numpy()
     return None
 
 
@@ -152,7 +259,7 @@ def remove_gravity_lowpass(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np
     bias_vec = find_stationary_bias(df)
     if bias_vec is None:
         bias_vec = np.zeros(3)
-    acc_bias = df[["ax", "ay", "az"]].to_numpy() - bias_vec
+    acc_bias = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - bias_vec
 
     dt = np.median(np.diff(df["time"]))
     fs = 1.0 / dt if dt > 0 else 100.0
@@ -197,10 +304,10 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
     """Calculate 3x3 rotation matrix sensor→vehicle or return `None."""
 
     # --- Z-axis via gravity vector -------------------------------------
-    if {"g_x", "g_y", "g_z"}.issubset(df.columns):
-        z_sens = df[["g_x", "g_y", "g_z"]].mean().to_numpy()
-    elif {"ax", "ay", "az"}.issubset(df.columns):
-        g_sens = df[["ax", "ay", "az"]].mean().to_numpy()
+    if {"grav_x", "grav_y", "grav_z"}.issubset(df.columns):
+        z_sens = df[["grav_x", "grav_y", "grav_z"]].mean().to_numpy()
+    elif {"accel_x", "accel_y", "accel_z"}.issubset(df.columns):
+        g_sens = df[["accel_x", "accel_y", "accel_z"]].mean().to_numpy()
         if np.linalg.norm(g_sens) < 1:
             return None
         z_sens = g_sens / np.linalg.norm(g_sens)
@@ -241,22 +348,24 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     bag_root = Path(self.bag_path)
 
-    QFileDialog = _get_qt_widget(self, "QFileDialog")
-    if QFileDialog is None:
-        print("Qt not available for file dialog")
-        return
-
-    folder = QFileDialog.getExistingDirectory(
-        self,
-        "Ziel-Ordner für CSV/JSON wählen",
-        str(Path(self.bag_path).parent),
-    )
-    if not folder:          # Dialog abgebrochen
-        return
-    dest = Path(folder)
+    # Zielordner automatisch erzeugen
+    root = Path("/home/afius/Desktop/anomaly-data-hs-merseburg")
+    label_date = datetime.now().strftime("%Y%m%d")
+    city = "unknown"
+    if gps_df is not None and not gps_df.empty:
+        city = guess_city(float(gps_df['lat'].iat[0]), float(gps_df['lon'].iat[0]))
+    dest = root / f"{label_date}_{city}_{bag_root.stem}"
+    dest.mkdir(parents=True, exist_ok=True)
     self.last_export_dir = str(dest)   # für den GUI-Check
     exporter_sha = sha1_of_file(Path(__file__))
-    for topic, df in self.dfs.items():
+
+    progress = ProgressWindow("Export", ["Schreibe CSV …"], parent=self)
+    progress.set_bar_range(len(self.dfs))
+
+    for i, (topic, df) in enumerate(self.dfs.items()):
+        progress.set_bar_value(i)
+        if progress.wasCanceled():
+            break
         if not (df["label_id"] != 99).any():
             continue  # nichts gelabelt → kein Export
         try:
@@ -283,21 +392,21 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
 
             work = df.copy()
             if has_gyro:
-                work["gx"] = gyro[:, 0]
-                work["gy"] = gyro[:, 1]
-                work["gz"] = gyro[:, 2]
+                work["gyro_x"] = gyro[:, 0]
+                work["gyro_y"] = gyro[:, 1]
+                work["gyro_z"] = gyro[:, 2]
 
             # Speed aus GPS-Daten ableiten
             work = add_speed(work, gps_df)
 
-            abs_a = np.linalg.norm(df[["ax", "ay", "az"]].to_numpy(), axis=1)
+            abs_a = np.linalg.norm(df[["accel_x", "accel_y", "accel_z"]].to_numpy(), axis=1)
             fsr = detect_fsr(abs_a)
-            clipped = (df[["ax", "ay", "az"]].abs() >= 0.98 * fsr).any(axis=1)
+            clipped = (df[["accel_x", "accel_y", "accel_z"]].abs() >= 0.98 * fsr).any(axis=1)
 
             if has_quat:
                 g_vec = gravity_from_quat(
                     pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
-                acc_corr = df[["ax", "ay", "az"]].to_numpy() - g_vec
+                acc_corr = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - g_vec
                 g_est = g_vec
                 bias_vec = None
                 comp_type = "quaternion"
@@ -305,8 +414,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 acc_corr, g_est, bias_vec = remove_gravity_lowpass(df)
                 comp_type = "lowpass_bias"
 
-            work["ax_corr"], work["ay_corr"], work["az_corr"] = acc_corr.T
-            work["g_x"], work["g_y"], work["g_z"] = g_est.T
+            work["accel_corr_x"], work["accel_corr_y"], work["accel_corr_z"] = acc_corr.T
+            work["grav_x"], work["grav_y"], work["grav_z"] = g_est.T
 
             # Rotation & Beschleunigung transformieren
             rot_mat = self._resolve_rotation(topic, work)
@@ -314,7 +423,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             if rot_avail:
                 R = np.asarray(rot_mat)
                 veh = acc_corr @ R.T
-                work["ax_veh"], work["ay_veh"], work["az_veh"] = veh.T
+                work["accel_veh_x"], work["accel_veh_y"], work["accel_veh_z"] = veh.T
 
             if has_gyro:
                 abs_w = np.linalg.norm(gyro, axis=1)
@@ -346,12 +455,13 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 "exporter_sha1": exporter_sha,
             }
 
-            cols = ["time", "time_abs", "ax", "ay", "az", "speed_mps"]
+            cols = ["time", "time_abs", "accel_x", "accel_y", "accel_z", "speed_mps"]
             if has_gyro:
-                cols += ["gx", "gy", "gz"]
-            cols += ["ax_corr", "ay_corr", "az_corr", "g_x", "g_y", "g_z"]
+                cols += ["gyro_x", "gyro_y", "gyro_z"]
+            cols += ["accel_corr_x", "accel_corr_y", "accel_corr_z",
+                     "grav_x", "grav_y", "grav_z"]
             if rot_mat is not None:
-                cols += ["ax_veh", "ay_veh", "az_veh"]
+                cols += ["accel_veh_x", "accel_veh_y", "accel_veh_z"]
             cols += ["|a|_raw", "|ω|_raw", "clipped_flag", "label_id", "label_name"]
 
             out_df = work[cols]
@@ -364,7 +474,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             vec_mean = acc_corr.mean(axis=0)
             rms_corr = np.sqrt((acc_corr ** 2).mean())
             print(
-                f"[{topic}]  μ(ax_corr, ay_corr, az_corr) = {vec_mean.round(2)}  "
+                f"[{topic}]  μ(accel_corr_x, accel_corr_y, accel_corr_z) = {vec_mean.round(2)}  "
                 f" RMS(|a_corr|) = {rms_corr:.2f}"
             )
 
@@ -376,6 +486,16 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             meta_path.write_text(json.dumps(header, indent=2, default=_conv))
             out_df.to_csv(csv_path, index=False)
 
+            detail_dir = dest / stem
+            detail_dir.mkdir(exist_ok=True)
+
+            save_plot(work, ["accel_x", "accel_y", "accel_z"], detail_dir / "acc_raw.png", "Raw Acceleration")
+            save_plot(work, ["grav_x", "grav_y", "grav_z"], detail_dir / "gravity.png", "Gravity Vector")
+            if {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(work.columns):
+                save_plot(work, ["accel_veh_x", "accel_veh_y", "accel_veh_z"], detail_dir / "acc_vehicle.png", "Vehicle Frame")
+            save_plot(work, ["awx", "awy", "awz"], detail_dir / "weighted.png", "Weighted")
+            save_plot(work, ["rms_x", "rms_y", "rms_z"], detail_dir / "rms.png", "Running RMS")
+
         except Exception as exc:
             QMessageBox = _get_qt_widget(self, "QMessageBox")
             if QMessageBox is None:
@@ -384,6 +504,25 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
             continue
         
+
+    if gps_df is not None and not gps_df.empty:
+        topic0 = next(iter(self.dfs))
+        df0 = self.dfs[topic0]
+        gps_comfort = prepare_gps(gps_df, df0, True,
+                                  self.peak_threshold, self.peak_distance, self.use_max_peak)
+        gps_health = prepare_gps(gps_df, df0, False,
+                                 self.peak_threshold, self.peak_distance, self.use_max_peak)
+        track = gps_df.copy()
+        track[["awv_comfort", "color_comfort", "peak_comfort"]] = gps_comfort[["awv", "color", "peak"]]
+        track[["awv_health", "color_health", "peak_health"]] = gps_health[["awv", "color", "peak"]]
+        track_path = dest / f"{bag_root.stem}_track.csv"
+        track.to_csv(track_path, index=False)
+        write_gpx(gps_df, dest / f"{bag_root.stem}_track.gpx")
+        save_map(gps_comfort, dest / f"{bag_root.stem}_comfort.html")
+        save_map(gps_health, dest / f"{bag_root.stem}_health.html")
+
+    progress.set_bar_value(len(self.dfs))
+    progress.accept()
 
     if hasattr(self, "statusBar"):
         self.statusBar().showMessage(f"Export abgeschlossen → {dest}")
