@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from datetime import datetime
 
 import yaml
 import numpy as np
@@ -97,6 +98,16 @@ def sha1_of_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def write_gpx(df: pd.DataFrame, path: Path) -> None:
+    """Write GPS data *df* to a very small GPX file."""
+    with open(path, "w") as f:
+        f.write('<gpx version="1.1">\n<trk><trkseg>\n')
+        for _, row in df.iterrows():
+            t = datetime.utcfromtimestamp(float(row["time"])).isoformat() + "Z"
+            f.write(f'<trkpt lat="{row.lat}" lon="{row.lon}"><ele>{row.alt}</ele><time>{t}</time></trkpt>\n')
+        f.write('</trkseg></trk></gpx>')
 
 
 def detect_fsr(abs_a: np.ndarray) -> float:
@@ -241,22 +252,29 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     bag_root = Path(self.bag_path)
 
-    QFileDialog = _get_qt_widget(self, "QFileDialog")
-    if QFileDialog is None:
-        print("Qt not available for file dialog")
-        return
-
-    folder = QFileDialog.getExistingDirectory(
-        self,
-        "Ziel-Ordner für CSV/JSON wählen",
-        str(Path(self.bag_path).parent),
-    )
-    if not folder:          # Dialog abgebrochen
-        return
-    dest = Path(folder)
+    # Zielordner automatisch erzeugen
+    root = Path("/home/afius/Desktop/anomaly-data-hs-merseburg")
+    label_date = datetime.now().strftime("%Y%m%d")
+    city = "unknown"
+    if gps_df is not None and not gps_df.empty:
+        city = f"{gps_df['lat'].iat[0]:.2f}_{gps_df['lon'].iat[0]:.2f}"
+    dest = root / f"{label_date}_{city}_{bag_root.stem}"
+    dest.mkdir(parents=True, exist_ok=True)
     self.last_export_dir = str(dest)   # für den GUI-Check
     exporter_sha = sha1_of_file(Path(__file__))
-    for topic, df in self.dfs.items():
+
+    ProgressDialog = _get_qt_widget(self, "QProgressDialog")
+    progress = None
+    if ProgressDialog is not None:
+        progress = ProgressDialog("Exporting CSV", "Abort", 0, len(self.dfs), self)
+        progress.setWindowTitle("Export")
+        progress.setMinimumDuration(0)
+
+    for i, (topic, df) in enumerate(self.dfs.items()):
+        if progress:
+            progress.setValue(i)
+            if progress.wasCanceled():
+                break
         if not (df["label_id"] != 99).any():
             continue  # nichts gelabelt → kein Export
         try:
@@ -376,6 +394,9 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             meta_path.write_text(json.dumps(header, indent=2, default=_conv))
             out_df.to_csv(csv_path, index=False)
 
+            detail_dir = dest / stem
+            detail_dir.mkdir(exist_ok=True)
+
         except Exception as exc:
             QMessageBox = _get_qt_widget(self, "QMessageBox")
             if QMessageBox is None:
@@ -384,6 +405,14 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 QMessageBox.critical(self, "Export-Fehler", f"{topic}: {exc}", QMessageBox.Ok)
             continue
         
+
+    if gps_df is not None and not gps_df.empty:
+        (dest / "track.csv").write_text(gps_df.to_csv(index=False))
+        write_gpx(gps_df, dest / "track.gpx")
+
+    if progress:
+        progress.setValue(len(self.dfs))
+        progress.close()
 
     if hasattr(self, "statusBar"):
         self.statusBar().showMessage(f"Export abgeschlossen → {dest}")

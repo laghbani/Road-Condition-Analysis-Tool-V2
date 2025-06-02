@@ -75,7 +75,7 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand
+        QActionGroup, QUndoStack, QUndoCommand, QProgressDialog
     )
     try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -90,7 +90,7 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand
+        QActionGroup, QUndoStack, QUndoCommand, QProgressDialog
     )
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -376,6 +376,55 @@ class PeakDialog(QDialog):
         return self.sb_thr.value(), self.sb_dist.value(), self.chk_max.isChecked()
 
 
+class LabelManagerDialog(QDialog):
+    """Advanced dialog to edit existing label segments."""
+
+    def __init__(self, dfs: dict[str, pd.DataFrame], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Labels")
+        self.resize(600, 400)
+
+        self.dfs = dfs
+        self.tbl = QTableWidget(self)
+        self.tbl.setColumnCount(4)
+        self.tbl.setHorizontalHeaderLabels(["Topic", "Label", "Start", "End"])
+
+        rows = []
+        for topic, df in dfs.items():
+            mask = df["label_name"] != UNKNOWN_NAME
+            if not mask.any():
+                continue
+            seg_id = (df["label_name"] != df["label_name"].shift()).cumsum()
+            for _, grp in df[mask].groupby(seg_id):
+                rows.append((topic, grp["label_name"].iat[0], grp["time"].iat[0], grp["time"].iat[-1]))
+
+        self.tbl.setRowCount(len(rows))
+        for i, (t, lbl, s, e) in enumerate(rows):
+            self.tbl.setItem(i, 0, QTableWidgetItem(t))
+            it_lbl = QTableWidgetItem(lbl)
+            it_lbl.setFlags(it_lbl.flags() | Qt.ItemIsEditable)
+            self.tbl.setItem(i, 1, it_lbl)
+            self.tbl.setItem(i, 2, QTableWidgetItem(f"{s:.2f}"))
+            self.tbl.setItem(i, 3, QTableWidgetItem(f"{e:.2f}"))
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tbl)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+    def result(self) -> dict[str, list[tuple[str, float, float]]]:
+        res: dict[str, list[tuple[str, float, float]]] = {}
+        for r in range(self.tbl.rowCount()):
+            topic = self.tbl.item(r, 0).text()
+            label = self.tbl.item(r, 1).text()
+            s = float(self.tbl.item(r, 2).text())
+            e = float(self.tbl.item(r, 3).text())
+            res.setdefault(topic, []).append((label, s, e))
+        return res
+
+
 # ===========================================================================
 # Undo/Redo Commands
 # ===========================================================================
@@ -611,6 +660,10 @@ class MainWindow(QMainWindow):
         m_edit.addAction(act_undo)
         m_edit.addAction(act_redo)
 
+        act_manage = QAction("Manage labels …", self)
+        act_manage.triggered.connect(self._open_label_manager)
+        m_edit.addAction(act_manage)
+
         m_imu = mb.addMenu("&IMU Settings")
         self.act_topics = QAction("Topics auswählen …", self)
         self.act_topics.setEnabled(False)
@@ -708,6 +761,12 @@ class MainWindow(QMainWindow):
         self.dfs.clear()
         self.t0 = None
 
+        progress = QProgressDialog("Loading bag …", "Abort", 0, 0, self)
+        progress.setWindowTitle("Reading Bag")
+        progress.setMinimumDuration(0)
+        progress.setRange(0, 0)
+        progress.show()
+
         try:
             reader = SequentialReader()
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
@@ -718,10 +777,12 @@ class MainWindow(QMainWindow):
                 self.samples[t] = []
         except Exception as exc:
             QMessageBox.critical(self, "Lesefehler", str(exc))
+            progress.close()
             return
 
         if not self.samples:
             QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
+            progress.close()
             return
 
         # Daten einlesen
@@ -736,6 +797,7 @@ class MainWindow(QMainWindow):
                     gps_samples.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
         except Exception as exc:
             QMessageBox.critical(self, "Lesefehler", f"Fehler beim Lesen:\n{exc}")
+            progress.close()
             return
 
         self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
@@ -745,6 +807,7 @@ class MainWindow(QMainWindow):
         self._set_defaults()
         self._draw_plots()
         self._draw_map()
+        progress.close()
 
         self.act_topics.setEnabled(True)
         self.act_verify.setEnabled(True)
@@ -1187,6 +1250,21 @@ class MainWindow(QMainWindow):
             return
         self.peak_threshold, self.peak_distance, self.use_max_peak = dlg.result()
         self._preprocess_all()
+        self._draw_plots()
+
+    def _open_label_manager(self) -> None:
+        dlg = LabelManagerDialog(self.dfs, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        result = dlg.result()
+        for topic, segs in result.items():
+            df = self.dfs[topic]
+            df["label_id"] = UNKNOWN_ID
+            df["label_name"] = UNKNOWN_NAME
+            for lbl, s, e in segs:
+                lid = self.LABEL_IDS.get(lbl, UNKNOWN_ID)
+                mask = (df["time"] >= s) & (df["time"] <= e)
+                df.loc[mask, ["label_id", "label_name"]] = [lid, lbl]
         self._draw_plots()
 
     def _set_weighting(self, comfort: bool) -> None:
