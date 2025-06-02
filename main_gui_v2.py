@@ -1358,13 +1358,15 @@ class MainWindow(QMainWindow):
         self.video_topic = t if t else None
         vframes = self.video_frames_by_topic.get(t, [])
         pframes = self.pc_frames_by_topic.get(self.pc_topic, [])
-        self.tab_vpc.load_arrays(vframes, pframes)
+        ptimes = self.pc_times_by_topic.get(self.pc_topic, [])
+        self.tab_vpc.load_arrays(vframes, pframes, ptimes)
 
     def _change_pc_topic(self, t: str) -> None:
         self.pc_topic = t if t else None
         vframes = self.video_frames_by_topic.get(self.video_topic, [])
         pframes = self.pc_frames_by_topic.get(t, [])
-        self.tab_vpc.load_arrays(vframes, pframes)
+        ptimes = self.pc_times_by_topic.get(t, [])
+        self.tab_vpc.load_arrays(vframes, pframes, ptimes)
 
     def _show_peak_video(self, topic: str, t_peak: float) -> None:
         vid_topic = self.video_topic or ""
@@ -1392,10 +1394,10 @@ class MainWindow(QMainWindow):
             i0 = int(np.searchsorted(trp, start, "left"))
             i1 = int(np.searchsorted(trp, end, "right"))
             pframes = pframes[i0:i1]
+            ptimes = ptimes[i0:i1]
 
-        self.tab_vpc.load_arrays(vframes, pframes)
+        self.tab_vpc.load_arrays(vframes, pframes, ptimes)
         self.tabs.setCurrentIndex(2)
-        self.tab_vpc.play()
 
     def _draw_map(self) -> None:
         log.debug("Drawing map")
