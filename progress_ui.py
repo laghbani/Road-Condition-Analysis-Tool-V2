@@ -32,11 +32,16 @@ class ProgressWindow(QDialog):
         self.lst.setCurrentRow(0)
         vbox.addWidget(self.lst, stretch=1)
 
+        self._aborted = False
         self.btn_abort = QPushButton("Abbrechen")
-        self.btn_abort.clicked.connect(self.reject)
+        self.btn_abort.clicked.connect(self._on_abort)
         vbox.addWidget(self.btn_abort)
 
         self.show()
+
+    def _on_abort(self) -> None:
+        self._aborted = True
+        self.reject()
 
     def advance(self, text: str | None = None) -> bool:
         """Fortschritt +1 Step.  Rückgabe: True = nicht abgebrochen."""
@@ -66,4 +71,4 @@ class ProgressWindow(QDialog):
         QApplication.processEvents()
 
     def wasCanceled(self) -> bool:
-        return self.result() == QDialog.Rejected
+        return self._aborted
