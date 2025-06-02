@@ -11,15 +11,45 @@ from __future__ import annotations
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QDoubleSpinBox
+    QPushButton, QDoubleSpinBox, QComboBox, QSpinBox
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap, QImage
+
+import cv2
+from sensor_msgs.msg import PointCloud2, Image
+from cv_bridge import CvBridge
+from sensor_msgs_py import point_cloud2 as pc2
 
 import numpy as np
 
 import pyqtgraph as pg
 from pyqtgraph.opengl import GLViewWidget, GLScatterPlotItem
+
+
+def _downsample(iter_pts, step: int = 8):
+    """Yield every *step*-th point from an iterator."""
+    for k, p in enumerate(iter_pts):
+        if k % step == 0:
+            yield p
+
+
+def _pc_to_xyz(pc_msg: PointCloud2, step: int = 1) -> np.ndarray:
+    """Alle Punkte → Nx3-float32-Array (kein Decimation, wenn step=1)."""
+    # 1) Rohpunkte als strukturierte Records einlesen
+    rec = np.fromiter(
+        pc2.read_points(pc_msg, ("x", "y", "z"), skip_nans=True),
+        dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")],
+        count=-1 if step == 1 else None,   # Performance-Optimization
+    )
+
+    # 2) Optionaler Down-Sampler
+    if step > 1:
+        rec = rec[::step]
+
+    # 3) Spalten sauber stapeln ⇒ echtes (N,3)-float32-Array
+    pts = np.column_stack((rec["x"], rec["y"], rec["z"])).astype(np.float32, copy=False)
+    return pts
 
 
 class VideoPointCloudTab(QWidget):
@@ -61,6 +91,8 @@ class VideoPointCloudTab(QWidget):
         self.lbl_video.setAlignment(Qt.AlignCenter)
         self.lbl_video.setMinimumSize(320, 240)
         vcol.addWidget(self.lbl_video, stretch=1)
+        self.cmb_video = QComboBox()
+        vcol.addWidget(self.cmb_video)
         hbox.addLayout(vcol, stretch=1)
 
         # ------------------------------ Point cloud column
@@ -68,11 +100,14 @@ class VideoPointCloudTab(QWidget):
         self.gl_view = GLViewWidget()
         self.gl_view.setMinimumSize(320, 240)
         self.gl_view.opts["distance"] = 5
+        self.gl_view.opts["projection"] = "perspective"
         pcol.addWidget(self.gl_view, stretch=1)
         self.lbl_placeholder = QLabel("Point Cloud View")
         self.lbl_placeholder.setAlignment(Qt.AlignCenter)
         self.lbl_placeholder.hide()
         pcol.addWidget(self.lbl_placeholder, stretch=1)
+        self.cmb_pc = QComboBox()
+        pcol.addWidget(self.cmb_pc)
         hbox.addLayout(pcol, stretch=1)
 
         ctrl.addWidget(QLabel("Point size:"))
@@ -82,11 +117,19 @@ class VideoPointCloudTab(QWidget):
         self.spn_size.valueChanged.connect(self.update_point_size)
         ctrl.addWidget(self.spn_size)
 
+        ctrl.addWidget(QLabel("FPS:"))
+        self.spn_fps = QSpinBox()
+        self.spn_fps.setRange(1, 60)
+        self.spn_fps.setValue(10)
+        ctrl.addWidget(self.spn_fps)
+
         self.video_frames: list[QImage] = []
         self.pc_frames: list[QImage] = []
-        self.img_arrays: list[np.ndarray] = []
-        self.pc_arrays: list[np.ndarray] = []
+        self.img_arrays: list = []
+        self.pc_arrays: list = []
         self.scatter_item: GLScatterPlotItem | None = None
+        self._last_pts: np.ndarray | None = None
+        self._last_cols: np.ndarray | None = None
         self.point_size = self.spn_size.value()
         self.sync_index = 0
         self.timer = QTimer(self)
@@ -124,8 +167,8 @@ class VideoPointCloudTab(QWidget):
         if pc:
             self.show_pc_frame(pc[0])
 
-    def load_arrays(self, images: list[np.ndarray], pcs: list[np.ndarray]) -> None:
-        """Load NumPy arrays for video frames and point clouds."""
+    def load_arrays(self, images: list, pcs: list) -> None:
+        """Load raw data for video frames and point clouds."""
         self.img_arrays = images
         self.pc_arrays = pcs
         self.sync_index = 0
@@ -138,7 +181,8 @@ class VideoPointCloudTab(QWidget):
         """Start playback if any frames are available."""
         if not (self.video_frames or self.img_arrays):
             return
-        self.timer.start(100)
+        interval = int(1000 / max(1, self.spn_fps.value()))
+        self.timer.start(interval)
 
     def pause(self) -> None:
         self.timer.stop()
@@ -155,20 +199,39 @@ class VideoPointCloudTab(QWidget):
         if not self.img_arrays:
             return
         i = max(0, min(i, len(self.img_arrays) - 1))
-        arr = self.img_arrays[i]
+        raw = self.img_arrays[i]
+        if isinstance(raw, Image):
+            arr = CvBridge().imgmsg_to_cv2(raw, desired_encoding="bgr8")
+        elif isinstance(raw, (bytes, memoryview)):
+            arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+            if arr is None:
+                return
+        else:
+            arr = raw
         if arr.ndim == 2:
             h, w = arr.shape
             fmt = QImage.Format_Grayscale8
             bytes_per_line = w
         else:
             h, w, ch = arr.shape
-            fmt = QImage.Format_RGB888 if ch == 3 else QImage.Format_RGBA8888
+            fmt = getattr(QImage, "Format_BGR888", QImage.Format_RGB888) if ch == 3 else QImage.Format_RGBA8888
+            if ch == 3 and fmt == QImage.Format_BGR888:
+                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                fmt = QImage.Format_RGB888
+            elif ch == 3:
+                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
             bytes_per_line = ch * w
         qimg = QImage(arr.tobytes(), w, h, bytes_per_line, fmt)
         qimg = qimg.copy()
         self.show_video_frame(qimg)
 
-    def draw_scatter(self, pts: np.ndarray) -> None:
+    def draw_scatter(self, pts_raw) -> None:
+        if isinstance(pts_raw, np.ndarray):
+            pts = pts_raw
+        elif isinstance(pts_raw, PointCloud2):
+            pts = _pc_to_xyz(pts_raw)
+        else:
+            pts = np.asarray(pts_raw, dtype=np.float32)
         if pts.size == 0:
             return
         self.gl_view.setVisible(True)
@@ -178,8 +241,12 @@ class VideoPointCloudTab(QWidget):
         rng = float(z.max() - zmin) or 1.0
         norm = (z - zmin) / rng
         colors = np.column_stack((norm, np.zeros_like(norm), 1 - norm, np.ones_like(norm)))
+        self._last_pts = pts
+        self._last_cols = colors
         if self.scatter_item is None:
-            self.scatter_item = GLScatterPlotItem(pos=pts, color=colors, size=self.point_size)
+            self.scatter_item = GLScatterPlotItem(
+                pos=pts, color=colors, size=self.point_size
+            )
             self.gl_view.addItem(self.scatter_item)
         else:
             self.scatter_item.setData(pos=pts, color=colors, size=self.point_size)
@@ -187,22 +254,30 @@ class VideoPointCloudTab(QWidget):
     def update_point_size(self, val: float) -> None:
         self.point_size = val
         if self.scatter_item is not None:
-            self.scatter_item.setData(size=val)
+            pts = self._last_pts if self._last_pts is not None else self.scatter_item.pos
+            cols = self._last_cols if self._last_cols is not None else self.scatter_item.color
+            self.scatter_item.setData(pos=pts, color=cols, size=val)
 
     def _next_frame(self) -> None:
-        if self.sync_index >= max(len(self.video_frames), len(self.img_arrays)):
+        if (
+            self.sync_index >= len(self.video_frames)
+            and self.sync_index >= len(self.img_arrays)
+        ):
             self.pause()
             return
-        if self.video_frames:
+
+        if self.sync_index < len(self.video_frames):
             self.show_video_frame(self.video_frames[self.sync_index])
-        elif self.img_arrays:
+        elif self.sync_index < len(self.img_arrays):
             self.show_frame(self.sync_index)
+
         if self.pc_frames:
             idx = min(self.sync_index, len(self.pc_frames) - 1)
             self.show_pc_frame(self.pc_frames[idx])
         elif self.pc_arrays:
             idx = min(self.sync_index, len(self.pc_arrays) - 1)
             self.draw_scatter(self.pc_arrays[idx])
+
         self.sync_index += 1
 
     def show_pc_frame(self, img: QImage) -> None:
