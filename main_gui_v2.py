@@ -81,7 +81,7 @@ try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PyQt5.QtCore import Qt
+    from PyQt5.QtCore import Qt, QSettings
 except ImportError:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
@@ -95,7 +95,7 @@ except ImportError:
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QSettings
 
 # ---------------------------------------------------------------------------#
 # ROS-Import                                                                 #
@@ -385,6 +385,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ROS 2 IMU-Labeling Tool")
         self.resize(1500, 900)
 
+        # Persistent settings
+        self.settings = QSettings("FH-Zürich", "IMU-LabelTool")
+
         # Daten-Strukturen
         self.bag_path: pathlib.Path | None = None
         self.samples: dict[str, list[ImuSample]] = {}
@@ -410,6 +413,9 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+
+        # Restore persisted window state
+        self._restore_settings()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -463,6 +469,24 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(w_map, "Map")
 
         self.tabs.currentChanged.connect(self._tab_changed)
+
+    # ------------------------------------------------------------------ Settings
+    def _restore_settings(self) -> None:
+        geom = self.settings.value("geom", b"")
+        if isinstance(geom, (bytes, bytearray)):
+            self.restoreGeometry(geom)
+        state = self.settings.value("state", b"")
+        if isinstance(state, (bytes, bytearray)):
+            self.restoreState(state)
+        topics = self.settings.value("active_topics")
+        if isinstance(topics, list):
+            self.active_topics = [str(t) for t in topics]
+
+    def closeEvent(self, e) -> None:
+        self.settings.setValue("geom", self.saveGeometry())
+        self.settings.setValue("state", self.saveState())
+        self.settings.setValue("active_topics", self.active_topics)
+        super().closeEvent(e)
 
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:

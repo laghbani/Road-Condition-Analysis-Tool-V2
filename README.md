@@ -7,3 +7,5 @@ from the **View** menu. Comfort and health weighting can now be selected via
 **IMU Settings → Comfort/Health mode weighting**. The map tab shows an
 interactive OpenStreetMap powered by *folium*. Current settings can be stored
 and later restored using **File → Save settings…** and **File → Load settings…**.
+Window geometry and active topics are automatically preserved between sessions
+via Qt's `QSettings`.
