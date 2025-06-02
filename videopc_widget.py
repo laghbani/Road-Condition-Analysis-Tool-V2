@@ -16,6 +16,15 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap, QImage
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ▼▼▼  NEUER BLOCK – direkt hinter den bisherigen QWidget-Imports einfügen  ▼▼▼
+# ─────────────────────────────────────────────────────────────────────────────
+import collections
+from scipy.spatial.transform import Rotation as R   # pip install scipy
+# ─────────────────────────────────────────────────────────────────────────────
+# ▲▲▲  NEUER BLOCK ENDE                                                     ▲▲▲
+# ─────────────────────────────────────────────────────────────────────────────
+
 import cv2
 from sensor_msgs.msg import PointCloud2, Image
 from cv_bridge import CvBridge
@@ -40,7 +49,7 @@ def _pc_to_xyz(pc_msg: PointCloud2, step: int = 1) -> np.ndarray:
     rec = np.fromiter(
         pc2.read_points(pc_msg, ("x", "y", "z"), skip_nans=True),
         dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")],
-        count=-1 if step == 1 else None,   # Performance-Optimization
+        count=-1,  # Disable pre-allocation when size unknown
     )
 
     # 2) Optionaler Down-Sampler
@@ -61,23 +70,57 @@ class VideoPointCloudTab(QWidget):
 
         # -------------------------------------------------- Control bar
         ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("Pre-/Post-Zeit:"))
-        self.spn_pre = QDoubleSpinBox()
-        self.spn_pre.setRange(0.0, 10.0)
-        self.spn_pre.setValue(2.0)
-        ctrl.addWidget(self.spn_pre)
-        self.spn_post = QDoubleSpinBox()
-        self.spn_post.setRange(0.0, 10.0)
-        self.spn_post.setValue(2.0)
-        ctrl.addWidget(self.spn_post)
 
-        self.btn_play = QPushButton("Play")
-        self.btn_pause = QPushButton("Pause")
-        self.btn_replay = QPushButton("Replay")
-        self.btn_toggle_roi = QPushButton("Toggle ROI")
+        # Zeitfenster
+        for cap, box in (("Pre [s]:", "spn_pre"), ("Post [s]:", "spn_post")):
+            ctrl.addWidget(QLabel(cap))
+            setattr(self, box, QDoubleSpinBox())
+            sb: QDoubleSpinBox = getattr(self, box)
+            sb.setRange(0.0, 10.0); sb.setDecimals(1); sb.setValue(2.0)
+            ctrl.addWidget(sb)
 
-        for b in (self.btn_play, self.btn_pause, self.btn_replay, self.btn_toggle_roi):
+        # ▶️/⏸ Steuerung
+        self.btn_play, self.btn_pause, self.btn_replay = (
+            QPushButton(t) for t in ("Play", "Pause", "Replay")
+        )
+        for b in (self.btn_play, self.btn_pause, self.btn_replay):
             ctrl.addWidget(b)
+
+        # Punktgröße
+        ctrl.addWidget(QLabel("PtSize:"))
+        self.spn_size = QDoubleSpinBox(); self.spn_size.setRange(1, 20); self.spn_size.setValue(5)
+        self.spn_size.valueChanged.connect(self.update_point_size)
+        ctrl.addWidget(self.spn_size)
+
+        # FPS
+        ctrl.addWidget(QLabel("FPS:"))
+        self.spn_fps = QSpinBox(); self.spn_fps.setRange(1, 60); self.spn_fps.setValue(10)
+        ctrl.addWidget(self.spn_fps)
+
+        # ↓↓↓ NEU ↓↓↓ --- Parameter fürs Point-Processing ---
+        ctrl.addWidget(QLabel("Decimate:"))
+        self.spn_dec = QSpinBox(); self.spn_dec.setRange(1, 16); self.spn_dec.setValue(1)
+        ctrl.addWidget(self.spn_dec)
+
+        ctrl.addWidget(QLabel("Stack N:"))
+        self.spn_stack = QSpinBox(); self.spn_stack.setRange(1, 50); self.spn_stack.setValue(5)
+        ctrl.addWidget(self.spn_stack)
+
+        ctrl.addWidget(QLabel("Ground ±[cm]:"))
+        self.spn_gth = QSpinBox(); self.spn_gth.setRange(1, 50); self.spn_gth.setValue(10)
+        ctrl.addWidget(self.spn_gth)
+
+        # Yaw / Pitch / Roll für Fahrzeug-Frame
+        for cap, box in (("Yaw°:", "spn_yaw"), ("Pitch°:", "spn_pitch"), ("Roll°:", "spn_roll")):
+            ctrl.addWidget(QLabel(cap))
+            setattr(self, box, QDoubleSpinBox())
+            sb: QDoubleSpinBox = getattr(self, box)
+            sb.setRange(-180, 180); sb.setDecimals(1); sb.setValue(0.0)
+            ctrl.addWidget(sb)
+
+        # Boden/Anomalie-Anzeige
+        self.btn_detect = QPushButton("Detect"); ctrl.addWidget(self.btn_detect)
+
         ctrl.addStretch()
         vbox.addLayout(ctrl)
 
@@ -110,19 +153,6 @@ class VideoPointCloudTab(QWidget):
         pcol.addWidget(self.cmb_pc)
         hbox.addLayout(pcol, stretch=1)
 
-        ctrl.addWidget(QLabel("Point size:"))
-        self.spn_size = QDoubleSpinBox()
-        self.spn_size.setRange(1.0, 20.0)
-        self.spn_size.setValue(5.0)
-        self.spn_size.valueChanged.connect(self.update_point_size)
-        ctrl.addWidget(self.spn_size)
-
-        ctrl.addWidget(QLabel("FPS:"))
-        self.spn_fps = QSpinBox()
-        self.spn_fps.setRange(1, 60)
-        self.spn_fps.setValue(10)
-        ctrl.addWidget(self.spn_fps)
-
         self.video_frames: list[QImage] = []
         self.pc_frames: list[QImage] = []
         self.img_arrays: list = []
@@ -130,6 +160,14 @@ class VideoPointCloudTab(QWidget):
         self.scatter_item: GLScatterPlotItem | None = None
         self._last_pts: np.ndarray | None = None
         self._last_cols: np.ndarray | None = None
+        # Ringpuffer für Akkumulation
+        self._cloud_buffer = collections.deque(maxlen=self.spn_stack.value())
+        # Änderungen an Stackgröße live übernehmen
+        self.spn_stack.valueChanged.connect(
+            lambda n: self._cloud_buffer.__setattr__("maxlen", n)
+        )
+        # Detect-Button
+        self.btn_detect.clicked.connect(self._detect_anomalies)
         self.point_size = self.spn_size.value()
         self.sync_index = 0
         self.timer = QTimer(self)
@@ -138,14 +176,6 @@ class VideoPointCloudTab(QWidget):
         self.btn_play.clicked.connect(self.play)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_replay.clicked.connect(self.replay)
-
-        self.roi_mode = False
-        self.btn_toggle_roi.clicked.connect(self._toggle_roi)
-
-    # ------------------------------------------------------------------ actions
-    def _toggle_roi(self) -> None:
-        self.roi_mode = not self.roi_mode
-        self.btn_toggle_roi.setChecked(self.roi_mode)
 
     # ------------------------------------------------------------------ helpers
     def show_video_frame(self, img: QImage) -> None:
@@ -226,30 +256,38 @@ class VideoPointCloudTab(QWidget):
         self.show_video_frame(qimg)
 
     def draw_scatter(self, pts_raw) -> None:
+        # -- 0. Eingangsdaten → numpy Nx3 ----------------------------------
         if isinstance(pts_raw, np.ndarray):
             pts = pts_raw
         elif isinstance(pts_raw, PointCloud2):
-            pts = _pc_to_xyz(pts_raw)
+            pts = _pc_to_xyz(pts_raw, step=max(1, self.spn_dec.value()))
         else:
             pts = np.asarray(pts_raw, dtype=np.float32)
         if pts.size == 0:
             return
-        self.gl_view.setVisible(True)
-        self.lbl_placeholder.setVisible(False)
-        z = pts[:, 2]
-        zmin = float(z.min())
-        rng = float(z.max() - zmin) or 1.0
+
+        # -- 1. Transform in Fahrzeug-Frame & Akkumulation ------------------
+        veh_pts = self._to_vehicle(pts)
+        self._cloud_buffer.append(veh_pts)
+        stack = np.vstack(self._cloud_buffer)
+
+        # -- 2. Zurück in Sensor-Frame zeichnen (nur Farbe/Z-Kodierung) -----
+        z = stack[:, 2]
+        zmin, rng = float(z.min()), float(max(z.ptp(), 1e-3))
         norm = (z - zmin) / rng
-        colors = np.column_stack((norm, np.zeros_like(norm), 1 - norm, np.ones_like(norm)))
-        self._last_pts = pts
-        self._last_cols = colors
+        colors = np.column_stack((norm, np.zeros_like(norm), 1 - norm,
+                                  np.ones_like(norm)))
+        self._last_pts, self._last_cols = stack, colors
+
+        # -- 3. Plot --------------------------------------------------------
+        self.gl_view.setVisible(True); self.lbl_placeholder.hide()
         if self.scatter_item is None:
-            self.scatter_item = GLScatterPlotItem(
-                pos=pts, color=colors, size=self.point_size
-            )
+            self.scatter_item = GLScatterPlotItem(pos=stack, color=colors,
+                                                  size=self.point_size)
             self.gl_view.addItem(self.scatter_item)
         else:
-            self.scatter_item.setData(pos=pts, color=colors, size=self.point_size)
+            self.scatter_item.setData(pos=stack, color=colors,
+                                      size=self.point_size)
 
     def update_point_size(self, val: float) -> None:
         self.point_size = val
@@ -286,3 +324,48 @@ class VideoPointCloudTab(QWidget):
         self.gl_view.setVisible(False)
         self.lbl_placeholder.setPixmap(QPixmap.fromImage(img))
         self.lbl_placeholder.setVisible(True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ▼▼▼  HELFERFUNKTIONEN GANZ UNTER IN DER KLASSE EINFÜGEN  ▼▼▼
+# ─────────────────────────────────────────────────────────────────────────────
+    # ---------- Koordinatentransform ---------------------------------
+    def _to_vehicle(self, pts: np.ndarray) -> np.ndarray:
+        """Dreht den Scan in Fahrzeug-Frame (Yaw/Pitch/Roll aus Spin-Boxen)."""
+        ypr = [self.spn_yaw.value(), self.spn_pitch.value(), self.spn_roll.value()]
+        Rmat = R.from_euler("zyx", ypr, degrees=True).as_matrix().astype(np.float32)
+        return pts @ Rmat.T         # (N,3) · (3,3)^T
+
+    # ---------- Anomalien-Detection ---------------------------------
+    def _detect_anomalies(self):
+        if self._last_pts is None:
+            return
+        g_thr = self.spn_gth.value() / 100.0     # cm → m
+        # Bodenpunkte (z in ±g_thr) im Fahrzeug-Frame
+        veh = self._to_vehicle(self._last_pts)
+        mask_ground = np.abs(veh[:, 2]) <= g_thr
+        # Höhenvariation pro (x,y)-Raster
+        cell = 0.2                               # 20 cm Raster
+        idx = np.floor(veh[mask_ground, :2] / cell).astype(int)
+        grid = {}
+        for (i, j), z in zip(idx, veh[mask_ground, 2]):
+            key = (i, j)
+            grid.setdefault(key, [z, z])
+            grid[key][0] = min(grid[key][0], z)
+            grid[key][1] = max(grid[key][1], z)
+        dh = np.array([v[1] - v[0] for v in grid.values()])
+        if dh.size == 0:
+            return
+        dh_mean = dh.mean()
+        # Anomalie: Zellen deren Δh > 2× Durchschnitt
+        bad_keys = {k for k, v in grid.items() if (v[1] - v[0]) > 2 * dh_mean}
+        if not bad_keys:
+            return
+        # Punkte einfärben
+        key_all = np.floor(veh[:, :2] / cell).astype(int)
+        is_bad = np.array([tuple(t) in bad_keys for t in key_all])
+        cols = self._last_cols.copy()
+        cols[is_bad] = [1, 0, 1, 1]              # Magenta
+        self.scatter_item.setData(pos=self._last_pts, color=cols, size=self.point_size)
+# ─────────────────────────────────────────────────────────────────────────────
+# ▲▲▲  ENDE NEUER FUNKTIONEN                                                 ▲▲▲
+# ─────────────────────────────────────────────────────────────────────────────
