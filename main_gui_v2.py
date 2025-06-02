@@ -92,8 +92,8 @@ try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
-    from PyQt5.QtGui import QKeySequence
+    from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QTimer
+    from PyQt5.QtGui import QKeySequence, QPainter, QImage
 except ImportError:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
@@ -107,8 +107,8 @@ except ImportError:
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal
-    from PySide6.QtGui import QKeySequence
+    from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal, QTimer
+    from PySide6.QtGui import QKeySequence, QPainter, QImage
 
 # ---------------------------------------------------------------------------#
 # ROS-Import                                                                 #
@@ -126,6 +126,7 @@ try:
     )
     from iso_weighting import calc_awv
     from progress_ui import ProgressWindow
+    from videopc_widget import VideoPointCloudTab
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -673,6 +674,10 @@ class MainWindow(QMainWindow):
             v_map.addWidget(self.web_map)
         self.tabs.addTab(w_map, "Map")
 
+        # ------------------------------------------------------ Videos + PC
+        self.tab_vpc = VideoPointCloudTab()
+        self.tabs.addTab(self.tab_vpc, "Videos + PC")
+
         self.tabs.currentChanged.connect(self._tab_changed)
 
     # ------------------------------------------------------------------ Settings
@@ -1177,9 +1182,22 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
-        if ev.button != 3 or ev.inaxes not in self.ax_topic:
+        if ev.inaxes not in self.ax_topic:
             return
         topic = self.ax_topic[ev.inaxes]
+
+        if ev.button == 1:
+            peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+            if peaks:
+                df = self.dfs[topic]
+                times = df.loc[peaks, "time"].to_numpy()
+                idx = int(np.argmin(np.abs(times - ev.xdata)))
+                if abs(times[idx] - ev.xdata) <= 0.2:
+                    self._show_peak_video(topic, times[idx])
+                    return
+
+        if ev.button != 3:
+            return
         if topic not in self.current_span:
             return
         xmin, xmax = self.current_span[topic]
@@ -1191,6 +1209,28 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, idx: int) -> None:
         if idx == 1:
             self._draw_map()
+        elif idx == 2:
+            if not self.tab_vpc.video_frames:
+                self.tab_vpc.show_pointcloud_placeholder("No data loaded")
+
+    def _show_peak_video(self, topic: str, t_peak: float) -> None:
+        pre = float(self.tab_vpc.spn_pre.value())
+        post = float(self.tab_vpc.spn_post.value())
+        times = np.arange(t_peak - pre, t_peak + post, 0.1)
+        video_frames: list[np.ndarray] = []
+        pc_frames: list[np.ndarray] = []
+        for t in times:
+            val = int(255 * (t - times[0]) / max(times[-1] - times[0], 0.1))
+            img = np.full((240, 320, 3), val, dtype=np.uint8)
+            video_frames.append(img)
+
+            pts = np.random.normal(size=(500, 3)).astype(np.float32)
+            pts[:, 2] += 0.1 * t
+            pc_frames.append(pts)
+
+        self.tab_vpc.load_arrays(video_frames, pc_frames)
+        self.tabs.setCurrentIndex(2)
+        self.tab_vpc.play()
 
     def _draw_map(self) -> None:
         log.debug("Drawing map")
