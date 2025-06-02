@@ -17,11 +17,22 @@ import pathlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, cast
 from enum import Enum, auto
+import logging
 
 import numpy as np
 import pandas as pd
 import json
 import os
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('debug.log', mode='w', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------#
 # Matplotlib – robuster Style-Loader                                         #
@@ -186,6 +197,7 @@ class BagReaderWorker(QThread):
 
     def run(self) -> None:
         try:
+            log.debug("BagReaderWorker started")
             self.stepChanged.emit("Öffne Bag-Datei …")
             reader = SequentialReader()
             reader.open(
@@ -219,8 +231,10 @@ class BagReaderWorker(QThread):
 
             self.progress.emit(total)
             available = [t for t, vals in samples.items() if vals]
+            log.debug("BagReaderWorker finished reading")
             self.finished.emit((samples, gps, available, gps_topic), None)
         except Exception as exc:
+            log.exception("BagReaderWorker error")
             self.finished.emit(None, exc)
 
 
@@ -836,10 +850,13 @@ class MainWindow(QMainWindow):
 
     def _reader_done(self, result: tuple | None, err: Exception | None, progress: ProgressWindow) -> None:
         """Callback nach dem asynchronen Lese-Vorgang."""
+        log.debug("Reader done callback invoked")
         if progress.wasCanceled():
+            log.debug("Progress dialog was canceled")
             progress.accept()
             return
         if err:
+            log.error("Error from worker: %s", err)
             QMessageBox.critical(self, "Lesefehler", str(err))
             progress.accept()
             return
@@ -855,28 +872,57 @@ class MainWindow(QMainWindow):
         self.samples = cast(dict[str, list[ImuSample]], {t: samples[t] for t in available})
         self.available_topics = available
         self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
+        log.debug("Available topics: %s", self.available_topics)
 
         progress.set_bar_steps(3)
         if not progress.advance("Erzeuge DataFrames …"):
+            log.debug("Aborted during DataFrame generation")
             progress.accept()
             return
-        self._build_dfs()
+        try:
+            self._build_dfs()
+            log.debug("DataFrames built")
+        except Exception:
+            log.exception("Error while building DataFrames")
+            progress.accept()
+            return
 
         if not progress.advance("Vorverarbeitung …"):
+            log.debug("Aborted during preprocessing")
             progress.accept()
             return
-        self._preprocess_all()
+        try:
+            self._preprocess_all()
+            log.debug("Preprocessing done")
+        except Exception:
+            log.exception("Error during preprocessing")
+            progress.accept()
+            return
 
         if not progress.advance("Erstelle Plots …"):
+            log.debug("Aborted before plotting")
             progress.accept()
             return
         self._set_defaults()
-        self._draw_plots()
-
-        if not progress.advance("Erstelle Karte …"):
+        try:
+            self._draw_plots()
+            log.debug("Plots drawn")
+        except Exception:
+            log.exception("Error while drawing plots")
             progress.accept()
             return
-        self._draw_map()
+
+        if not progress.advance("Erstelle Karte …"):
+            log.debug("Aborted before map creation")
+            progress.accept()
+            return
+        try:
+            self._draw_map()
+            log.debug("Map drawn")
+        except Exception:
+            log.exception("Error while drawing map")
+            progress.accept()
+            return
         progress.accept()
 
         self.act_topics.setEnabled(True)
@@ -886,6 +932,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ DataFrame
     def _build_dfs(self) -> None:
+        log.debug("Building DataFrames")
         for t, samps in self.samples.items():
             if not samps:
                 continue
@@ -902,9 +949,11 @@ class MainWindow(QMainWindow):
                 "label_name": [UNKNOWN_NAME] * len(tr),
             })
             self.dfs[t] = df
+        log.debug("DataFrames created: %s", list(self.dfs))
 
     # ------------------------------------------------------------------ Preprocess
     def _preprocess_all(self) -> None:
+        log.debug("Preprocessing all topics")
         self.iso_metrics.clear()
         for topic, df in self.dfs.items():
             samps = self.samples[topic]
@@ -957,6 +1006,7 @@ class MainWindow(QMainWindow):
                 "crest_factor": res["crest_factor"],
                 "peaks": res["peaks"].tolist(),
             }
+        log.debug("Preprocessing finished")
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
@@ -997,6 +1047,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Plots
     def _draw_plots(self, verify: bool = False) -> None:
+        log.debug("Drawing plots (verify=%s)", verify)
         self.fig.clear()
         self.ax_topic.clear()
         for sel in self.span_selector.values():
@@ -1090,6 +1141,7 @@ class MainWindow(QMainWindow):
                 ax_tr.legend(fontsize="x-small", ncol=3, loc="upper right")
 
         self.canvas.draw_idle()
+        log.debug("Plots updated")
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
             self._draw_map()
 
@@ -1141,6 +1193,7 @@ class MainWindow(QMainWindow):
             self._draw_map()
 
     def _draw_map(self) -> None:
+        log.debug("Drawing map")
         if self._gps_df is None or not self.active_topics:
             if QWebEngineView is None:
                 self.fig_map.clear()
@@ -1220,6 +1273,7 @@ class MainWindow(QMainWindow):
             fmap.save(map_file)
             gps.to_csv(map_file.replace(".html", "_gps.csv"), index=False)
             self.web_map.load(QUrl.fromLocalFile(map_file))
+        log.debug("Map updated")
 
     def _assign_label(self, topic: str, xmin: float, xmax: float,
                       lname: str | None = None) -> None:
