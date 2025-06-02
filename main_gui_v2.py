@@ -126,6 +126,7 @@ try:
     )
     from iso_weighting import calc_awv
     from progress_ui import ProgressWindow
+    from videopc_widget import VideoPointCloudTab
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -673,6 +674,10 @@ class MainWindow(QMainWindow):
             v_map.addWidget(self.web_map)
         self.tabs.addTab(w_map, "Map")
 
+        # ------------------------------------------------------ Videos + PC
+        self.tab_vpc = VideoPointCloudTab()
+        self.tabs.addTab(self.tab_vpc, "Videos + PC")
+
         self.tabs.currentChanged.connect(self._tab_changed)
 
     # ------------------------------------------------------------------ Settings
@@ -812,6 +817,11 @@ class MainWindow(QMainWindow):
         m_view.addAction(act_check)
         self.act_check = act_check
 
+        m_vpc = mb.addMenu("Videos + PC")
+        act_cfg_vpc = QAction("Configure topics …", self)
+        act_cfg_vpc.triggered.connect(self._configure_vpc_topics)
+        m_vpc.addAction(act_cfg_vpc)
+
     # ------------------------------------------------------------------ Bag
     def _open_bag(self) -> None:
         pth, _ = QFileDialog.getOpenFileName(
@@ -871,6 +881,7 @@ class MainWindow(QMainWindow):
         # nur Topics mit Daten behalten
         self.samples = cast(dict[str, list[ImuSample]], {t: samples[t] for t in available})
         self.available_topics = available
+        self.tab_vpc.set_available_topics(self.available_topics)
         self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
         log.debug("Available topics: %s", self.available_topics)
 
@@ -1177,20 +1188,38 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
-        if ev.button != 3 or ev.inaxes not in self.ax_topic:
+        if ev.inaxes not in self.ax_topic:
             return
         topic = self.ax_topic[ev.inaxes]
-        if topic not in self.current_span:
-            return
-        xmin, xmax = self.current_span[topic]
-        if xmax <= xmin:
-            return
-        lname = self.cmb.currentData()
-        self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
+        if ev.button == 3:
+            if topic not in self.current_span:
+                return
+            xmin, xmax = self.current_span[topic]
+            if xmax <= xmin:
+                return
+            lname = self.cmb.currentData()
+            self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
+        elif ev.button == 1:
+            peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+            if not len(peaks):
+                return
+            t = ev.xdata
+            if t is None:
+                return
+            times = self.dfs[topic].loc[peaks, "time"]
+            diff = np.abs(times - t)
+            idx = diff.idxmin()
+            if diff.loc[idx] < 0.5:
+                peak_time = times.loc[idx]
+                self.tab_vpc.load_demo_peak(topic, float(peak_time))
+                self.tabs.setCurrentIndex(2)
 
     def _tab_changed(self, idx: int) -> None:
         if idx == 1:
             self._draw_map()
+        elif idx == 2:
+            # Placeholder: show message when switching to video/PC tab
+            self.tab_vpc.show_pointcloud_placeholder("No data loaded")
 
     def _draw_map(self) -> None:
         log.debug("Drawing map")
@@ -1448,6 +1477,9 @@ class MainWindow(QMainWindow):
             return
         self.active_topics = sel
         self._draw_plots()
+
+    def _configure_vpc_topics(self) -> None:
+        self.tab_vpc.open_topic_dialog()
 
 
 
