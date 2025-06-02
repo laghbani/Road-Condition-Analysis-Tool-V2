@@ -225,7 +225,9 @@ class BagReaderWorker(QThread):
             samples = {t: [] for t in imu_topics}
             gps: list[tuple] = []
             video_frames_by_topic: dict[str, list[np.ndarray]] = {t: [] for t in image_topics}
+            video_times_by_topic: dict[str, list[float]] = {t: [] for t in image_topics}
             pc_frames_by_topic: dict[str, list[np.ndarray]] = {t: [] for t in pc_topics}
+            pc_times_by_topic: dict[str, list[float]] = {t: [] for t in pc_topics}
             cnt = 0
             bridge = CvBridge()
 
@@ -247,6 +249,7 @@ class BagReaderWorker(QThread):
                         buf = np.frombuffer(img_msg.data, dtype=np.uint8)
                         cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
                     video_frames_by_topic[topic].append(cv_img)
+                    video_times_by_topic[topic].append(ts / 1e9)
                 elif topic in pc_frames_by_topic:
                     pc_msg = deserialize_message(data, PointCloud2)
                     xyz = np.asarray([
@@ -254,6 +257,7 @@ class BagReaderWorker(QThread):
                         for p in pc2.read_points(pc_msg, field_names=("x", "y", "z"), skip_nans=True)
                     ], dtype=np.float32)
                     pc_frames_by_topic[topic].append(xyz)
+                    pc_times_by_topic[topic].append(ts / 1e9)
                 cnt += 1
                 if cnt % 200 == 0:
                     self.progress.emit(cnt)
@@ -271,6 +275,8 @@ class BagReaderWorker(QThread):
                     pc_topics,
                     video_frames_by_topic,
                     pc_frames_by_topic,
+                    video_times_by_topic,
+                    pc_times_by_topic,
                 ),
                 None,
             )
@@ -654,14 +660,16 @@ class MainWindow(QMainWindow):
         self.iso_comfort: bool = True  # ISO weighting mode
         self.iso_metrics: dict[str, dict] = {}
         self.peak_threshold: float = 3.19
-        self.peak_distance: float = 0.0
+        self.peak_distance: float = 1.5
         self.use_max_peak: bool = False
 
         # Video/PointCloud playback
         self.video_topic: str | None = None
         self.pc_topic: str | None = None
         self.video_frames_by_topic: dict[str, list[np.ndarray]] = {}
+        self.video_times_by_topic: dict[str, list[float]] = {}
         self.pc_frames_by_topic: dict[str, list[np.ndarray]] = {}
+        self.pc_times_by_topic: dict[str, list[float]] = {}
 
         self._build_menu()
         self._build_ui()
@@ -819,12 +827,12 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_verify)
 
         self.act_show_raw = QAction("Show raw acceleration", self, checkable=True)
-        self.act_show_raw.setChecked(True)
+        self.act_show_raw.setChecked(False)
         self.act_show_raw.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_raw)
 
         self.act_show_corr = QAction("Show g-corrected acceleration", self, checkable=True)
-        self.act_show_corr.setChecked(True)
+        self.act_show_corr.setChecked(False)
         self.act_show_corr.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_corr)
 
@@ -850,7 +858,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_show_z)
 
         self.act_show_iso = QAction("Show ISO weighted", self, checkable=True)
-        self.act_show_iso.setChecked(False)
+        self.act_show_iso.setChecked(True)
         self.act_show_iso.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_iso)
 
@@ -917,7 +925,8 @@ class MainWindow(QMainWindow):
         assert result is not None
         (samples, gps, available, gps_topic,
          image_topics, pc_topics,
-         vid_frames, pc_frames) = result
+         vid_frames, pc_frames,
+         vid_times, pc_times) = result
         if not available:
             QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
             progress.accept()
@@ -928,7 +937,9 @@ class MainWindow(QMainWindow):
         self.available_topics = available
         self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
         self.video_frames_by_topic = vid_frames
+        self.video_times_by_topic = vid_times
         self.pc_frames_by_topic = pc_frames
+        self.pc_times_by_topic = pc_times
         log.debug("Available topics: %s", self.available_topics)
 
         self.tab_vpc.cmb_video.clear()
@@ -1289,10 +1300,32 @@ class MainWindow(QMainWindow):
         self.tab_vpc.load_arrays(vframes, pframes)
 
     def _show_peak_video(self, topic: str, t_peak: float) -> None:
-        vframes = self.video_frames_by_topic.get(self.video_topic or "", [])
-        pframes = self.pc_frames_by_topic.get(self.pc_topic or "", [])
+        vid_topic = self.video_topic or ""
+        pc_topic = self.pc_topic or ""
+        vframes = self.video_frames_by_topic.get(vid_topic, [])
+        pframes = self.pc_frames_by_topic.get(pc_topic, [])
+        vtimes = self.video_times_by_topic.get(vid_topic, [])
+        ptimes = self.pc_times_by_topic.get(pc_topic, [])
         if not vframes and not pframes:
             return
+
+        pre = self.tab_vpc.spn_pre.value()
+        post = self.tab_vpc.spn_post.value()
+        t0 = self.t0 or 0.0
+        start = t_peak - pre
+        end = t_peak + post
+
+        if vtimes:
+            tr = np.array(vtimes) - t0
+            i0 = int(np.searchsorted(tr, start, "left"))
+            i1 = int(np.searchsorted(tr, end, "right"))
+            vframes = vframes[i0:i1]
+        if ptimes:
+            trp = np.array(ptimes) - t0
+            i0 = int(np.searchsorted(trp, start, "left"))
+            i1 = int(np.searchsorted(trp, end, "right"))
+            pframes = pframes[i0:i1]
+
         self.tab_vpc.load_arrays(vframes, pframes)
         self.tabs.setCurrentIndex(2)
         self.tab_vpc.play()
