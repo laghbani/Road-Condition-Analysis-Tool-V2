@@ -32,6 +32,10 @@ def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
     if gps_df is None or len(gps_df) < 3:
         work["speed_mps"] = np.nan
         return work
+
+    # ➊ NICHT doppelt führen – falls die Spalte bereits existiert, entfernen
+    work = work.drop(columns=["speed_mps"], errors="ignore")
+
     R_earth = 6_378_137.0
     lat0 = np.deg2rad(gps_df["lat"].iat[0])
     dx = (
@@ -44,13 +48,20 @@ def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
     v = np.hypot(np.diff(dx), np.diff(dy)) / dt
     g2 = gps_df.iloc[1:].copy()
     g2["speed_mps"] = v
+
     out = pd.merge_asof(
         work.sort_values("time_abs"),
         g2[["time", "speed_mps"]].rename(columns={"time": "time_abs"}),
         on="time_abs",
         direction="nearest",
     )
-    out["speed_mps"] = out["speed_mps"].interpolate(limit_direction="both")
+
+    # ➋ Eine konsolidierte Spalte herstellen
+    out["speed_mps"] = (
+        out.pop("speed_mps_y")
+           .combine_first(out.pop("speed_mps_x"))
+    ).interpolate(limit_direction="both")
+
     return out
 
 

@@ -395,6 +395,7 @@ class AddLabelCmd(QUndoCommand):
 
     def redo(self) -> None:  # type: ignore[override]
         self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
+        self.win._draw_plots(self.win.act_verify.isChecked())
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -402,7 +403,7 @@ class AddLabelCmd(QUndoCommand):
         df.loc[mask, ["label_id", "label_name"]] = self.prev.values
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
-        self.win.canvas.draw_idle()
+        self.win._draw_plots(self.win.act_verify.isChecked())
 
 
 class DeleteLabelCmd(QUndoCommand):
@@ -420,6 +421,7 @@ class DeleteLabelCmd(QUndoCommand):
 
     def redo(self) -> None:  # type: ignore[override]
         self.win._delete_label_range(self.topic, self.xmin, self.xmax)
+        self.win._draw_plots(self.win.act_verify.isChecked())
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -427,7 +429,7 @@ class DeleteLabelCmd(QUndoCommand):
         df.loc[mask, ["label_id", "label_name"]] = self.prev.values
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
-        self.win.canvas.draw_idle()
+        self.win._draw_plots(self.win.act_verify.isChecked())
 
 
 class EditLabelCmd(QUndoCommand):
@@ -447,6 +449,7 @@ class EditLabelCmd(QUndoCommand):
     def redo(self) -> None:  # type: ignore[override]
         self.win._delete_label_range(self.topic, self.xmin, self.xmax)
         self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
+        self.win._draw_plots(self.win.act_verify.isChecked())
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -454,7 +457,7 @@ class EditLabelCmd(QUndoCommand):
         df.loc[mask, ["label_id", "label_name"]] = self.prev.values
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
-        self.win.canvas.draw_idle()
+        self.win._draw_plots(self.win.act_verify.isChecked())
 
 # ===========================================================================
 # Main-Window
@@ -485,6 +488,8 @@ class MainWindow(QMainWindow):
         self.current_span: dict[str, Tuple[float, float]] = {}
         self.last_selected_topic: str | None = None
         self.label_patches: Dict[str, List[Tuple[float, float, object]]] = {}
+        # Track-Segmente zur Synchronisation von Verifikations-Ansicht
+        self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
@@ -927,15 +932,21 @@ class MainWindow(QMainWindow):
             # Verify-Track
             if verify:
                 ax_tr = self.fig.add_subplot(gs[row + 1], sharex=ax)
-                for lname, props in ANOMALY_TYPES.items():
-                    m = df["label_name"] == lname
-                    if m.any():
-                        ax_tr.scatter(df.loc[m, "time"], np.zeros(m.sum()),
-                                      s=10, marker="s", color=props["color"], label=lname)
-                unk = df["label_id"] == UNKNOWN_ID
-                if unk.any():
-                    ax_tr.scatter(df.loc[unk, "time"], np.zeros(unk.sum()),
-                                  s=10, marker="s", color=UNKNOWN_COLOR, label=UNKNOWN_NAME)
+                segs = self.label_patches_track.get(topic, [])
+                if segs:
+                    for s, e, lname in segs:
+                        color = ANOMALY_TYPES[lname]["color"]
+                        ax_tr.axvspan(s, e, color=color, alpha=.6, label=lname)
+                else:
+                    for lname, props in ANOMALY_TYPES.items():
+                        m = df["label_name"] == lname
+                        if m.any():
+                            ax_tr.scatter(df.loc[m, "time"], np.zeros(m.sum()),
+                                          s=10, marker="s", color=props["color"], label=lname)
+                    unk = df["label_id"] == UNKNOWN_ID
+                    if unk.any():
+                        ax_tr.scatter(df.loc[unk, "time"], np.zeros(unk.sum()),
+                                      s=10, marker="s", color=UNKNOWN_COLOR, label=UNKNOWN_NAME)
                 ax_tr.set_ylim(-1, 1)
                 ax_tr.set_yticks([])
                 ax_tr.set_xlabel("Zeit ab Start [s]")
@@ -953,6 +964,7 @@ class MainWindow(QMainWindow):
     def _restore_labels(self, ax, topic: str) -> None:
         df = self.dfs[topic]
         self.label_patches[topic] = []
+        self.label_patches_track[topic] = []
         if df.empty:
             return
         lbl = df["label_name"].to_numpy()
@@ -965,6 +977,7 @@ class MainWindow(QMainWindow):
                     color = ANOMALY_TYPES[last]["color"]
                     patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
                     self.label_patches[topic].append((start, prev_t, patch))
+                    self.label_patches_track[topic].append((start, prev_t, last))
                 start = t
                 last = name
             prev_t = t
@@ -972,6 +985,7 @@ class MainWindow(QMainWindow):
             color = ANOMALY_TYPES[last]["color"]
             patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
             self.label_patches[topic].append((start, prev_t, patch))
+            self.label_patches_track[topic].append((start, prev_t, last))
 
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
@@ -1084,6 +1098,7 @@ class MainWindow(QMainWindow):
         ax = next(a for a, t in self.ax_topic.items() if t == topic)
         patch = ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
         self.label_patches.setdefault(topic, []).append((xmin, xmax, patch))
+        self.label_patches_track.setdefault(topic, []).append((xmin, xmax, lname))
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
@@ -1099,6 +1114,8 @@ class MainWindow(QMainWindow):
             for _, _, patch in self.label_patches[topic]:
                 patch.remove()
             self.label_patches[topic] = []
+        if topic in self.label_patches_track:
+            self.label_patches_track[topic] = []
         ax = next(a for a, t in self.ax_topic.items() if t == topic)
         self._restore_labels(ax, topic)
         self.canvas.draw_idle()
