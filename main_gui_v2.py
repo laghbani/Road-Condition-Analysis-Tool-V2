@@ -16,6 +16,7 @@ import sys
 import pathlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, cast
+from concurrent.futures import ProcessPoolExecutor
 from enum import Enum, auto
 import logging
 
@@ -116,7 +117,12 @@ except ImportError:
 try:
     from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
     from rclpy.serialization import deserialize_message
-    from sensor_msgs.msg import Imu, NavSatFix
+    from sensor_msgs.msg import (
+        Imu, NavSatFix, Image, CompressedImage, PointCloud2
+    )
+    from cv_bridge import CvBridge
+    from sensor_msgs_py import point_cloud2 as pc2
+    import cv2
     from imu_csv_export_v2 import (
         export_csv_smart_v2,
         remove_gravity_lowpass,
@@ -141,12 +147,25 @@ class RotMode(Enum):
 
 # Default-Overrides (kann der User gleich im Dialog ändern)
 DEFAULT_OVERRIDES: dict[str, np.ndarray] = {
-    "/zed_right/zed_node/imu/data": np.array([[0, 1, 0],
-                                              [-1, 0, 0],
-                                              [0, 0, 1]], float),
-    "/zed_left/zed_node/imu/data": np.array([[0, -1, 0],
-                                             [1, 0, 0],
+    # ZED rear camera: flipped by 180° around X and Y (equals 180° around Z)
+    "/zed_rear/zed_node/imu/data": np.array([[-1, 0, 0],
+                                             [0, -1, 0],
                                              [0, 0, 1]], float),
+
+    # Ouster rear lidar IMU: same orientation as the rear ZED
+    "/ouster_rear/imu": np.array([[-1, 0, 0],
+                                  [0, -1, 0],
+                                  [0, 0, 1]], float),
+
+    # ZED left camera: rotate 90° to the right (clockwise around Z)
+    "/zed_left/zed_node/imu/data": np.array([[0, 1, 0],
+                                             [-1, 0, 0],
+                                             [0, 0, 1]], float),
+
+    # ZED right camera: rotate 90° to the left (counter-clockwise around Z)
+    "/zed_right/zed_node/imu/data": np.array([[0, -1, 0],
+                                              [1, 0, 0],
+                                              [0, 0, 1]], float),
 }
 
 # ===========================================================================
@@ -184,6 +203,84 @@ class ImuSample:
         return la.x, la.y, la.z
 
 
+def _preprocess_single(args):
+    """Helper for parallel preprocessing of one topic."""
+    (
+        topic,
+        times,
+        acc_arr,
+        ori_arr,
+        gps_df,
+        rot_mode,
+        overrides,
+        iso_comfort,
+        peak_thr,
+        peak_dist,
+        use_max,
+    ) = args
+
+    df = pd.DataFrame(
+        {
+            "time": times,
+            "accel_x": acc_arr[:, 0],
+            "accel_y": acc_arr[:, 1],
+            "accel_z": acc_arr[:, 2],
+        }
+    )
+
+    ori = ori_arr
+    norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
+    var_ok = np.ptp(ori, axis=0).max() > 1e-3
+    has_quat = bool(norm_ok.any() and var_ok)
+
+    if has_quat:
+        g_vec = gravity_from_quat(pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
+        acc_corr = acc_arr - g_vec
+        g_est = g_vec
+    else:
+        acc_corr, g_est, _ = remove_gravity_lowpass(df)
+
+    df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
+    df[["grav_x", "grav_y", "grav_z"]] = g_est
+
+    auto = auto_vehicle_frame(df, gps_df)
+    ov = overrides.get(topic)
+    if rot_mode == RotMode.OVERRIDE_FIRST:
+        rot = ov if ov is not None else auto
+    elif rot_mode == RotMode.AUTO_FIRST:
+        rot = auto if auto is not None else ov
+    else:
+        rot = auto
+    if rot is not None:
+        R = np.asarray(rot)
+        veh = acc_corr @ R.T
+        df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
+
+    fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
+    res = calc_awv(
+        acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
+        comfort=iso_comfort,
+        peak_height=peak_thr,
+        peak_dist=peak_dist,
+        max_peak=use_max,
+    )
+    df[["awx", "awy", "awz"]] = np.column_stack((res["awx"], res["awy"], res["awz"]))
+    df[["rms_x", "rms_y", "rms_z"]] = np.column_stack((res["rms_x"], res["rms_y"], res["rms_z"]))
+    df["awv"] = res["awv"]
+    metrics = {
+        "awv_total": res["awv_total"],
+        "A8": res["A8"],
+        "crest_factor": res["crest_factor"],
+        "peaks": res["peaks"].tolist(),
+    }
+    cols = {
+        name: df[name].to_numpy()
+        for name in df.columns
+        if name not in {"time", "accel_x", "accel_y", "accel_z"}
+    }
+    return topic, cols, metrics
+
+
 class BagReaderWorker(QThread):
     """Worker-Thread zum asynchronen Einlesen der Bag-Datei."""
 
@@ -208,15 +305,23 @@ class BagReaderWorker(QThread):
 
             self.stepChanged.emit("Ermittle Topics …")
             topics_info = reader.get_all_topics_and_types()
-            imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
+            topic_types = {t.name: t.type for t in topics_info}
+            imu_topics = [t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/Imu"]
+            gps_topic = next((t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/NavSatFix"), None)
+            image_topics = [t for t, ty in topic_types.items() if ty in ("sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage")]
+            pc_topics = [t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/PointCloud2"]
 
             total = reader.get_metadata().message_count
             self.setMaximum.emit(total)
 
             samples = {t: [] for t in imu_topics}
             gps: list[tuple] = []
+            video_frames_by_topic: dict[str, list[Image | bytes]] = {t: [] for t in image_topics}
+            video_times_by_topic: dict[str, list[float]] = {t: [] for t in image_topics}
+            pc_frames_by_topic: dict[str, list[PointCloud2]] = {t: [] for t in pc_topics}
+            pc_times_by_topic: dict[str, list[float]] = {t: [] for t in pc_topics}
             cnt = 0
+            bridge = CvBridge()
 
             self.stepChanged.emit("Lese Daten …")
             while reader.has_next():
@@ -226,6 +331,19 @@ class BagReaderWorker(QThread):
                 elif gps_topic and topic == gps_topic:
                     msg = deserialize_message(data, NavSatFix)
                     gps.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
+                elif topic in video_frames_by_topic:
+                    mtype = topic_types[topic]
+                    if mtype == "sensor_msgs/msg/Image":
+                        img_msg = deserialize_message(data, Image)
+                        video_frames_by_topic[topic].append(img_msg)
+                    else:
+                        img_msg = deserialize_message(data, CompressedImage)
+                        video_frames_by_topic[topic].append(bytes(img_msg.data))
+                    video_times_by_topic[topic].append(ts / 1e9)
+                elif topic in pc_frames_by_topic:
+                    pc_msg = deserialize_message(data, PointCloud2)
+                    pc_frames_by_topic[topic].append(pc_msg)
+                    pc_times_by_topic[topic].append(ts / 1e9)
                 cnt += 1
                 if cnt % 200 == 0:
                     self.progress.emit(cnt)
@@ -233,7 +351,21 @@ class BagReaderWorker(QThread):
             self.progress.emit(total)
             available = [t for t, vals in samples.items() if vals]
             log.debug("BagReaderWorker finished reading")
-            self.finished.emit((samples, gps, available, gps_topic), None)
+            self.finished.emit(
+                (
+                    samples,
+                    gps,
+                    available,
+                    gps_topic,
+                    image_topics,
+                    pc_topics,
+                    video_frames_by_topic,
+                    pc_frames_by_topic,
+                    video_times_by_topic,
+                    pc_times_by_topic,
+                ),
+                None,
+            )
         except Exception as exc:
             log.exception("BagReaderWorker error")
             self.finished.emit(None, exc)
@@ -296,9 +428,9 @@ class MountDialog(QDialog):
         rb1 = QRadioButton("Override ⟶ Auto (Override-first)")
         rb2 = QRadioButton("Auto ⟶ Override (Auto-first)")
         rb3 = QRadioButton("Nur Auto (Override deaktiviert)")
-        if mode is RotMode.OVERRIDE_FIRST:
+        if mode == RotMode.OVERRIDE_FIRST:
             rb1.setChecked(True)
-        elif mode is RotMode.AUTO_FIRST:
+        elif mode == RotMode.AUTO_FIRST:
             rb2.setChecked(True)
         else:
             rb3.setChecked(True)
@@ -610,12 +742,20 @@ class MainWindow(QMainWindow):
         self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
-        self.rot_mode: RotMode = RotMode.AUTO_ONLY
+        self.rot_mode: RotMode = RotMode.OVERRIDE_FIRST
         self.iso_comfort: bool = True  # ISO weighting mode
         self.iso_metrics: dict[str, dict] = {}
         self.peak_threshold: float = 3.19
-        self.peak_distance: float = 0.0
+        self.peak_distance: float = 1.5
         self.use_max_peak: bool = False
+
+        # Video/PointCloud playback
+        self.video_topic: str | None = None
+        self.pc_topic: str | None = None
+        self.video_frames_by_topic: dict[str, list] = {}
+        self.video_times_by_topic: dict[str, list[float]] = {}
+        self.pc_frames_by_topic: dict[str, list] = {}
+        self.pc_times_by_topic: dict[str, list[float]] = {}
 
         self._build_menu()
         self._build_ui()
@@ -677,6 +817,8 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------ Videos + PC
         self.tab_vpc = VideoPointCloudTab()
         self.tabs.addTab(self.tab_vpc, "Videos + PC")
+        self.tab_vpc.cmb_video.currentTextChanged.connect(self._change_video_topic)
+        self.tab_vpc.cmb_pc.currentTextChanged.connect(self._change_pc_topic)
 
         self.tabs.currentChanged.connect(self._tab_changed)
 
@@ -771,12 +913,12 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_verify)
 
         self.act_show_raw = QAction("Show raw acceleration", self, checkable=True)
-        self.act_show_raw.setChecked(True)
+        self.act_show_raw.setChecked(False)
         self.act_show_raw.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_raw)
 
         self.act_show_corr = QAction("Show g-corrected acceleration", self, checkable=True)
-        self.act_show_corr.setChecked(True)
+        self.act_show_corr.setChecked(False)
         self.act_show_corr.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_corr)
 
@@ -802,7 +944,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_show_z)
 
         self.act_show_iso = QAction("Show ISO weighted", self, checkable=True)
-        self.act_show_iso.setChecked(False)
+        self.act_show_iso.setChecked(True)
         self.act_show_iso.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_iso)
 
@@ -867,7 +1009,10 @@ class MainWindow(QMainWindow):
             return
 
         assert result is not None
-        samples, gps, available, gps_topic = result
+        (samples, gps, available, gps_topic,
+         image_topics, pc_topics,
+         vid_frames, pc_frames,
+         vid_times, pc_times) = result
         if not available:
             QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
             progress.accept()
@@ -877,7 +1022,22 @@ class MainWindow(QMainWindow):
         self.samples = cast(dict[str, list[ImuSample]], {t: samples[t] for t in available})
         self.available_topics = available
         self._gps_df = pd.DataFrame(gps, columns=["time", "lat", "lon", "alt"]) if gps else None
+        self.video_frames_by_topic = vid_frames
+        self.video_times_by_topic = vid_times
+        self.pc_frames_by_topic = pc_frames
+        self.pc_times_by_topic = pc_times
         log.debug("Available topics: %s", self.available_topics)
+
+        self.tab_vpc.cmb_video.clear()
+        self.tab_vpc.cmb_video.addItems(image_topics)
+        self.tab_vpc.cmb_pc.clear()
+        self.tab_vpc.cmb_pc.addItems(pc_topics)
+        if image_topics:
+            self.tab_vpc.cmb_video.setCurrentIndex(0)
+            self._change_video_topic(image_topics[0])
+        if pc_topics:
+            self.tab_vpc.cmb_pc.setCurrentIndex(0)
+            self._change_pc_topic(pc_topics[0])
 
         progress.set_bar_steps(3)
         if not progress.advance("Erzeuge DataFrames …"):
@@ -960,69 +1120,49 @@ class MainWindow(QMainWindow):
     def _preprocess_all(self) -> None:
         log.debug("Preprocessing all topics")
         self.iso_metrics.clear()
+        arglist = []
         for topic, df in self.dfs.items():
             samps = self.samples[topic]
-
-            # --- Prüfen, ob Quaternionen verwertbar ---------------------------
-            ori = np.array([[s.msg.orientation.x, s.msg.orientation.y,
-                            s.msg.orientation.z, s.msg.orientation.w]
-                            for s in samps])
-            norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
-            var_ok  = np.ptp(ori, axis=0).max() > 1e-3
-            has_quat = bool(norm_ok.any() and var_ok)
-
-            # --- g-Kompensation ----------------------------------------------
-            if has_quat:
-                g_vec = gravity_from_quat(
-                    pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"])
+            acc = np.asarray([s.lin_acc for s in samps], dtype=np.float32)
+            ori = np.asarray([
+                [s.msg.orientation.x, s.msg.orientation.y, s.msg.orientation.z, s.msg.orientation.w]
+                for s in samps
+            ], dtype=np.float32)
+            times = df["time"].to_numpy(np.float32)
+            arglist.append(
+                (
+                    topic,
+                    times,
+                    acc,
+                    ori,
+                    self._gps_df,
+                    self.rot_mode,
+                    self.mount_overrides,
+                    self.iso_comfort,
+                    self.peak_threshold,
+                    self.peak_distance,
+                    self.use_max_peak,
                 )
-                acc_corr = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - g_vec
-                g_est = g_vec
-            else:
-                acc_corr, g_est, _ = remove_gravity_lowpass(df)
-
-            df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
-            df[["grav_x", "grav_y", "grav_z"]] = g_est
-
-            # --- Fahrzeug-Rahmen ---------------------------------------------
-            rot = self._resolve_rotation(topic, df)
-            if rot is not None:
-                R = np.asarray(rot)
-                veh = acc_corr @ R.T
-                df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
-
-            # --- ISO 2631 weighting -----------------------------------------
-            fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
-            res = calc_awv(
-                acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
-                comfort=self.iso_comfort,
-                peak_height=self.peak_threshold,
-                peak_dist=self.peak_distance,
-                max_peak=self.use_max_peak,
             )
-            df[["awx", "awy", "awz"]] = np.column_stack(
-                (res["awx"], res["awy"], res["awz"]))
-            df[["rms_x", "rms_y", "rms_z"]] = np.column_stack(
-                (res["rms_x"], res["rms_y"], res["rms_z"]))
-            df["awv"] = res["awv"]
-            self.iso_metrics[topic] = {
-                "awv_total": res["awv_total"],
-                "A8": res["A8"],
-                "crest_factor": res["crest_factor"],
-                "peaks": res["peaks"].tolist(),
-            }
+
+        with ProcessPoolExecutor() as pool:
+            for topic, cols, iso in pool.map(_preprocess_single, arglist):
+                df = self.dfs[topic]
+                for name, arr in cols.items():
+                    df[name] = arr
+                self.iso_metrics[topic] = iso
         log.debug("Preprocessing finished")
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
         ov = self.mount_overrides.get(topic)
 
-        if self.rot_mode is RotMode.OVERRIDE_FIRST:
+        if self.rot_mode == RotMode.OVERRIDE_FIRST:
             if ov is not None:
                 rot = ov
             else:
                 rot = auto
-        if self.rot_mode is RotMode.AUTO_FIRST:
+        elif self.rot_mode == RotMode.AUTO_FIRST:
             if auto is not None:
                 rot = auto
             else:
@@ -1037,18 +1177,19 @@ class MainWindow(QMainWindow):
             "/zed_rear/zed_node/imu/data",
             "/zed_left/zed_node/imu/data",
             "/zed_right/zed_node/imu/data",
+            "/ouster_rear/imu",
         ]
         available = self.available_topics or list(self.dfs)
         if not available:
             self.active_topics = []
             return
+
         sel = [p for p in pref if p in available]
         for t in available:
-            if len(sel) >= 3:
-                break
             if t not in sel:
                 sel.append(t)
-        self.active_topics = sel or available[:3]
+
+        self.active_topics = sel
 
     # ------------------------------------------------------------------ Plots
     def _draw_plots(self, verify: bool = False) -> None:
@@ -1118,7 +1259,7 @@ class MainWindow(QMainWindow):
                 direction="horizontal",
                 interactive=True,
                 useblit=True,
-                props=dict(alpha=.25, facecolor="tab:red"),
+                props=dict(alpha=.2, facecolor="#ff8888"),
             )
 
             # Verify-Track
@@ -1213,22 +1354,46 @@ class MainWindow(QMainWindow):
             if not self.tab_vpc.video_frames:
                 self.tab_vpc.show_pointcloud_placeholder("No data loaded")
 
+    def _change_video_topic(self, t: str) -> None:
+        self.video_topic = t if t else None
+        vframes = self.video_frames_by_topic.get(t, [])
+        pframes = self.pc_frames_by_topic.get(self.pc_topic, [])
+        self.tab_vpc.load_arrays(vframes, pframes)
+
+    def _change_pc_topic(self, t: str) -> None:
+        self.pc_topic = t if t else None
+        vframes = self.video_frames_by_topic.get(self.video_topic, [])
+        pframes = self.pc_frames_by_topic.get(t, [])
+        self.tab_vpc.load_arrays(vframes, pframes)
+
     def _show_peak_video(self, topic: str, t_peak: float) -> None:
-        pre = float(self.tab_vpc.spn_pre.value())
-        post = float(self.tab_vpc.spn_post.value())
-        times = np.arange(t_peak - pre, t_peak + post, 0.1)
-        video_frames: list[np.ndarray] = []
-        pc_frames: list[np.ndarray] = []
-        for t in times:
-            val = int(255 * (t - times[0]) / max(times[-1] - times[0], 0.1))
-            img = np.full((240, 320, 3), val, dtype=np.uint8)
-            video_frames.append(img)
+        vid_topic = self.video_topic or ""
+        pc_topic = self.pc_topic or ""
+        vframes = self.video_frames_by_topic.get(vid_topic, [])
+        pframes = self.pc_frames_by_topic.get(pc_topic, [])
+        vtimes = self.video_times_by_topic.get(vid_topic, [])
+        ptimes = self.pc_times_by_topic.get(pc_topic, [])
+        if not vframes and not pframes:
+            return
 
-            pts = np.random.normal(size=(500, 3)).astype(np.float32)
-            pts[:, 2] += 0.1 * t
-            pc_frames.append(pts)
+        pre = self.tab_vpc.spn_pre.value()
+        post = self.tab_vpc.spn_post.value()
+        t0 = self.t0 or 0.0
+        start = t_peak - pre
+        end = t_peak + post
 
-        self.tab_vpc.load_arrays(video_frames, pc_frames)
+        if vtimes:
+            tr = np.array(vtimes) - t0
+            i0 = int(np.searchsorted(tr, start, "left"))
+            i1 = int(np.searchsorted(tr, end, "right"))
+            vframes = vframes[i0:i1]
+        if ptimes:
+            trp = np.array(ptimes) - t0
+            i0 = int(np.searchsorted(trp, start, "left"))
+            i1 = int(np.searchsorted(trp, end, "right"))
+            pframes = pframes[i0:i1]
+
+        self.tab_vpc.load_arrays(vframes, pframes)
         self.tabs.setCurrentIndex(2)
         self.tab_vpc.play()
 
