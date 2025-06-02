@@ -98,7 +98,7 @@ def exponential_running_rms(x: np.ndarray, fs: float, tau: float = 1.0) -> np.nd
 
 def calc_awv(ax: np.ndarray, ay: np.ndarray, az: np.ndarray,
              fs: float, comfort: bool = True,
-             peak_height: float = 3.19, peak_dist: float = 0.0,
+             peak_height: float = 3.19, peak_dist: float = 1.5,
              max_peak: bool = False) -> dict[str, np.ndarray | float]:
     """Calculate weighted vibration values for three axes.
 
