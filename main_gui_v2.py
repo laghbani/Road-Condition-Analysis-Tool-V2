@@ -16,6 +16,7 @@ import sys
 import pathlib
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, cast
+from concurrent.futures import ProcessPoolExecutor
 from enum import Enum, auto
 import logging
 
@@ -202,6 +203,84 @@ class ImuSample:
         return la.x, la.y, la.z
 
 
+def _preprocess_single(args):
+    """Helper for parallel preprocessing of one topic."""
+    (
+        topic,
+        times,
+        acc_arr,
+        ori_arr,
+        gps_df,
+        rot_mode,
+        overrides,
+        iso_comfort,
+        peak_thr,
+        peak_dist,
+        use_max,
+    ) = args
+
+    df = pd.DataFrame(
+        {
+            "time": times,
+            "accel_x": acc_arr[:, 0],
+            "accel_y": acc_arr[:, 1],
+            "accel_z": acc_arr[:, 2],
+        }
+    )
+
+    ori = ori_arr
+    norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
+    var_ok = np.ptp(ori, axis=0).max() > 1e-3
+    has_quat = bool(norm_ok.any() and var_ok)
+
+    if has_quat:
+        g_vec = gravity_from_quat(pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
+        acc_corr = acc_arr - g_vec
+        g_est = g_vec
+    else:
+        acc_corr, g_est, _ = remove_gravity_lowpass(df)
+
+    df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
+    df[["grav_x", "grav_y", "grav_z"]] = g_est
+
+    auto = auto_vehicle_frame(df, gps_df)
+    ov = overrides.get(topic)
+    if rot_mode == RotMode.OVERRIDE_FIRST:
+        rot = ov if ov is not None else auto
+    elif rot_mode == RotMode.AUTO_FIRST:
+        rot = auto if auto is not None else ov
+    else:
+        rot = auto
+    if rot is not None:
+        R = np.asarray(rot)
+        veh = acc_corr @ R.T
+        df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
+
+    fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
+    res = calc_awv(
+        acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
+        comfort=iso_comfort,
+        peak_height=peak_thr,
+        peak_dist=peak_dist,
+        max_peak=use_max,
+    )
+    df[["awx", "awy", "awz"]] = np.column_stack((res["awx"], res["awy"], res["awz"]))
+    df[["rms_x", "rms_y", "rms_z"]] = np.column_stack((res["rms_x"], res["rms_y"], res["rms_z"]))
+    df["awv"] = res["awv"]
+    metrics = {
+        "awv_total": res["awv_total"],
+        "A8": res["A8"],
+        "crest_factor": res["crest_factor"],
+        "peaks": res["peaks"].tolist(),
+    }
+    cols = {
+        name: df[name].to_numpy()
+        for name in df.columns
+        if name not in {"time", "accel_x", "accel_y", "accel_z"}
+    }
+    return topic, cols, metrics
+
+
 class BagReaderWorker(QThread):
     """Worker-Thread zum asynchronen Einlesen der Bag-Datei."""
 
@@ -237,9 +316,9 @@ class BagReaderWorker(QThread):
 
             samples = {t: [] for t in imu_topics}
             gps: list[tuple] = []
-            video_frames_by_topic: dict[str, list[np.ndarray]] = {t: [] for t in image_topics}
+            video_frames_by_topic: dict[str, list[Image | bytes]] = {t: [] for t in image_topics}
             video_times_by_topic: dict[str, list[float]] = {t: [] for t in image_topics}
-            pc_frames_by_topic: dict[str, list[np.ndarray]] = {t: [] for t in pc_topics}
+            pc_frames_by_topic: dict[str, list[PointCloud2]] = {t: [] for t in pc_topics}
             pc_times_by_topic: dict[str, list[float]] = {t: [] for t in pc_topics}
             cnt = 0
             bridge = CvBridge()
@@ -256,20 +335,14 @@ class BagReaderWorker(QThread):
                     mtype = topic_types[topic]
                     if mtype == "sensor_msgs/msg/Image":
                         img_msg = deserialize_message(data, Image)
-                        cv_img = bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
+                        video_frames_by_topic[topic].append(img_msg)
                     else:
                         img_msg = deserialize_message(data, CompressedImage)
-                        buf = np.frombuffer(img_msg.data, dtype=np.uint8)
-                        cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-                    video_frames_by_topic[topic].append(cv_img)
+                        video_frames_by_topic[topic].append(bytes(img_msg.data))
                     video_times_by_topic[topic].append(ts / 1e9)
                 elif topic in pc_frames_by_topic:
                     pc_msg = deserialize_message(data, PointCloud2)
-                    xyz = np.asarray([
-                        [p[0], p[1], p[2]]
-                        for p in pc2.read_points(pc_msg, field_names=("x", "y", "z"), skip_nans=True)
-                    ], dtype=np.float32)
-                    pc_frames_by_topic[topic].append(xyz)
+                    pc_frames_by_topic[topic].append(pc_msg)
                     pc_times_by_topic[topic].append(ts / 1e9)
                 cnt += 1
                 if cnt % 200 == 0:
@@ -355,9 +428,9 @@ class MountDialog(QDialog):
         rb1 = QRadioButton("Override ⟶ Auto (Override-first)")
         rb2 = QRadioButton("Auto ⟶ Override (Auto-first)")
         rb3 = QRadioButton("Nur Auto (Override deaktiviert)")
-        if mode is RotMode.OVERRIDE_FIRST:
+        if mode == RotMode.OVERRIDE_FIRST:
             rb1.setChecked(True)
-        elif mode is RotMode.AUTO_FIRST:
+        elif mode == RotMode.AUTO_FIRST:
             rb2.setChecked(True)
         else:
             rb3.setChecked(True)
@@ -679,9 +752,9 @@ class MainWindow(QMainWindow):
         # Video/PointCloud playback
         self.video_topic: str | None = None
         self.pc_topic: str | None = None
-        self.video_frames_by_topic: dict[str, list[np.ndarray]] = {}
+        self.video_frames_by_topic: dict[str, list] = {}
         self.video_times_by_topic: dict[str, list[float]] = {}
-        self.pc_frames_by_topic: dict[str, list[np.ndarray]] = {}
+        self.pc_frames_by_topic: dict[str, list] = {}
         self.pc_times_by_topic: dict[str, list[float]] = {}
 
         self._build_menu()
@@ -1047,69 +1120,49 @@ class MainWindow(QMainWindow):
     def _preprocess_all(self) -> None:
         log.debug("Preprocessing all topics")
         self.iso_metrics.clear()
+        arglist = []
         for topic, df in self.dfs.items():
             samps = self.samples[topic]
-
-            # --- Prüfen, ob Quaternionen verwertbar ---------------------------
-            ori = np.array([[s.msg.orientation.x, s.msg.orientation.y,
-                            s.msg.orientation.z, s.msg.orientation.w]
-                            for s in samps])
-            norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
-            var_ok  = np.ptp(ori, axis=0).max() > 1e-3
-            has_quat = bool(norm_ok.any() and var_ok)
-
-            # --- g-Kompensation ----------------------------------------------
-            if has_quat:
-                g_vec = gravity_from_quat(
-                    pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"])
+            acc = np.asarray([s.lin_acc for s in samps], dtype=np.float32)
+            ori = np.asarray([
+                [s.msg.orientation.x, s.msg.orientation.y, s.msg.orientation.z, s.msg.orientation.w]
+                for s in samps
+            ], dtype=np.float32)
+            times = df["time"].to_numpy()
+            arglist.append(
+                (
+                    topic,
+                    times,
+                    acc,
+                    ori,
+                    self._gps_df,
+                    self.rot_mode,
+                    self.mount_overrides,
+                    self.iso_comfort,
+                    self.peak_threshold,
+                    self.peak_distance,
+                    self.use_max_peak,
                 )
-                acc_corr = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - g_vec
-                g_est = g_vec
-            else:
-                acc_corr, g_est, _ = remove_gravity_lowpass(df)
-
-            df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
-            df[["grav_x", "grav_y", "grav_z"]] = g_est
-
-            # --- Fahrzeug-Rahmen ---------------------------------------------
-            rot = self._resolve_rotation(topic, df)
-            if rot is not None:
-                R = np.asarray(rot)
-                veh = acc_corr @ R.T
-                df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
-
-            # --- ISO 2631 weighting -----------------------------------------
-            fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
-            res = calc_awv(
-                acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
-                comfort=self.iso_comfort,
-                peak_height=self.peak_threshold,
-                peak_dist=self.peak_distance,
-                max_peak=self.use_max_peak,
             )
-            df[["awx", "awy", "awz"]] = np.column_stack(
-                (res["awx"], res["awy"], res["awz"]))
-            df[["rms_x", "rms_y", "rms_z"]] = np.column_stack(
-                (res["rms_x"], res["rms_y"], res["rms_z"]))
-            df["awv"] = res["awv"]
-            self.iso_metrics[topic] = {
-                "awv_total": res["awv_total"],
-                "A8": res["A8"],
-                "crest_factor": res["crest_factor"],
-                "peaks": res["peaks"].tolist(),
-            }
+
+        with ProcessPoolExecutor() as pool:
+            for topic, cols, iso in pool.map(_preprocess_single, arglist):
+                df = self.dfs[topic]
+                for name, arr in cols.items():
+                    df[name] = arr
+                self.iso_metrics[topic] = iso
         log.debug("Preprocessing finished")
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
         ov = self.mount_overrides.get(topic)
 
-        if self.rot_mode is RotMode.OVERRIDE_FIRST:
+        if self.rot_mode == RotMode.OVERRIDE_FIRST:
             if ov is not None:
                 rot = ov
             else:
                 rot = auto
-        elif self.rot_mode is RotMode.AUTO_FIRST:
+        elif self.rot_mode == RotMode.AUTO_FIRST:
             if auto is not None:
                 rot = auto
             else:
@@ -1206,7 +1259,7 @@ class MainWindow(QMainWindow):
                 direction="horizontal",
                 interactive=True,
                 useblit=True,
-                props=dict(alpha=.25, facecolor="tab:red"),
+                props=dict(alpha=.2, facecolor="#ff8888"),
             )
 
             # Verify-Track
