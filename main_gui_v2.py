@@ -397,6 +397,8 @@ class MainWindow(QMainWindow):
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
+        self.last_selected_topic: str | None = None
+        self.label_patches: Dict[str, List[Tuple[float, float, object]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
@@ -433,6 +435,18 @@ class MainWindow(QMainWindow):
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
+        self.btn_add = QPushButton("Add")
+        self.btn_edit = QPushButton("Edit")
+        self.btn_del = QPushButton("Delete")
+        self.btn_add.setMaximumWidth(60)
+        self.btn_edit.setMaximumWidth(60)
+        self.btn_del.setMaximumWidth(60)
+        self.btn_add.clicked.connect(self._button_add_label)
+        self.btn_edit.clicked.connect(self._button_edit_label)
+        self.btn_del.clicked.connect(self._button_delete_label)
+        hl.addWidget(self.btn_add)
+        hl.addWidget(self.btn_edit)
+        hl.addWidget(self.btn_del)
         hl.addStretch()
 
         self.tabs.addTab(w_plot, "Plots")
@@ -578,7 +592,7 @@ class MainWindow(QMainWindow):
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
             topics_info = reader.get_all_topics_and_types()
             imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.name == "/lvx_client/navsat"), None)
+            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
             for t in imu_topics:
                 self.samples[t] = []
         except Exception as exc:
@@ -731,6 +745,7 @@ class MainWindow(QMainWindow):
         for sel in self.span_selector.values():
             sel.disconnect_events()
         self.span_selector.clear()
+        self.label_patches.clear()
 
         rows = len(self.active_topics) * (2 if verify else 1)
         gs = self.fig.add_gridspec(rows, 1,
@@ -777,6 +792,7 @@ class MainWindow(QMainWindow):
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
+            self._restore_labels(ax, topic)
             h, l = ax.get_legend_handles_labels()
             uniq = dict(zip(l, h))
             ax.legend(uniq.values(), uniq.keys(), loc="upper right")
@@ -785,7 +801,7 @@ class MainWindow(QMainWindow):
             # Span-Selector
             self.span_selector[topic] = SpanSelector(
                 ax,
-                onselect=lambda xmin, xmax, t=topic: self.current_span.__setitem__(t, (xmin, xmax)),
+                onselect=lambda xmin, xmax, t=topic: self._span_selected(t, xmin, xmax),
                 direction="horizontal",
                 interactive=True,
                 useblit=True,
@@ -814,6 +830,33 @@ class MainWindow(QMainWindow):
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
             self._draw_map()
 
+    def _span_selected(self, topic: str, xmin: float, xmax: float) -> None:
+        self.current_span[topic] = (xmin, xmax)
+        self.last_selected_topic = topic
+
+    def _restore_labels(self, ax, topic: str) -> None:
+        df = self.dfs[topic]
+        self.label_patches[topic] = []
+        if df.empty:
+            return
+        lbl = df["label_name"].to_numpy()
+        times = df["time"].to_numpy()
+        start = None
+        last = UNKNOWN_NAME
+        for t, name in zip(times, lbl):
+            if name != last:
+                if last != UNKNOWN_NAME and start is not None:
+                    color = ANOMALY_TYPES[last]["color"]
+                    patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+                    self.label_patches[topic].append((start, prev_t, patch))
+                start = t
+                last = name
+            prev_t = t
+        if last != UNKNOWN_NAME and start is not None:
+            color = ANOMALY_TYPES[last]["color"]
+            patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+            self.label_patches[topic].append((start, prev_t, patch))
+
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
         if ev.button != 3 or ev.inaxes not in self.ax_topic:
@@ -831,74 +874,85 @@ class MainWindow(QMainWindow):
             self._draw_map()
 
     def _draw_map(self) -> None:
-        if QWebEngineView is None:
-            self.fig_map.clear()
-            if self._gps_df is None or not self.active_topics:
+        if self._gps_df is None or not self.active_topics:
+            if QWebEngineView is None:
+                self.fig_map.clear()
                 self.canvas_map.draw_idle()
-                return
-            topic = self.active_topics[0]
-            df = self.dfs[topic]
-            merged = pd.merge_asof(
-                df.sort_values("time_abs"),
-                self._gps_df[["time", "lat", "lon"]].rename(columns={"time": "time_abs"}),
-                on="time_abs",
-                direction="nearest",
-            )
-            ax = self.fig_map.add_subplot(111)
-            c = merged.get("awv", pd.Series(np.zeros(len(merged))))
-            sc = ax.scatter(merged["lon"], merged["lat"], c=c, cmap="plasma", s=5)
-            self.fig_map.colorbar(sc, ax=ax, label="awv")
+            else:
+                self.web_map.setHtml("<p>No GPS data.</p>")
+            return
+
+        topic = self.active_topics[0]
+        df = self.dfs[topic]
+
+        # interpolate AWV to GPS timestamps
+        gps = self._gps_df.copy()
+        gps["awv"] = np.interp(gps["time"], df["time_abs"], df.get("awv", pd.Series(np.zeros(len(df)))) )
+
+        # optional peak markers
+        gps["peak"] = False
+        if self.act_show_peaks.isChecked():
             peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
             if len(peaks):
-                ax.scatter(merged.loc[peaks, "lon"], merged.loc[peaks, "lat"],
+                peak_times = df.loc[peaks, "time_abs"].to_numpy()
+                tol = 0.1
+                gps["peak"] = gps["time"].apply(lambda t: bool(np.any(np.abs(t - peak_times) <= tol)))
+
+        if QWebEngineView is None:
+            # simple matplotlib fallback
+            self.fig_map.clear()
+            ax = self.fig_map.add_subplot(111)
+            sc = ax.scatter(gps["lon"], gps["lat"], c=gps["awv"], cmap="plasma", s=5)
+            self.fig_map.colorbar(sc, ax=ax, label="awv")
+            if gps["peak"].any():
+                ax.scatter(gps.loc[gps["peak"], "lon"], gps.loc[gps["peak"], "lat"],
                            facecolors="none", edgecolors="black", s=40)
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")
             ax.set_title("GPS Track")
             self.canvas_map.draw_idle()
         else:
-            if self._gps_df is None or not self.active_topics:
-                self.web_map.setHtml("<p>No GPS data.</p>")
-                return
-            topic = self.active_topics[0]
-            df = self.dfs[topic]
-            merged = pd.merge_asof(
-                df.sort_values("time_abs"),
-                self._gps_df[["time", "lat", "lon"]].rename(columns={"time": "time_abs"}),
-                on="time_abs",
-                direction="nearest",
-            )
-            import folium
             try:
-                import branca.colormap as cm
+                import folium
+                from PyQt5.QtCore import QUrl
+                import tempfile, os
             except Exception:
-                cm = None
-            center = [merged["lat"].mean(), merged["lon"].mean()]
-            fmap = folium.Map(location=center, zoom_start=15)
-            cvals = merged.get("awv", pd.Series(np.zeros(len(merged))))
-            if cm and hasattr(cm.linear, "Plasma_09"):
-                colormap = cm.linear.Plasma_09.scale(float(cvals.min()), float(cvals.max()))
-            elif cm:
-                colormap = cm.LinearColormap(["blue", "red"], vmin=float(cvals.min()), vmax=float(cvals.max()))
-            else:
-                colormap = None
-            for lat, lon, val in zip(merged["lat"], merged["lon"], cvals):
-                color = colormap(float(val)) if colormap else None
-                folium.CircleMarker(
-                    location=[lat, lon], radius=3,
-                    color=color, fill=True, fill_opacity=0.9,
-                    fill_color=color
-                ).add_to(fmap)
-            if colormap:
-                colormap.add_to(fmap)
-            peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
-            for idx in peaks:
-                if 0 <= idx < len(merged):
-                    folium.CircleMarker(
-                        location=[merged.loc[idx, "lat"], merged.loc[idx, "lon"]],
-                        radius=6, color="black", fill=False
+                self.web_map.setHtml("<p>Folium not available.</p>")
+                return
+
+            lat0 = gps["lat"].mean()
+            lon0 = gps["lon"].mean()
+            fmap = folium.Map(location=[lat0, lon0], zoom_start=16, max_zoom=30, min_zoom=10)
+
+            def c_for(v: float) -> str:
+                if v < 1.72:
+                    return "green"
+                elif v < 2.12:
+                    return "yellow"
+                elif v < 2.54:
+                    return "orange"
+                elif v < 3.19:
+                    return "red"
+                else:
+                    return "purple"
+
+            for row in gps.itertuples():
+                if row.peak:
+                    folium.Marker(
+                        location=[row.lat, row.lon],
+                        icon=folium.Icon(color="black", icon="star"),
+                        popup=f"Peak@{row.time:.2f}"
                     ).add_to(fmap)
-            self.web_map.setHtml(fmap._repr_html_())
+                else:
+                    folium.CircleMarker(
+                        location=[row.lat, row.lon], radius=4,
+                        color=c_for(row.awv), fill=True
+                    ).add_to(fmap)
+
+            map_file = os.path.join(tempfile.gettempdir(), "analysis_map.html")
+            fmap.save(map_file)
+            gps.to_csv(map_file.replace(".html", "_gps.csv"), index=False)
+            self.web_map.load(QUrl.fromLocalFile(map_file))
 
     def _assign_label(self, topic: str, xmin: float, xmax: float) -> None:
         df = self.dfs[topic]
@@ -909,11 +963,52 @@ class MainWindow(QMainWindow):
         df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
 
         ax = next(a for a, t in self.ax_topic.items() if t == topic)
-        ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        patch = ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        self.label_patches.setdefault(topic, []).append((xmin, xmax, patch))
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
         self.canvas.draw_idle()
+
+    def _delete_label_range(self, topic: str, xmin: float, xmax: float) -> None:
+        df = self.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+
+        # remove all existing patches for this topic and rebuild from DataFrame
+        if topic in self.label_patches:
+            for _, _, patch in self.label_patches[topic]:
+                patch.remove()
+            self.label_patches[topic] = []
+        ax = next(a for a, t in self.ax_topic.items() if t == topic)
+        self._restore_labels(ax, topic)
+        self.canvas.draw_idle()
+
+    def _button_add_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        self._assign_label(t, xmin, xmax)
+
+    def _button_edit_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        self._delete_label_range(t, xmin, xmax)
+        self._assign_label(t, xmin, xmax)
+
+    def _button_delete_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        self._delete_label_range(t, xmin, xmax)
 
     def _check_export_status(self):
         rows = []
