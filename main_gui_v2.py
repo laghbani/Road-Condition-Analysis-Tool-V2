@@ -397,6 +397,8 @@ class MainWindow(QMainWindow):
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
+        self.last_selected_topic: str | None = None
+        self.label_patches: Dict[str, List[Tuple[float, float, object]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
@@ -433,6 +435,18 @@ class MainWindow(QMainWindow):
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
+        self.btn_add = QPushButton("Add")
+        self.btn_edit = QPushButton("Edit")
+        self.btn_del = QPushButton("Delete")
+        self.btn_add.setMaximumWidth(60)
+        self.btn_edit.setMaximumWidth(60)
+        self.btn_del.setMaximumWidth(60)
+        self.btn_add.clicked.connect(self._button_add_label)
+        self.btn_edit.clicked.connect(self._button_edit_label)
+        self.btn_del.clicked.connect(self._button_delete_label)
+        hl.addWidget(self.btn_add)
+        hl.addWidget(self.btn_edit)
+        hl.addWidget(self.btn_del)
         hl.addStretch()
 
         self.tabs.addTab(w_plot, "Plots")
@@ -578,7 +592,7 @@ class MainWindow(QMainWindow):
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
             topics_info = reader.get_all_topics_and_types()
             imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.name == "/lvx_client/navsat"), None)
+            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
             for t in imu_topics:
                 self.samples[t] = []
         except Exception as exc:
@@ -731,6 +745,7 @@ class MainWindow(QMainWindow):
         for sel in self.span_selector.values():
             sel.disconnect_events()
         self.span_selector.clear()
+        self.label_patches.clear()
 
         rows = len(self.active_topics) * (2 if verify else 1)
         gs = self.fig.add_gridspec(rows, 1,
@@ -777,6 +792,7 @@ class MainWindow(QMainWindow):
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
+            self._restore_labels(ax, topic)
             h, l = ax.get_legend_handles_labels()
             uniq = dict(zip(l, h))
             ax.legend(uniq.values(), uniq.keys(), loc="upper right")
@@ -785,7 +801,7 @@ class MainWindow(QMainWindow):
             # Span-Selector
             self.span_selector[topic] = SpanSelector(
                 ax,
-                onselect=lambda xmin, xmax, t=topic: self.current_span.__setitem__(t, (xmin, xmax)),
+                onselect=lambda xmin, xmax, t=topic: self._span_selected(t, xmin, xmax),
                 direction="horizontal",
                 interactive=True,
                 useblit=True,
@@ -813,6 +829,33 @@ class MainWindow(QMainWindow):
         self.canvas.draw_idle()
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
             self._draw_map()
+
+    def _span_selected(self, topic: str, xmin: float, xmax: float) -> None:
+        self.current_span[topic] = (xmin, xmax)
+        self.last_selected_topic = topic
+
+    def _restore_labels(self, ax, topic: str) -> None:
+        df = self.dfs[topic]
+        self.label_patches[topic] = []
+        if df.empty:
+            return
+        lbl = df["label_name"].to_numpy()
+        times = df["time"].to_numpy()
+        start = None
+        last = UNKNOWN_NAME
+        for t, name in zip(times, lbl):
+            if name != last:
+                if last != UNKNOWN_NAME and start is not None:
+                    color = ANOMALY_TYPES[last]["color"]
+                    patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+                    self.label_patches[topic].append((start, prev_t, patch))
+                start = t
+                last = name
+            prev_t = t
+        if last != UNKNOWN_NAME and start is not None:
+            color = ANOMALY_TYPES[last]["color"]
+            patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+            self.label_patches[topic].append((start, prev_t, patch))
 
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
@@ -909,11 +952,53 @@ class MainWindow(QMainWindow):
         df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
 
         ax = next(a for a, t in self.ax_topic.items() if t == topic)
-        ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        patch = ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        self.label_patches.setdefault(topic, []).append((xmin, xmax, patch))
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
         self.canvas.draw_idle()
+
+    def _delete_label_range(self, topic: str, xmin: float, xmax: float) -> None:
+        df = self.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+
+        if topic in self.label_patches:
+            new_list = []
+            for start, end, patch in self.label_patches[topic]:
+                if end <= xmin or start >= xmax:
+                    new_list.append((start, end, patch))
+                else:
+                    patch.remove()
+            self.label_patches[topic] = new_list
+        self.canvas.draw_idle()
+
+    def _button_add_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        self._assign_label(t, xmin, xmax)
+
+    def _button_edit_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        self._delete_label_range(t, xmin, xmax)
+        self._assign_label(t, xmin, xmax)
+
+    def _button_delete_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        self._delete_label_range(t, xmin, xmax)
 
     def _check_export_status(self):
         rows = []
