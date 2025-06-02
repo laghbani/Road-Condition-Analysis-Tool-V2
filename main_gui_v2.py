@@ -74,18 +74,30 @@ try:
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
+        QActionGroup, QUndoStack, QUndoCommand
     )
-    from PyQt5.QtCore import Qt
+    try:
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
+    except Exception:
+        QWebEngineView = None
+    from PyQt5.QtCore import Qt, QSettings
+    from PyQt5.QtGui import QKeySequence
 except ImportError:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-        QPushButton, QGroupBox, QRadioButton,
+        QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
+        QActionGroup, QUndoStack, QUndoCommand
     )
-    from PySide6.QtCore import Qt
+    try:
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+    except Exception:
+        QWebEngineView = None
+    from PySide6.QtCore import Qt, QSettings
+    from PySide6.QtGui import QKeySequence
 
 # ---------------------------------------------------------------------------#
 # ROS-Import                                                                 #
@@ -99,7 +111,9 @@ try:
         remove_gravity_lowpass,
         auto_vehicle_frame,
         gravity_from_quat,
+        _get_qt_widget,
     )
+    from iso_weighting import calc_awv
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -317,6 +331,135 @@ class MountDialog(QDialog):
 
 
 # ===========================================================================
+# Peak Settings Dialog
+# ===========================================================================
+class PeakDialog(QDialog):
+    """Dialog to configure peak detection parameters."""
+
+    def __init__(self, thr: float, dist: float, use_max: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Peak Detection Settings")
+        self.resize(300, 180)
+
+        v = QVBoxLayout(self)
+
+        form = QVBoxLayout()
+
+        lbl_thr = QLabel("Peak threshold")
+        self.sb_thr = QDoubleSpinBox()
+        self.sb_thr.setRange(0.0, 100.0)
+        self.sb_thr.setDecimals(2)
+        self.sb_thr.setValue(thr)
+        form.addWidget(lbl_thr)
+        form.addWidget(self.sb_thr)
+
+        lbl_dist = QLabel("Min. time between peaks [s]")
+        self.sb_dist = QDoubleSpinBox()
+        self.sb_dist.setRange(0.0, 10.0)
+        self.sb_dist.setDecimals(2)
+        self.sb_dist.setValue(dist)
+        form.addWidget(lbl_dist)
+        form.addWidget(self.sb_dist)
+
+        self.chk_max = QCheckBox("Only mark maximum peak")
+        self.chk_max.setChecked(use_max)
+        form.addWidget(self.chk_max)
+
+        v.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(btns)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+    def result(self) -> tuple[float, float, bool]:
+        return self.sb_thr.value(), self.sb_dist.value(), self.chk_max.isChecked()
+
+
+# ===========================================================================
+# Undo/Redo Commands
+# ===========================================================================
+class AddLabelCmd(QUndoCommand):
+    """Undoable command: add label to a time range."""
+
+    def __init__(self, win, topic: str, xmin: float, xmax: float, lname: str):
+        super().__init__(f"Add {lname}")
+        self.win = win
+        self.topic = topic
+        self.xmin = xmin
+        self.xmax = xmax
+        self.lname = lname
+        df = win.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        self.prev = df.loc[mask, ["label_id", "label_name"]].copy()
+
+    def redo(self) -> None:  # type: ignore[override]
+        self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
+        self.win._draw_plots(self.win.act_verify.isChecked())
+
+    def undo(self) -> None:  # type: ignore[override]
+        df = self.win.dfs[self.topic]
+        mask = (df["time"] >= self.xmin) & (df["time"] <= self.xmax)
+        df.loc[mask, ["label_id", "label_name"]] = self.prev.values
+        ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
+        self.win._restore_labels(ax, self.topic)
+        self.win._draw_plots(self.win.act_verify.isChecked())
+
+
+class DeleteLabelCmd(QUndoCommand):
+    """Undoable command: delete labels in a range."""
+
+    def __init__(self, win, topic: str, xmin: float, xmax: float):
+        super().__init__("Delete labels")
+        self.win = win
+        self.topic = topic
+        self.xmin = xmin
+        self.xmax = xmax
+        df = win.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        self.prev = df.loc[mask, ["label_id", "label_name"]].copy()
+
+    def redo(self) -> None:  # type: ignore[override]
+        self.win._delete_label_range(self.topic, self.xmin, self.xmax)
+        self.win._draw_plots(self.win.act_verify.isChecked())
+
+    def undo(self) -> None:  # type: ignore[override]
+        df = self.win.dfs[self.topic]
+        mask = (df["time"] >= self.xmin) & (df["time"] <= self.xmax)
+        df.loc[mask, ["label_id", "label_name"]] = self.prev.values
+        ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
+        self.win._restore_labels(ax, self.topic)
+        self.win._draw_plots(self.win.act_verify.isChecked())
+
+
+class EditLabelCmd(QUndoCommand):
+    """Undoable command: change label in a range."""
+
+    def __init__(self, win, topic: str, xmin: float, xmax: float, lname: str):
+        super().__init__(f"Edit → {lname}")
+        self.win = win
+        self.topic = topic
+        self.xmin = xmin
+        self.xmax = xmax
+        self.lname = lname
+        df = win.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        self.prev = df.loc[mask, ["label_id", "label_name"]].copy()
+
+    def redo(self) -> None:  # type: ignore[override]
+        self.win._delete_label_range(self.topic, self.xmin, self.xmax)
+        self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
+        self.win._draw_plots(self.win.act_verify.isChecked())
+
+    def undo(self) -> None:  # type: ignore[override]
+        df = self.win.dfs[self.topic]
+        mask = (df["time"] >= self.xmin) & (df["time"] <= self.xmax)
+        df.loc[mask, ["label_id", "label_name"]] = self.prev.values
+        ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
+        self.win._restore_labels(ax, self.topic)
+        self.win._draw_plots(self.win.act_verify.isChecked())
+
+# ===========================================================================
 # Main-Window
 # ===========================================================================
 class MainWindow(QMainWindow):
@@ -326,6 +469,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("ROS 2 IMU-Labeling Tool")
         self.resize(1500, 900)
+
+        # Persistent settings
+        self.settings = QSettings("FH-Zürich", "IMU-LabelTool")
+        self.undo = QUndoStack(self)
 
         # Daten-Strukturen
         self.bag_path: pathlib.Path | None = None
@@ -339,12 +486,24 @@ class MainWindow(QMainWindow):
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
+        self.last_selected_topic: str | None = None
+        self.label_patches: Dict[str, List[Tuple[float, float, object]]] = {}
+        # Track-Segmente zur Synchronisation von Verifikations-Ansicht
+        self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
+        self.iso_comfort: bool = True  # ISO weighting mode
+        self.iso_metrics: dict[str, dict] = {}
+        self.peak_threshold: float = 3.19
+        self.peak_distance: float = 0.0
+        self.use_max_peak: bool = False
 
         self._build_menu()
         self._build_ui()
+
+        # Restore persisted window state
+        self._restore_settings()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -352,19 +511,70 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         vbox = QVBoxLayout(central)
 
+        self.tabs = QTabWidget()
+        vbox.addWidget(self.tabs)
+
+        w_plot = QWidget()
+        v_plot = QVBoxLayout(w_plot)
+
         self.fig = Figure(constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
-        vbox.addWidget(self.canvas)
+        v_plot.addWidget(self.canvas)
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
 
         hl = QHBoxLayout()
-        vbox.addLayout(hl)
+        v_plot.addLayout(hl)
         hl.addWidget(QLabel("Segment Label:"))
         self.cmb = QComboBox()
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
+        self.btn_add = QPushButton("Add")
+        self.btn_edit = QPushButton("Edit")
+        self.btn_del = QPushButton("Delete")
+        self.btn_add.setMaximumWidth(60)
+        self.btn_edit.setMaximumWidth(60)
+        self.btn_del.setMaximumWidth(60)
+        self.btn_add.clicked.connect(self._button_add_label)
+        self.btn_edit.clicked.connect(self._button_edit_label)
+        self.btn_del.clicked.connect(self._button_delete_label)
+        hl.addWidget(self.btn_add)
+        hl.addWidget(self.btn_edit)
+        hl.addWidget(self.btn_del)
         hl.addStretch()
+
+        self.tabs.addTab(w_plot, "Plots")
+
+        w_map = QWidget()
+        v_map = QVBoxLayout(w_map)
+        if QWebEngineView is None:
+            self.fig_map = Figure(constrained_layout=True)
+            self.canvas_map = FigureCanvas(self.fig_map)
+            v_map.addWidget(self.canvas_map)
+        else:
+            self.web_map = QWebEngineView()
+            v_map.addWidget(self.web_map)
+        self.tabs.addTab(w_map, "Map")
+
+        self.tabs.currentChanged.connect(self._tab_changed)
+
+    # ------------------------------------------------------------------ Settings
+    def _restore_settings(self) -> None:
+        geom = self.settings.value("geom", b"")
+        if isinstance(geom, (bytes, bytearray)):
+            self.restoreGeometry(geom)
+        state = self.settings.value("state", b"")
+        if isinstance(state, (bytes, bytearray)):
+            self.restoreState(state)
+        topics = self.settings.value("active_topics")
+        if isinstance(topics, list):
+            self.active_topics = [str(t) for t in topics]
+
+    def closeEvent(self, e) -> None:
+        self.settings.setValue("geom", self.saveGeometry())
+        self.settings.setValue("state", self.saveState())
+        self.settings.setValue("active_topics", self.active_topics)
+        super().closeEvent(e)
 
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
@@ -381,8 +591,25 @@ class MainWindow(QMainWindow):
             lambda: export_csv_smart_v2(self, gps_df=self._gps_df))
         m_file.addAction(self.act_export)
 
+        act_save_cfg = QAction("Save settings …", self)
+        act_save_cfg.triggered.connect(self._save_config)
+        m_file.addAction(act_save_cfg)
+
+        act_load_cfg = QAction("Load settings …", self)
+        act_load_cfg.triggered.connect(self._load_config)
+        m_file.addAction(act_load_cfg)
+
         m_file.addSeparator()
         m_file.addAction("Beenden", lambda: QApplication.instance().quit())
+
+        # Edit menu with Undo/Redo
+        m_edit = mb.addMenu("&Edit")
+        act_undo = self.undo.createUndoAction(self, "Undo")
+        act_redo = self.undo.createRedoAction(self, "Redo")
+        act_undo.setShortcut(QKeySequence.Undo)
+        act_redo.setShortcut(QKeySequence.Redo)
+        m_edit.addAction(act_undo)
+        m_edit.addAction(act_redo)
 
         m_imu = mb.addMenu("&IMU Settings")
         self.act_topics = QAction("Topics auswählen …", self)
@@ -393,6 +620,23 @@ class MainWindow(QMainWindow):
         act_mount = QAction("Mounting Overrides …", self)
         act_mount.triggered.connect(self._open_mount_dialog)
         m_imu.addAction(act_mount)
+
+        act_peaks = QAction("Peak detection …", self)
+        act_peaks.triggered.connect(self._open_peak_dialog)
+        m_imu.addAction(act_peaks)
+
+        from PyQt5.QtWidgets import QActionGroup
+        ag = QActionGroup(self)
+        self.act_comfort = QAction("Comfort mode weighting", self, checkable=True)
+        self.act_health = QAction("Health mode weighting", self, checkable=True)
+        ag.addAction(self.act_comfort)
+        ag.addAction(self.act_health)
+        self.act_comfort.setChecked(self.iso_comfort)
+        self.act_health.setChecked(not self.iso_comfort)
+        self.act_comfort.triggered.connect(lambda: self._set_weighting(True))
+        self.act_health.triggered.connect(lambda: self._set_weighting(False))
+        m_imu.addAction(self.act_comfort)
+        m_imu.addAction(self.act_health)
 
         m_view = mb.addMenu("&View")
         self.act_verify = QAction("Verify your labeling", self)
@@ -431,6 +675,16 @@ class MainWindow(QMainWindow):
         self.act_show_z.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_z)
 
+        self.act_show_iso = QAction("Show ISO weighted", self, checkable=True)
+        self.act_show_iso.setChecked(False)
+        self.act_show_iso.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_iso)
+
+        self.act_show_peaks = QAction("Show ISO peaks", self, checkable=True)
+        self.act_show_peaks.setChecked(True)
+        self.act_show_peaks.triggered.connect(lambda: self._draw_plots())
+        m_view.addAction(self.act_show_peaks)
+
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
         act_check.triggered.connect(self._check_export_status)
@@ -459,7 +713,7 @@ class MainWindow(QMainWindow):
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
             topics_info = reader.get_all_topics_and_types()
             imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.name == "/lvx_client/navsat"), None)
+            gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
             for t in imu_topics:
                 self.samples[t] = []
         except Exception as exc:
@@ -490,6 +744,7 @@ class MainWindow(QMainWindow):
         self._preprocess_all()
         self._set_defaults()
         self._draw_plots()
+        self._draw_map()
 
         self.act_topics.setEnabled(True)
         self.act_verify.setEnabled(True)
@@ -517,6 +772,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Preprocess
     def _preprocess_all(self) -> None:
+        self.iso_metrics.clear()
         for topic, df in self.dfs.items():
             samps = self.samples[topic]
 
@@ -548,19 +804,44 @@ class MainWindow(QMainWindow):
                 veh = acc_corr @ R.T
                 df[["ax_veh", "ay_veh", "az_veh"]] = veh
 
+            # --- ISO 2631 weighting -----------------------------------------
+            fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
+            res = calc_awv(
+                acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
+                comfort=self.iso_comfort,
+                peak_height=self.peak_threshold,
+                peak_dist=self.peak_distance,
+                max_peak=self.use_max_peak,
+            )
+            df[["awx", "awy", "awz"]] = np.column_stack(
+                (res["awx"], res["awy"], res["awz"]))
+            df[["rms_x", "rms_y", "rms_z"]] = np.column_stack(
+                (res["rms_x"], res["rms_y"], res["rms_z"]))
+            df["awv"] = res["awv"]
+            self.iso_metrics[topic] = {
+                "awv_total": res["awv_total"],
+                "A8": res["A8"],
+                "crest_factor": res["crest_factor"],
+                "peaks": res["peaks"].tolist(),
+            }
+
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
         ov = self.mount_overrides.get(topic)
 
         if self.rot_mode is RotMode.OVERRIDE_FIRST:
             if ov is not None:
-                return ov
-            return auto
+                rot = ov
+            else:
+                rot = auto
         if self.rot_mode is RotMode.AUTO_FIRST:
             if auto is not None:
-                return auto
-            return ov
-        return auto
+                rot = auto
+            else:
+                rot = ov
+        else:
+            rot = auto
+        return np.asarray(rot) if rot is not None else None
 
     # ------------------------------------------------------------------ Defaults
     def _set_defaults(self) -> None:
@@ -585,6 +866,7 @@ class MainWindow(QMainWindow):
         for sel in self.span_selector.values():
             sel.disconnect_events()
         self.span_selector.clear()
+        self.label_patches.clear()
 
         rows = len(self.active_topics) * (2 if verify else 1)
         gs = self.fig.add_gridspec(rows, 1,
@@ -616,9 +898,22 @@ class MainWindow(QMainWindow):
                     ax.plot(df["time"], df["ay_veh"], label="ay_veh", color="tab:orange", alpha=0.6, ls=":")
                 if self.act_show_z.isChecked():
                     ax.plot(df["time"], df["az_veh"], label="az_veh", color="tab:green", alpha=0.6, ls=":")
+            if self.act_show_iso.isChecked() and {"awx", "awy", "awz", "awv"}.issubset(df.columns):
+                if self.act_show_x.isChecked():
+                    ax.plot(df["time"], df["awx"], label="awx", color="tab:blue")
+                if self.act_show_y.isChecked():
+                    ax.plot(df["time"], df["awy"], label="awy", color="tab:orange")
+                if self.act_show_z.isChecked():
+                    ax.plot(df["time"], df["awz"], label="awz", color="tab:green")
+                ax.plot(df["time"], df["awv"], label="awv", color="tab:red", lw=1.5)
+                if self.act_show_peaks.isChecked():
+                    peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+                    if len(peaks):
+                        ax.plot(df.loc[peaks, "time"], df.loc[peaks, "awv"], "k*", markersize=8, label="peaks")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
+            self._restore_labels(ax, topic)
             h, l = ax.get_legend_handles_labels()
             uniq = dict(zip(l, h))
             ax.legend(uniq.values(), uniq.keys(), loc="upper right")
@@ -627,7 +922,7 @@ class MainWindow(QMainWindow):
             # Span-Selector
             self.span_selector[topic] = SpanSelector(
                 ax,
-                onselect=lambda xmin, xmax, t=topic: self.current_span.__setitem__(t, (xmin, xmax)),
+                onselect=lambda xmin, xmax, t=topic: self._span_selected(t, xmin, xmax),
                 direction="horizontal",
                 interactive=True,
                 useblit=True,
@@ -637,15 +932,21 @@ class MainWindow(QMainWindow):
             # Verify-Track
             if verify:
                 ax_tr = self.fig.add_subplot(gs[row + 1], sharex=ax)
-                for lname, props in ANOMALY_TYPES.items():
-                    m = df["label_name"] == lname
-                    if m.any():
-                        ax_tr.scatter(df.loc[m, "time"], np.zeros(m.sum()),
-                                      s=10, marker="s", color=props["color"], label=lname)
-                unk = df["label_id"] == UNKNOWN_ID
-                if unk.any():
-                    ax_tr.scatter(df.loc[unk, "time"], np.zeros(unk.sum()),
-                                  s=10, marker="s", color=UNKNOWN_COLOR, label=UNKNOWN_NAME)
+                segs = self.label_patches_track.get(topic, [])
+                if segs:
+                    for s, e, lname in segs:
+                        color = ANOMALY_TYPES[lname]["color"]
+                        ax_tr.axvspan(s, e, color=color, alpha=.6, label=lname)
+                else:
+                    for lname, props in ANOMALY_TYPES.items():
+                        m = df["label_name"] == lname
+                        if m.any():
+                            ax_tr.scatter(df.loc[m, "time"], np.zeros(m.sum()),
+                                          s=10, marker="s", color=props["color"], label=lname)
+                    unk = df["label_id"] == UNKNOWN_ID
+                    if unk.any():
+                        ax_tr.scatter(df.loc[unk, "time"], np.zeros(unk.sum()),
+                                      s=10, marker="s", color=UNKNOWN_COLOR, label=UNKNOWN_NAME)
                 ax_tr.set_ylim(-1, 1)
                 ax_tr.set_yticks([])
                 ax_tr.set_xlabel("Zeit ab Start [s]")
@@ -653,6 +954,38 @@ class MainWindow(QMainWindow):
                 ax_tr.legend(fontsize="x-small", ncol=3, loc="upper right")
 
         self.canvas.draw_idle()
+        if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
+            self._draw_map()
+
+    def _span_selected(self, topic: str, xmin: float, xmax: float) -> None:
+        self.current_span[topic] = (xmin, xmax)
+        self.last_selected_topic = topic
+
+    def _restore_labels(self, ax, topic: str) -> None:
+        df = self.dfs[topic]
+        self.label_patches[topic] = []
+        self.label_patches_track[topic] = []
+        if df.empty:
+            return
+        lbl = df["label_name"].to_numpy()
+        times = df["time"].to_numpy()
+        start = None
+        last = UNKNOWN_NAME
+        for t, name in zip(times, lbl):
+            if name != last:
+                if last != UNKNOWN_NAME and start is not None:
+                    color = ANOMALY_TYPES[last]["color"]
+                    patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+                    self.label_patches[topic].append((start, prev_t, patch))
+                    self.label_patches_track[topic].append((start, prev_t, last))
+                start = t
+                last = name
+            prev_t = t
+        if last != UNKNOWN_NAME and start is not None:
+            color = ANOMALY_TYPES[last]["color"]
+            patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+            self.label_patches[topic].append((start, prev_t, patch))
+            self.label_patches_track[topic].append((start, prev_t, last))
 
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
@@ -664,22 +997,155 @@ class MainWindow(QMainWindow):
         xmin, xmax = self.current_span[topic]
         if xmax <= xmin:
             return
-        self._assign_label(topic, xmin, xmax)
-
-    def _assign_label(self, topic: str, xmin: float, xmax: float) -> None:
-        df = self.dfs[topic]
         lname = self.cmb.currentData()
+        self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
+
+    def _tab_changed(self, idx: int) -> None:
+        if idx == 1:
+            self._draw_map()
+
+    def _draw_map(self) -> None:
+        if self._gps_df is None or not self.active_topics:
+            if QWebEngineView is None:
+                self.fig_map.clear()
+                self.canvas_map.draw_idle()
+            else:
+                self.web_map.setHtml("<p>No GPS data.</p>")
+            return
+
+        topic = self.active_topics[0]
+        df = self.dfs[topic]
+
+        # interpolate AWV to GPS timestamps
+        gps = self._gps_df.copy()
+        gps["awv"] = np.interp(gps["time"], df["time_abs"], df.get("awv", pd.Series(np.zeros(len(df)))) )
+
+        # optional peak markers
+        gps["peak"] = False
+        if self.act_show_peaks.isChecked():
+            peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+            if len(peaks):
+                peak_times = df.loc[peaks, "time_abs"].to_numpy()
+                tol = 0.1
+                gps["peak"] = gps["time"].apply(lambda t: bool(np.any(np.abs(t - peak_times) <= tol)))
+
+        if QWebEngineView is None:
+            # simple matplotlib fallback
+            self.fig_map.clear()
+            ax = self.fig_map.add_subplot(111)
+            sc = ax.scatter(gps["lon"], gps["lat"], c=gps["awv"], cmap="plasma", s=5)
+            self.fig_map.colorbar(sc, ax=ax, label="awv")
+            if gps["peak"].any():
+                ax.scatter(gps.loc[gps["peak"], "lon"], gps.loc[gps["peak"], "lat"],
+                           facecolors="none", edgecolors="black", s=40)
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title("GPS Track")
+            self.canvas_map.draw_idle()
+        else:
+            try:
+                import folium
+                from PyQt5.QtCore import QUrl
+                import tempfile, os
+            except Exception:
+                self.web_map.setHtml("<p>Folium not available.</p>")
+                return
+
+            lat0 = gps["lat"].mean()
+            lon0 = gps["lon"].mean()
+            fmap = folium.Map(location=[lat0, lon0], zoom_start=16, max_zoom=30, min_zoom=10)
+
+            def c_for(v: float) -> str:
+                if v < 1.72:
+                    return "green"
+                elif v < 2.12:
+                    return "yellow"
+                elif v < 2.54:
+                    return "orange"
+                elif v < 3.19:
+                    return "red"
+                else:
+                    return "purple"
+
+            for row in gps.itertuples():
+                if row.peak:
+                    folium.Marker(
+                        location=[row.lat, row.lon],
+                        icon=folium.Icon(color="black", icon="star"),
+                        popup=f"Peak@{row.time:.2f}"
+                    ).add_to(fmap)
+                else:
+                    folium.CircleMarker(
+                        location=[row.lat, row.lon], radius=4,
+                        color=c_for(row.awv), fill=True
+                    ).add_to(fmap)
+
+            map_file = os.path.join(tempfile.gettempdir(), "analysis_map.html")
+            fmap.save(map_file)
+            gps.to_csv(map_file.replace(".html", "_gps.csv"), index=False)
+            self.web_map.load(QUrl.fromLocalFile(map_file))
+
+    def _assign_label(self, topic: str, xmin: float, xmax: float,
+                      lname: str | None = None) -> None:
+        df = self.dfs[topic]
+        if lname is None:
+            lname = self.cmb.currentData()
         lid = self.LABEL_IDS[lname]
         color = ANOMALY_TYPES[lname]["color"]
         mask = (df["time"] >= xmin) & (df["time"] <= xmax)
         df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
 
         ax = next(a for a, t in self.ax_topic.items() if t == topic)
-        ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        patch = ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        self.label_patches.setdefault(topic, []).append((xmin, xmax, patch))
+        self.label_patches_track.setdefault(topic, []).append((xmin, xmax, lname))
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
         self.canvas.draw_idle()
+
+    def _delete_label_range(self, topic: str, xmin: float, xmax: float) -> None:
+        df = self.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+
+        # remove all existing patches for this topic and rebuild from DataFrame
+        if topic in self.label_patches:
+            for _, _, patch in self.label_patches[topic]:
+                patch.remove()
+            self.label_patches[topic] = []
+        if topic in self.label_patches_track:
+            self.label_patches_track[topic] = []
+        ax = next(a for a, t in self.ax_topic.items() if t == topic)
+        self._restore_labels(ax, topic)
+        self.canvas.draw_idle()
+
+    def _button_add_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        lname = self.cmb.currentData()
+        self.undo.push(AddLabelCmd(self, t, xmin, xmax, lname))
+
+    def _button_edit_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        lname = self.cmb.currentData()
+        self.undo.push(EditLabelCmd(self, t, xmin, xmax, lname))
+
+    def _button_delete_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        self.undo.push(DeleteLabelCmd(self, t, xmin, xmax))
 
     def _check_export_status(self):
         rows = []
@@ -712,6 +1178,57 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         self.rot_mode, self.mount_overrides = dlg.result()
+        self._preprocess_all()
+        self._draw_plots()
+
+    def _open_peak_dialog(self) -> None:
+        dlg = PeakDialog(self.peak_threshold, self.peak_distance, self.use_max_peak, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.peak_threshold, self.peak_distance, self.use_max_peak = dlg.result()
+        self._preprocess_all()
+        self._draw_plots()
+
+    def _set_weighting(self, comfort: bool) -> None:
+        self.iso_comfort = comfort
+        self.act_comfort.setChecked(comfort)
+        self.act_health.setChecked(not comfort)
+        self._preprocess_all()
+        self._draw_plots()
+
+    def _save_config(self) -> None:
+        QFileDialog = _get_qt_widget(self, "QFileDialog")
+        if QFileDialog is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        if not path:
+            return
+        cfg = {
+            "mount_overrides": {k: v.tolist() for k, v in self.mount_overrides.items()},
+            "rot_mode": self.rot_mode.name,
+            "peak_threshold": self.peak_threshold,
+            "peak_distance": self.peak_distance,
+            "use_max_peak": self.use_max_peak,
+            "iso_comfort": self.iso_comfort,
+        }
+        pathlib.Path(path).write_text(json.dumps(cfg, indent=2))
+
+    def _load_config(self) -> None:
+        QFileDialog = _get_qt_widget(self, "QFileDialog")
+        if QFileDialog is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Load Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        if not path:
+            return
+        data = json.loads(pathlib.Path(path).read_text())
+        self.mount_overrides = {k: np.array(v) for k, v in data.get("mount_overrides", {}).items()}
+        self.rot_mode = RotMode[data.get("rot_mode", self.rot_mode.name)]
+        self.peak_threshold = float(data.get("peak_threshold", self.peak_threshold))
+        self.peak_distance = float(data.get("peak_distance", self.peak_distance))
+        self.use_max_peak = bool(data.get("use_max_peak", self.use_max_peak))
+        self.iso_comfort = bool(data.get("iso_comfort", self.iso_comfort))
+        self.act_comfort.setChecked(self.iso_comfort)
+        self.act_health.setChecked(not self.iso_comfort)
         self._preprocess_all()
         self._draw_plots()
 
