@@ -1217,25 +1217,18 @@ class MainWindow(QMainWindow):
         pre = float(self.tab_vpc.spn_pre.value())
         post = float(self.tab_vpc.spn_post.value())
         times = np.arange(t_peak - pre, t_peak + post, 0.1)
-        video_frames: list[QImage] = []
-        pc_frames: list[QImage] = []
+        video_frames: list[np.ndarray] = []
+        pc_frames: list[np.ndarray] = []
         for t in times:
-            txt = f"Video t={t:.1f}s"
-            img = QImage(320, 240, QImage.Format_RGB32)
-            img.fill(Qt.white)
-            p = QPainter(img)
-            p.drawText(img.rect(), Qt.AlignCenter, txt)
-            p.end()
+            val = int(255 * (t - times[0]) / max(times[-1] - times[0], 0.1))
+            img = np.full((240, 320, 3), val, dtype=np.uint8)
             video_frames.append(img)
 
-            pc = QImage(320, 240, QImage.Format_RGB32)
-            pc.fill(Qt.lightGray)
-            p = QPainter(pc)
-            p.drawText(pc.rect(), Qt.AlignCenter, f"PC t={t:.1f}s")
-            p.end()
-            pc_frames.append(pc)
+            pts = np.random.normal(size=(500, 3)).astype(np.float32)
+            pts[:, 2] += 0.1 * t
+            pc_frames.append(pts)
 
-        self.tab_vpc.load_frames(video_frames, pc_frames)
+        self.tab_vpc.load_arrays(video_frames, pc_frames)
         self.tabs.setCurrentIndex(2)
         self.tab_vpc.play()
 
