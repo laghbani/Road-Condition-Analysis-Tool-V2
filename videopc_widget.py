@@ -16,10 +16,31 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap, QImage
 
+import cv2
+from sensor_msgs.msg import PointCloud2, Image
+from cv_bridge import CvBridge
+from sensor_msgs_py import point_cloud2 as pc2
+
 import numpy as np
 
 import pyqtgraph as pg
 from pyqtgraph.opengl import GLViewWidget, GLScatterPlotItem
+
+
+def _downsample(iter_pts, step: int = 8):
+    """Yield every *step*-th point from an iterator."""
+    for k, p in enumerate(iter_pts):
+        if k % step == 0:
+            yield p
+
+
+def _pc_to_xyz(pc_msg: PointCloud2, step: int = 8) -> np.ndarray:
+    """Convert :class:`PointCloud2` to Nx3 array with optional decimation."""
+    arr = np.fromiter(
+        _downsample(pc2.read_points(pc_msg, ("x", "y", "z"), skip_nans=True), step),
+        dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")],
+    )
+    return arr.view(np.float32).reshape(-1, 3)
 
 
 class VideoPointCloudTab(QWidget):
@@ -70,6 +91,7 @@ class VideoPointCloudTab(QWidget):
         self.gl_view = GLViewWidget()
         self.gl_view.setMinimumSize(320, 240)
         self.gl_view.opts["distance"] = 5
+        self.gl_view.opts["projection"] = "perspective"
         pcol.addWidget(self.gl_view, stretch=1)
         self.lbl_placeholder = QLabel("Point Cloud View")
         self.lbl_placeholder.setAlignment(Qt.AlignCenter)
@@ -88,8 +110,8 @@ class VideoPointCloudTab(QWidget):
 
         self.video_frames: list[QImage] = []
         self.pc_frames: list[QImage] = []
-        self.img_arrays: list[np.ndarray] = []
-        self.pc_arrays: list[np.ndarray] = []
+        self.img_arrays: list = []
+        self.pc_arrays: list = []
         self.scatter_item: GLScatterPlotItem | None = None
         self.point_size = self.spn_size.value()
         self.sync_index = 0
@@ -128,8 +150,8 @@ class VideoPointCloudTab(QWidget):
         if pc:
             self.show_pc_frame(pc[0])
 
-    def load_arrays(self, images: list[np.ndarray], pcs: list[np.ndarray]) -> None:
-        """Load NumPy arrays for video frames and point clouds."""
+    def load_arrays(self, images: list, pcs: list) -> None:
+        """Load raw data for video frames and point clouds."""
         self.img_arrays = images
         self.pc_arrays = pcs
         self.sync_index = 0
@@ -159,20 +181,32 @@ class VideoPointCloudTab(QWidget):
         if not self.img_arrays:
             return
         i = max(0, min(i, len(self.img_arrays) - 1))
-        arr = self.img_arrays[i]
+        raw = self.img_arrays[i]
+        if isinstance(raw, Image):
+            arr = CvBridge().imgmsg_to_cv2(raw, desired_encoding="bgr8")
+        elif isinstance(raw, (bytes, memoryview)):
+            arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        else:
+            arr = raw
         if arr.ndim == 2:
             h, w = arr.shape
             fmt = QImage.Format_Grayscale8
             bytes_per_line = w
         else:
             h, w, ch = arr.shape
-            fmt = QImage.Format_RGB888 if ch == 3 else QImage.Format_RGBA8888
+            fmt = QImage.Format_BGR888 if ch == 3 else QImage.Format_RGBA8888
             bytes_per_line = ch * w
         qimg = QImage(arr.tobytes(), w, h, bytes_per_line, fmt)
         qimg = qimg.copy()
         self.show_video_frame(qimg)
 
-    def draw_scatter(self, pts: np.ndarray) -> None:
+    def draw_scatter(self, pts_raw) -> None:
+        if isinstance(pts_raw, np.ndarray):
+            pts = pts_raw
+        elif isinstance(pts_raw, PointCloud2):
+            pts = _pc_to_xyz(pts_raw)
+        else:
+            pts = np.asarray(pts_raw, dtype=np.float32)
         if pts.size == 0:
             return
         self.gl_view.setVisible(True)
@@ -183,7 +217,8 @@ class VideoPointCloudTab(QWidget):
         norm = (z - zmin) / rng
         colors = np.column_stack((norm, np.zeros_like(norm), 1 - norm, np.ones_like(norm)))
         if self.scatter_item is None:
-            self.scatter_item = GLScatterPlotItem(pos=pts, color=colors, size=self.point_size)
+            self.scatter_item = GLScatterPlotItem(pos=pts, color=colors,
+                                                 size=self.point_size)
             self.gl_view.addItem(self.scatter_item)
         else:
             self.scatter_item.setData(pos=pts, color=colors, size=self.point_size)
@@ -191,7 +226,9 @@ class VideoPointCloudTab(QWidget):
     def update_point_size(self, val: float) -> None:
         self.point_size = val
         if self.scatter_item is not None:
-            self.scatter_item.setData(size=val)
+            self.scatter_item.setData(pos=self.scatter_item.pos,
+                                     color=self.scatter_item.color,
+                                     size=val)
 
     def _next_frame(self) -> None:
         if self.sync_index >= max(len(self.video_frames), len(self.img_arrays)):
