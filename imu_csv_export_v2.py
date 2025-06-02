@@ -32,6 +32,10 @@ def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
     if gps_df is None or len(gps_df) < 3:
         work["speed_mps"] = np.nan
         return work
+
+    # ➊ NICHT doppelt führen – falls die Spalte bereits existiert, entfernen
+    work = work.drop(columns=["speed_mps"], errors="ignore")
+
     R_earth = 6_378_137.0
     lat0 = np.deg2rad(gps_df["lat"].iat[0])
     dx = (
@@ -44,13 +48,23 @@ def add_speed(work: pd.DataFrame, gps_df: pd.DataFrame | None) -> pd.DataFrame:
     v = np.hypot(np.diff(dx), np.diff(dy)) / dt
     g2 = gps_df.iloc[1:].copy()
     g2["speed_mps"] = v
+
     out = pd.merge_asof(
         work.sort_values("time_abs"),
         g2[["time", "speed_mps"]].rename(columns={"time": "time_abs"}),
         on="time_abs",
         direction="nearest",
     )
+
+    # ➋ Eine konsolidierte Spalte herstellen – robust gegen Duplikate
+    if {"speed_mps_x", "speed_mps_y"}.issubset(out.columns):
+        base = out.pop("speed_mps_x")
+        gps = out.pop("speed_mps_y")
+        out["speed_mps"] = gps.combine_first(base)
+    else:
+        out = out.rename(columns={"speed_mps": "speed_mps"})
     out["speed_mps"] = out["speed_mps"].interpolate(limit_direction="both")
+
     return out
 
 
@@ -273,9 +287,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 work["gy"] = gyro[:, 1]
                 work["gz"] = gyro[:, 2]
 
-            # Speed must be present before rotation handling
-            if "speed_mps" not in work.columns:
-                work["speed_mps"] = np.nan
+            # Speed aus GPS-Daten ableiten
             work = add_speed(work, gps_df)
 
             abs_a = np.linalg.norm(df[["ax", "ay", "az"]].to_numpy(), axis=1)
