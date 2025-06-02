@@ -364,6 +364,14 @@ class MainWindow(QMainWindow):
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
+        self.btn_apply = QPushButton("Apply")
+        self.btn_apply.clicked.connect(self._apply_label_current_span)
+        hl.addWidget(self.btn_apply)
+
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self._clear_label_current_span)
+        hl.addWidget(self.btn_clear)
+
         hl.addStretch()
 
     # ------------------------------------------------------------------ Menu
@@ -395,10 +403,6 @@ class MainWindow(QMainWindow):
         m_imu.addAction(act_mount)
 
         m_view = mb.addMenu("&View")
-        self.act_verify = QAction("Verify your labeling", self)
-        self.act_verify.setEnabled(False)
-        self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
-        m_view.addAction(self.act_verify)
 
         self.act_show_raw = QAction("Show raw acceleration", self, checkable=True)
         self.act_show_raw.setChecked(True)
@@ -415,7 +419,8 @@ class MainWindow(QMainWindow):
         self.act_show_veh.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_veh)
 
-        # Axis visibility
+        m_view.addSeparator()
+
         self.act_show_x = QAction("Show X axis", self, checkable=True)
         self.act_show_x.setChecked(True)
         self.act_show_x.triggered.connect(lambda: self._draw_plots())
@@ -430,6 +435,13 @@ class MainWindow(QMainWindow):
         self.act_show_z.setChecked(True)
         self.act_show_z.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_z)
+
+        m_view.addSeparator()
+
+        self.act_verify = QAction("Verify your labeling", self)
+        self.act_verify.setEnabled(False)
+        self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
+        m_view.addAction(self.act_verify)
 
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
@@ -459,7 +471,10 @@ class MainWindow(QMainWindow):
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
             topics_info = reader.get_all_topics_and_types()
             imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.name == "/lvx_client/navsat"), None)
+            gps_topic = next(
+                (t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"),
+                None,
+            )
             for t in imu_topics:
                 self.samples[t] = []
         except Exception as exc:
@@ -680,6 +695,24 @@ class MainWindow(QMainWindow):
         uniq = dict(zip(l, h))
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
         self.canvas.draw_idle()
+
+    def _apply_label_current_span(self) -> None:
+        for topic, (xmin, xmax) in self.current_span.items():
+            if xmax > xmin:
+                self._assign_label(topic, xmin, xmax)
+
+    def _clear_label_current_span(self) -> None:
+        changed = False
+        for topic, (xmin, xmax) in self.current_span.items():
+            if xmax <= xmin:
+                continue
+            df = self.dfs[topic]
+            mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+            if mask.any():
+                df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+                changed = True
+        if changed:
+            self._draw_plots()
 
     def _check_export_status(self):
         rows = []
