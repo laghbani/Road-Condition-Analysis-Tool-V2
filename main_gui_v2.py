@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import json
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -146,12 +147,14 @@ class RotMode(Enum):
 
 # Default-Overrides (kann der User gleich im Dialog ändern)
 DEFAULT_OVERRIDES: dict[str, np.ndarray] = {
-    "/zed_right/zed_node/imu/data": np.array([[0, 1, 0],
-                                              [-1, 0, 0],
+    "/zed_right/zed_node/imu/data": np.array([[0, -1, 0],
+                                              [1, 0, 0],
                                               [0, 0, 1]], float),
-    "/zed_left/zed_node/imu/data": np.array([[0, -1, 0],
-                                             [1, 0, 0],
+    "/zed_left/zed_node/imu/data": np.array([[0, 1, 0],
+                                             [-1, 0, 0],
                                              [0, 0, 1]], float),
+    "/zed_rear/zed_node/imu/data": np.diag([-1, -1, 1]).astype(float),
+    "/ouster_rear/imu": np.diag([-1, -1, 1]).astype(float),
 }
 
 # ===========================================================================
@@ -286,6 +289,69 @@ class BagReaderWorker(QThread):
 
 
 # ===========================================================================
+# Helper for parallel preprocessing
+# ===========================================================================
+def _resolve_rotation_static(topic: str, df: pd.DataFrame,
+                             overrides: dict[str, np.ndarray],
+                             mode: RotMode,
+                             gps_df: pd.DataFrame | None) -> np.ndarray | None:
+    auto = auto_vehicle_frame(df, gps_df)
+    ov = overrides.get(topic)
+
+    if mode is RotMode.OVERRIDE_FIRST:
+        rot = ov if ov is not None else auto
+    elif mode is RotMode.AUTO_FIRST:
+        rot = auto if auto is not None else ov
+    else:
+        rot = auto
+    return np.asarray(rot) if rot is not None else None
+
+
+def _preprocess_single(arg):
+    topic, df, samples, gps_df, cfg = arg
+    (overrides, rot_mode, iso_comfort,
+     peak_threshold, peak_distance, use_max_peak) = cfg
+
+    ori = np.array([[s.msg.orientation.x, s.msg.orientation.y,
+                     s.msg.orientation.z, s.msg.orientation.w]
+                    for s in samples])
+    norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
+    var_ok = np.ptp(ori, axis=0).max() > 1e-3
+    has_quat = bool(norm_ok.any() and var_ok)
+
+    if has_quat:
+        g_vec = gravity_from_quat(pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"]))
+        acc_corr = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - g_vec
+        g_est = g_vec
+    else:
+        acc_corr, g_est, _ = remove_gravity_lowpass(df)
+
+    df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
+    df[["grav_x", "grav_y", "grav_z"]] = g_est
+
+    rot = _resolve_rotation_static(topic, df, overrides, rot_mode, gps_df)
+    if rot is not None:
+        veh = acc_corr @ rot.T
+        df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
+
+    fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
+    res = calc_awv(acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
+                   comfort=iso_comfort, peak_height=peak_threshold,
+                   peak_dist=peak_distance, max_peak=use_max_peak)
+
+    df[["awx", "awy", "awz"]] = np.column_stack((res["awx"], res["awy"], res["awz"]))
+    df[["rms_x", "rms_y", "rms_z"]] = np.column_stack((res["rms_x"], res["rms_y"], res["rms_z"]))
+    df["awv"] = res["awv"]
+    iso = {
+        "awv_total": res["awv_total"],
+        "A8": res["A8"],
+        "crest_factor": res["crest_factor"],
+        "peaks": res["peaks"].tolist(),
+    }
+    return topic, df, iso
+
+
+# ===========================================================================
 # Topic-Dialog
 # ===========================================================================
 class TopicDialog(QDialog):
@@ -333,7 +399,7 @@ class MountDialog(QDialog):
                  mode: RotMode, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Mounting Overrides")
-        self.resize(680, 520)
+        self.resize(800, 600)
 
         v = QVBoxLayout(self)
 
@@ -378,6 +444,10 @@ class MountDialog(QDialog):
             self.tbl.setCellWidget(row, 4, self._axes_widget(R0))
         v.addWidget(self.tbl)
 
+        self.tbl.setColumnWidth(3, 200)
+        self.tbl.setColumnWidth(4, 200)
+        self.tbl.verticalHeader().setDefaultSectionSize(190)
+
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         v.addWidget(btns)
         btns.accepted.connect(self.accept)
@@ -389,8 +459,9 @@ class MountDialog(QDialog):
 
     @staticmethod
     def _axes_widget(R: np.ndarray):
-        fig = Figure(figsize=(1.6, 1.6))
+        fig = Figure(figsize=(3, 3), dpi=100, tight_layout=True)
         canvas = FigureCanvas(fig)
+        canvas.setFixedSize(180, 180)
         ax = fig.add_subplot(111, projection="3d")
         ax.set_xlim([-1, 1])
         ax.set_ylim([-1, 1])
@@ -656,7 +727,7 @@ class MainWindow(QMainWindow):
         self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
-        self.rot_mode: RotMode = RotMode.AUTO_ONLY
+        self.rot_mode: RotMode = RotMode.OVERRIDE_FIRST
         self.iso_comfort: bool = True  # ISO weighting mode
         self.iso_metrics: dict[str, dict] = {}
         self.peak_threshold: float = 3.19
@@ -1012,79 +1083,54 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ DataFrame
     def _build_dfs(self) -> None:
         log.debug("Building DataFrames")
+        self.dfs.clear()
+        self.t0 = None
         for t, samps in self.samples.items():
             if not samps:
                 continue
-            ta = np.array([s.time_abs for s in samps])
+
+            t_abs = np.fromiter((s.time_abs for s in samps), dtype=np.float64,
+                                 count=len(samps))
             if self.t0 is None:
-                self.t0 = ta[0]
-            tr = np.maximum(ta - self.t0, 0)
-            df = pd.DataFrame({
-                "time": tr, "time_abs": ta,
-                "accel_x": [s.lin_acc[0] for s in samps],
-                "accel_y": [s.lin_acc[1] for s in samps],
-                "accel_z": [s.lin_acc[2] for s in samps],
-                "label_id": np.full_like(tr, UNKNOWN_ID, int),
-                "label_name": [UNKNOWN_NAME] * len(tr),
-            })
-            self.dfs[t] = df
+                self.t0 = t_abs[0]
+            t_rel = t_abs - self.t0
+
+            lin_acc = np.fromiter((c for s in samps for c in s.lin_acc),
+                                  dtype=np.float32, count=len(samps) * 3)
+            lin_acc = lin_acc.reshape(-1, 3)
+
+            self.dfs[t] = pd.DataFrame(
+                np.column_stack((t_rel, t_abs, lin_acc)),
+                columns=["time", "time_abs", "accel_x", "accel_y", "accel_z"],
+            ).assign(label_id=UNKNOWN_ID, label_name=UNKNOWN_NAME)
         log.debug("DataFrames created: %s", list(self.dfs))
 
     # ------------------------------------------------------------------ Preprocess
     def _preprocess_all(self) -> None:
         log.debug("Preprocessing all topics")
         self.iso_metrics.clear()
-        for topic, df in self.dfs.items():
-            samps = self.samples[topic]
-
-            # --- Prüfen, ob Quaternionen verwertbar ---------------------------
-            ori = np.array([[s.msg.orientation.x, s.msg.orientation.y,
-                            s.msg.orientation.z, s.msg.orientation.w]
-                            for s in samps])
-            norm_ok = np.abs(np.linalg.norm(ori, axis=1) - 1.0) < 0.05
-            var_ok  = np.ptp(ori, axis=0).max() > 1e-3
-            has_quat = bool(norm_ok.any() and var_ok)
-
-            # --- g-Kompensation ----------------------------------------------
-            if has_quat:
-                g_vec = gravity_from_quat(
-                    pd.DataFrame(ori, columns=["ox", "oy", "oz", "ow"])
+        with ProcessPoolExecutor() as pool:
+            args = [
+                (
+                    t,
+                    self.dfs[t].copy(),
+                    self.samples[t],
+                    self._gps_df,
+                    (
+                        self.mount_overrides,
+                        self.rot_mode,
+                        self.iso_comfort,
+                        self.peak_threshold,
+                        self.peak_distance,
+                        self.use_max_peak,
+                    ),
                 )
-                acc_corr = df[["accel_x", "accel_y", "accel_z"]].to_numpy() - g_vec
-                g_est = g_vec
-            else:
-                acc_corr, g_est, _ = remove_gravity_lowpass(df)
-
-            df[["accel_corr_x", "accel_corr_y", "accel_corr_z"]] = acc_corr
-            df[["grav_x", "grav_y", "grav_z"]] = g_est
-
-            # --- Fahrzeug-Rahmen ---------------------------------------------
-            rot = self._resolve_rotation(topic, df)
-            if rot is not None:
-                R = np.asarray(rot)
-                veh = acc_corr @ R.T
-                df[["accel_veh_x", "accel_veh_y", "accel_veh_z"]] = veh
-
-            # --- ISO 2631 weighting -----------------------------------------
-            fs = 1.0 / np.median(np.diff(df["time"])) if len(df) > 1 else 0
-            res = calc_awv(
-                acc_corr[:, 0], acc_corr[:, 1], acc_corr[:, 2], fs,
-                comfort=self.iso_comfort,
-                peak_height=self.peak_threshold,
-                peak_dist=self.peak_distance,
-                max_peak=self.use_max_peak,
-            )
-            df[["awx", "awy", "awz"]] = np.column_stack(
-                (res["awx"], res["awy"], res["awz"]))
-            df[["rms_x", "rms_y", "rms_z"]] = np.column_stack(
-                (res["rms_x"], res["rms_y"], res["rms_z"]))
-            df["awv"] = res["awv"]
-            self.iso_metrics[topic] = {
-                "awv_total": res["awv_total"],
-                "A8": res["A8"],
-                "crest_factor": res["crest_factor"],
-                "peaks": res["peaks"].tolist(),
-            }
+                for t in self.dfs
+            ]
+            for fut in as_completed(pool.map(_preprocess_single, args)):
+                topic, df_new, iso = fut.result()
+                self.dfs[topic] = df_new
+                self.iso_metrics[topic] = iso
         log.debug("Preprocessing finished")
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
@@ -1118,11 +1164,9 @@ class MainWindow(QMainWindow):
             return
         sel = [p for p in pref if p in available]
         for t in available:
-            if len(sel) >= 3:
-                break
             if t not in sel:
                 sel.append(t)
-        self.active_topics = sel or available[:3]
+        self.active_topics = sel
 
     # ------------------------------------------------------------------ Plots
     def _draw_plots(self, verify: bool = False) -> None:
@@ -1228,31 +1272,32 @@ class MainWindow(QMainWindow):
         self.current_span[topic] = (xmin, xmax)
         self.last_selected_topic = topic
 
+    @staticmethod
+    def _segments_from_labels(lbl: pd.Series) -> list[tuple[int, int, str]]:
+        mask = lbl.values != UNKNOWN_NAME
+        if not mask.any():
+            return []
+        ids = lbl.factorize()[0]
+        changes = np.flatnonzero(np.diff(np.r_[False, mask]) |
+                                 np.diff(ids, prepend=-1))
+        starts = changes
+        ends = np.r_[changes[1:], mask.size - 1]
+        return [(s, e, lbl.iat[s]) for s, e in zip(starts, ends) if mask[s]]
+
     def _restore_labels(self, ax, topic: str) -> None:
         df = self.dfs[topic]
         self.label_patches[topic] = []
         self.label_patches_track[topic] = []
         if df.empty:
             return
-        lbl = df["label_name"].to_numpy()
-        times = df["time"].to_numpy()
-        start = None
-        last = UNKNOWN_NAME
-        for t, name in zip(times, lbl):
-            if name != last:
-                if last != UNKNOWN_NAME and start is not None:
-                    color = ANOMALY_TYPES[last]["color"]
-                    patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
-                    self.label_patches[topic].append((start, prev_t, patch))
-                    self.label_patches_track[topic].append((start, prev_t, last))
-                start = t
-                last = name
-            prev_t = t
-        if last != UNKNOWN_NAME and start is not None:
-            color = ANOMALY_TYPES[last]["color"]
-            patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
-            self.label_patches[topic].append((start, prev_t, patch))
-            self.label_patches_track[topic].append((start, prev_t, last))
+
+        segs = self._segments_from_labels(df["label_name"])
+        t = df["time"].to_numpy()
+        for s, e, name in segs:
+            color = ANOMALY_TYPES[name]["color"]
+            patch = ax.axvspan(t[s], t[e], alpha=.2, color=color, label=name)
+            self.label_patches[topic].append((t[s], t[e], patch))
+            self.label_patches_track[topic].append((t[s], t[e], name))
 
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
