@@ -75,7 +75,7 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand, QProgressDialog
+        QActionGroup, QUndoStack, QUndoCommand
     )
     try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -90,7 +90,7 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand, QProgressDialog
+        QActionGroup, QUndoStack, QUndoCommand
     )
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -114,6 +114,7 @@ try:
         _get_qt_widget,
     )
     from iso_weighting import calc_awv
+    from progress_ui import ProgressWindow
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -761,15 +762,26 @@ class MainWindow(QMainWindow):
         self.dfs.clear()
         self.t0 = None
 
-        progress = QProgressDialog("Loading bag …", "Abort", 0, 0, self)
-        progress.setWindowTitle("Reading Bag")
-        progress.setMinimumDuration(0)
-        progress.setRange(0, 0)
-        progress.show()
+        steps = [
+            "Öffne Bag-Datei",
+            "Ermittle Topics",
+            "Lese IMU-Daten",
+            "Lese GPS-Daten",
+            "Erzeuge DataFrames",
+            "Vorverarbeitung (g-Korrektur, ISO-Weights …)",
+            "Erstelle Plots",
+            "Erstelle Karte",
+        ]
+        progress = ProgressWindow("Bag einlesen", steps, parent=self)
 
         try:
+            if not progress.advance("Öffne Bag-Datei …"):
+                return
             reader = SequentialReader()
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
+
+            if not progress.advance("Ermittle Topics …"):
+                return
             topics_info = reader.get_all_topics_and_types()
             imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
             gps_topic = next((t.name for t in topics_info if t.type == "sensor_msgs/msg/NavSatFix"), None)
@@ -777,18 +789,23 @@ class MainWindow(QMainWindow):
                 self.samples[t] = []
         except Exception as exc:
             QMessageBox.critical(self, "Lesefehler", str(exc))
-            progress.close()
+            progress.accept()
             return
 
         if not self.samples:
             QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
-            progress.close()
+            progress.accept()
             return
 
-        # Daten einlesen
+        if not progress.advance("Lese IMU-Daten …"):
+            progress.accept()
+            return
         gps_samples: list[tuple] = []
         try:
             while reader.has_next():
+                if progress.wasCanceled():
+                    progress.accept()
+                    return
                 topic, data, ts = reader.read_next()
                 if topic in self.samples:
                     self.samples[topic].append(ImuSample(ts, deserialize_message(data, Imu)))
@@ -797,17 +814,35 @@ class MainWindow(QMainWindow):
                     gps_samples.append((ts / 1e9, msg.latitude, msg.longitude, msg.altitude))
         except Exception as exc:
             QMessageBox.critical(self, "Lesefehler", f"Fehler beim Lesen:\n{exc}")
-            progress.close()
+            progress.accept()
+            return
+        if not progress.advance("Lese GPS-Daten …"):
+            progress.accept()
             return
 
         self._gps_df = pd.DataFrame(gps_samples, columns=["time", "lat", "lon", "alt"]) if gps_samples else None
 
+        if not progress.advance("Erzeuge DataFrames …"):
+            progress.accept()
+            return
         self._build_dfs()
+
+        if not progress.advance("Vorverarbeitung …"):
+            progress.accept()
+            return
         self._preprocess_all()
+
+        if not progress.advance("Erstelle Plots …"):
+            progress.accept()
+            return
         self._set_defaults()
         self._draw_plots()
+
+        if not progress.advance("Erstelle Karte …"):
+            progress.accept()
+            return
         self._draw_map()
-        progress.close()
+        progress.accept()
 
         self.act_topics.setEnabled(True)
         self.act_verify.setEnabled(True)
