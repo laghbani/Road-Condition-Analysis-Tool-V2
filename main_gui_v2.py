@@ -75,7 +75,7 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup
+        QActionGroup, QStackedLayout
     )
     try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -89,7 +89,7 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup
+        QActionGroup, QStackedLayout
     )
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -397,6 +397,8 @@ class MainWindow(QMainWindow):
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
+        self.last_selected_topic: str | None = None
+        self.label_patches: Dict[str, List[Tuple[float, float, object]]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.AUTO_ONLY
@@ -433,19 +435,40 @@ class MainWindow(QMainWindow):
         for n in ANOMALY_TYPES:
             self.cmb.addItem(n, userData=n)
         hl.addWidget(self.cmb)
+        self.btn_add = QPushButton("Add")
+        self.btn_edit = QPushButton("Edit")
+        self.btn_del = QPushButton("Delete")
+        for b, sc, tip in (
+            (self.btn_add, "A", "Add label (A)"),
+            (self.btn_edit, "E", "Edit label (E)"),
+            (self.btn_del, "Delete", "Delete label (Del)"),
+        ):
+            b.setMaximumWidth(60)
+            b.setShortcut(sc)
+            b.setToolTip(tip)
+        self.btn_add.clicked.connect(self._button_add_label)
+        self.btn_edit.clicked.connect(self._button_edit_label)
+        self.btn_del.clicked.connect(self._button_delete_label)
+        hl.addWidget(self.btn_add)
+        hl.addWidget(self.btn_edit)
+        hl.addWidget(self.btn_del)
         hl.addStretch()
 
         self.tabs.addTab(w_plot, "Plots")
 
         w_map = QWidget()
         v_map = QVBoxLayout(w_map)
-        if QWebEngineView is None:
-            self.fig_map = Figure(constrained_layout=True)
-            self.canvas_map = FigureCanvas(self.fig_map)
-            v_map.addWidget(self.canvas_map)
-        else:
+        self.fig_map = Figure(constrained_layout=True)
+        self.canvas_map = FigureCanvas(self.fig_map)
+        if QWebEngineView is not None:
             self.web_map = QWebEngineView()
+            v_map.addWidget(self.canvas_map)
             v_map.addWidget(self.web_map)
+            self.web_map.setVisible(self.act_use_web_map.isChecked())
+            self.canvas_map.setVisible(not self.act_use_web_map.isChecked())
+        else:
+            self.web_map = None
+            v_map.addWidget(self.canvas_map)
         self.tabs.addTab(w_map, "Map")
 
         self.tabs.currentChanged.connect(self._tab_changed)
@@ -556,6 +579,16 @@ class MainWindow(QMainWindow):
         m_view.addAction(act_check)
         self.act_check = act_check
 
+        self.act_use_web_map = QAction("Use web map (needs internet)", self,
+                                       checkable=True)
+        if QWebEngineView is None:
+            self.act_use_web_map.setChecked(False)
+            self.act_use_web_map.setEnabled(False)
+        else:
+            self.act_use_web_map.setChecked(True)
+            self.act_use_web_map.triggered.connect(self._toggle_map_view)
+        m_view.addAction(self.act_use_web_map)
+
     # ------------------------------------------------------------------ Bag
     def _open_bag(self) -> None:
         pth, _ = QFileDialog.getOpenFileName(
@@ -578,7 +611,8 @@ class MainWindow(QMainWindow):
             reader.open(StorageOptions(str(self.bag_path), "sqlite3"), ConverterOptions("cdr", "cdr"))
             topics_info = reader.get_all_topics_and_types()
             imu_topics = [t.name for t in topics_info if t.type == "sensor_msgs/msg/Imu"]
-            gps_topic = next((t.name for t in topics_info if t.name == "/lvx_client/navsat"), None)
+            gps_topics = [t.name for t in topics_info if t.type.endswith("NavSatFix")]
+            gps_topic = gps_topics[0] if gps_topics else None
             for t in imu_topics:
                 self.samples[t] = []
         except Exception as exc:
@@ -731,6 +765,7 @@ class MainWindow(QMainWindow):
         for sel in self.span_selector.values():
             sel.disconnect_events()
         self.span_selector.clear()
+        self.label_patches.clear()
 
         rows = len(self.active_topics) * (2 if verify else 1)
         gs = self.fig.add_gridspec(rows, 1,
@@ -777,6 +812,7 @@ class MainWindow(QMainWindow):
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
+            self._restore_labels(ax, topic)
             h, l = ax.get_legend_handles_labels()
             uniq = dict(zip(l, h))
             ax.legend(uniq.values(), uniq.keys(), loc="upper right")
@@ -785,7 +821,7 @@ class MainWindow(QMainWindow):
             # Span-Selector
             self.span_selector[topic] = SpanSelector(
                 ax,
-                onselect=lambda xmin, xmax, t=topic: self.current_span.__setitem__(t, (xmin, xmax)),
+                onselect=lambda xmin, xmax, t=topic: self._span_selected(t, xmin, xmax),
                 direction="horizontal",
                 interactive=True,
                 useblit=True,
@@ -814,6 +850,33 @@ class MainWindow(QMainWindow):
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
             self._draw_map()
 
+    def _span_selected(self, topic: str, xmin: float, xmax: float) -> None:
+        self.current_span[topic] = (xmin, xmax)
+        self.last_selected_topic = topic
+
+    def _restore_labels(self, ax, topic: str) -> None:
+        df = self.dfs[topic]
+        self.label_patches[topic] = []
+        if df.empty:
+            return
+        lbl = df["label_name"].to_numpy()
+        times = df["time"].to_numpy()
+        start = None
+        last = UNKNOWN_NAME
+        for t, name in zip(times, lbl):
+            if name != last:
+                if last != UNKNOWN_NAME and start is not None:
+                    color = ANOMALY_TYPES[last]["color"]
+                    patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+                    self.label_patches[topic].append((start, prev_t, patch))
+                start = t
+                last = name
+            prev_t = t
+        if last != UNKNOWN_NAME and start is not None:
+            color = ANOMALY_TYPES[last]["color"]
+            patch = ax.axvspan(start, prev_t, alpha=.2, color=color, label=last)
+            self.label_patches[topic].append((start, prev_t, patch))
+
     # ------------------------------------------------------------------ Maus
     def _mouse_press(self, ev) -> None:
         if ev.button != 3 or ev.inaxes not in self.ax_topic:
@@ -830,8 +893,18 @@ class MainWindow(QMainWindow):
         if idx == 1:
             self._draw_map()
 
+    def _toggle_map_view(self) -> None:
+        if getattr(self, "web_map", None) is None:
+            return
+        use_web = self.act_use_web_map.isChecked()
+        self.web_map.setVisible(use_web)
+        if hasattr(self, "canvas_map"):
+            self.canvas_map.setVisible(not use_web)
+        self._draw_map()
+
     def _draw_map(self) -> None:
-        if QWebEngineView is None:
+        use_web = QWebEngineView is not None and self.act_use_web_map.isChecked()
+        if not use_web:
             self.fig_map.clear()
             if self._gps_df is None or not self.active_topics:
                 self.canvas_map.draw_idle()
@@ -909,11 +982,63 @@ class MainWindow(QMainWindow):
         df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
 
         ax = next(a for a, t in self.ax_topic.items() if t == topic)
-        ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        patch = ax.axvspan(xmin, xmax, alpha=.2, color=color, label=lname)
+        self.label_patches.setdefault(topic, []).append((xmin, xmax, patch))
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
         ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
         self.canvas.draw_idle()
+
+    def _delete_label_range(self, topic: str, xmin: float, xmax: float) -> None:
+        df = self.dfs[topic]
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+
+        if topic in self.label_patches:
+            new_list = []
+            for start, end, patch in self.label_patches[topic]:
+                if end <= xmin or start >= xmax:
+                    new_list.append((start, end, patch))
+                else:
+                    patch.remove()
+            self.label_patches[topic] = new_list
+        self.canvas.draw_idle()
+
+    def _button_add_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        self._assign_label(t, xmin, xmax)
+
+    def _button_edit_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        if xmax <= xmin:
+            return
+        self._delete_label_range(t, xmin, xmax)
+        self._assign_label(t, xmin, xmax)
+
+    def _button_delete_label(self) -> None:
+        t = self.last_selected_topic
+        if not t or t not in self.current_span:
+            return
+        xmin, xmax = self.current_span[t]
+        self._delete_label_range(t, xmin, xmax)
+
+    def keyPressEvent(self, ev) -> None:
+        if ev.key() == Qt.Key_A:
+            self._button_add_label()
+        elif ev.key() == Qt.Key_E:
+            self._button_edit_label()
+        elif ev.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self._button_delete_label()
+        else:
+            super().keyPressEvent(ev)
 
     def _check_export_status(self):
         rows = []
