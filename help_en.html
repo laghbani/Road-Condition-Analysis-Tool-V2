@@ -19,8 +19,37 @@ with the acceleration data.</p>
 <tr><td>Peak Detection</td><td>ISO peak threshold and minimum distance.</td></tr>
 <tr><td>Weighting Mode</td><td>Toggle between comfort and health weighting.</td></tr>
 </table>
-<h2>Exported CSV/JSON</h2>
-<p>Exported CSV files contain the processed acceleration signals and labels.
-JSON files store metadata such as rotation availability and ISO metrics.</p>
+<h2>CSV File Structure</h2>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>Column</th><th>Description</th></tr>
+<tr><td>time</td><td>Time relative to the start of the bag.</td></tr>
+<tr><td>time_abs</td><td>Absolute ROS2 timestamp.</td></tr>
+<tr><td>accel_x/y/z</td><td>Raw acceleration components in sensor axes.</td></tr>
+<tr><td>speed_mps</td><td>Interpolated vehicle speed from GPS.</td></tr>
+<tr><td>gyro_x/y/z</td><td>(Optional) Angular rate in rad/s.</td></tr>
+<tr><td>accel_corr_x/y/z</td><td>Acceleration after gravity compensation.</td></tr>
+<tr><td>grav_x/y/z</td><td>Estimated gravity vector.</td></tr>
+<tr><td>accel_veh_x/y/z</td><td>(Optional) Acceleration in the vehicle frame.</td></tr>
+<tr><td>|a|_raw</td><td>Magnitude of raw acceleration.</td></tr>
+<tr><td>|ω|_raw</td><td>Magnitude of angular rate.</td></tr>
+<tr><td>clipped_flag</td><td>1 if the sensor was saturated.</td></tr>
+<tr><td>label_id</td><td>Numeric identifier of the label.</td></tr>
+<tr><td>label_name</td><td>Textual label of the segment.</td></tr>
+</table>
+<h2>Metadata JSON</h2>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>Field</th><th>Description</th></tr>
+<tr><td>file_format</td><td>Version identifier of the export.</td></tr>
+<tr><td>sensor_topic</td><td>ROS topic of the IMU data.</td></tr>
+<tr><td>sensor_model</td><td>Hardware model derived from the bag.</td></tr>
+<tr><td>coordinate_frame</td><td>Original frame identifier of the IMU.</td></tr>
+<tr><td>sensor_fs_accel_g</td><td>Full-scale range of the accelerometer in g.</td></tr>
+<tr><td>bias_vector_mps2</td><td>Estimated bias vector used for correction.</td></tr>
+<tr><td>g_compensation</td><td>Method chosen for gravity removal.</td></tr>
+<tr><td>vehicle_rot_mat</td><td>3×3 matrix rotating sensor to vehicle frame.</td></tr>
+<tr><td>rotation_available</td><td>Whether a valid rotation was computed.</td></tr>
+<tr><td>sampling_rate_hz</td><td>Nominal sampling rate of the sensor.</td></tr>
+<tr><td>exporter_sha1</td><td>SHA‑1 of the exporter software.</td></tr>
+</table>
 <h2>About</h2>
 <p>All rights reserved for Mahmoud Laghbani (<a href="mailto:mahmoud.laghbani@hs-merseburg.de">mahmoud.laghbani@hs-merseburg.de</a>).</p>

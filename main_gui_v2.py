@@ -782,6 +782,7 @@ class MainWindow(QMainWindow):
         self.canvas = FigureCanvas(self.fig)
         v_plot.addWidget(self.canvas)
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
+        self.canvas.mpl_connect("motion_notify_event", self._mouse_move)
 
         hl = QHBoxLayout()
         v_plot.addLayout(hl)
@@ -843,6 +844,12 @@ class MainWindow(QMainWindow):
         self.settings.setValue("active_topics", self.active_topics)
         super().closeEvent(e)
 
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Delete:
+            self._button_delete_label()
+        else:
+            super().keyPressEvent(event)
+
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
         mb = self.menuBar()
@@ -882,6 +889,10 @@ class MainWindow(QMainWindow):
         act_manage.triggered.connect(self._open_label_manager)
         m_edit.addAction(act_manage)
 
+        self.act_label_all = QAction("Label all topics", self, checkable=True)
+        self.act_label_all.setChecked(False)
+        m_edit.addAction(self.act_label_all)
+
         m_imu = mb.addMenu("&IMU Settings")
         self.act_topics = QAction("Select topics …", self)
         self.act_topics.setEnabled(False)
@@ -910,9 +921,9 @@ class MainWindow(QMainWindow):
         m_imu.addAction(self.act_health)
 
         m_view = mb.addMenu("&View")
-        self.act_verify = QAction("Verify your labeling", self)
+        self.act_verify = QAction("Verify your labeling", self, checkable=True)
         self.act_verify.setEnabled(False)
-        self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
+        self.act_verify.toggled.connect(lambda chk: self._draw_plots(verify=chk))
         m_view.addAction(self.act_verify)
 
         self.act_show_raw = QAction("Show raw acceleration", self, checkable=True)
@@ -1354,7 +1365,28 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
-        self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
+        targets = self.active_topics if self.act_label_all.isChecked() else [topic]
+        if ev.dblclick:
+            for t in targets:
+                self.undo.push(DeleteLabelCmd(self, t, xmin, xmax))
+        else:
+            for t in targets:
+                self.undo.push(AddLabelCmd(self, t, xmin, xmax, lname))
+
+    def _mouse_move(self, ev) -> None:
+        if ev.inaxes not in self.ax_topic or ev.xdata is None:
+            return
+        topic = self.ax_topic[ev.inaxes]
+        peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+        if not peaks:
+            return
+        df = self.dfs[topic]
+        times = df.loc[peaks, "time"].to_numpy()
+        idx = int(np.argmin(np.abs(times - ev.xdata)))
+        if abs(times[idx] - ev.xdata) <= 0.2:
+            self.statusBar().showMessage(f"Peak at {times[idx]:.2f} s")
+        else:
+            self.statusBar().clearMessage()
 
     def _tab_changed(self, idx: int) -> None:
         if idx == 1:
@@ -1532,7 +1564,9 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
-        self.undo.push(AddLabelCmd(self, t, xmin, xmax, lname))
+        targets = self.active_topics if self.act_label_all.isChecked() else [t]
+        for topic in targets:
+            self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
 
     def _button_edit_label(self) -> None:
         t = self.last_selected_topic
@@ -1542,14 +1576,18 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
-        self.undo.push(EditLabelCmd(self, t, xmin, xmax, lname))
+        targets = self.active_topics if self.act_label_all.isChecked() else [t]
+        for topic in targets:
+            self.undo.push(EditLabelCmd(self, topic, xmin, xmax, lname))
 
     def _button_delete_label(self) -> None:
         t = self.last_selected_topic
         if not t or t not in self.current_span:
             return
         xmin, xmax = self.current_span[t]
-        self.undo.push(DeleteLabelCmd(self, t, xmin, xmax))
+        targets = self.active_topics if self.act_label_all.isChecked() else [t]
+        for topic in targets:
+            self.undo.push(DeleteLabelCmd(self, topic, xmin, xmax))
 
     def _check_export_status(self):
         rows = []
