@@ -818,6 +818,7 @@ class MainWindow(QMainWindow):
         self.label_patches: Dict[str, List[Tuple[float, float, object]]] = {}
         # Track-Segmente zur Synchronisation von Verifikations-Ansicht
         self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
+        self.legend_data: Dict[object, Tuple[list, list]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.OVERRIDE_FIRST
@@ -1269,7 +1270,6 @@ class MainWindow(QMainWindow):
             return
 
         df0 = self.dfs[topic0]
-        peak_times_abs = df0.loc[peaks, "time_abs"].to_numpy()
         peak_times_rel = df0.loc[peaks, "time"].to_numpy()
         labels = df0.loc[peaks, "label_name"].to_numpy()
         patches = self.label_patches_track.get(topic0, [])
@@ -1281,7 +1281,7 @@ class MainWindow(QMainWindow):
                         lbl = name
                         break
             fixed_labels.append(lbl)
-        pairs = sorted(zip(peak_times_abs, fixed_labels))
+        pairs = sorted(zip(peak_times_rel, fixed_labels))
         tol = min(0.5, self.peak_distance / 2)
         uniq: list[tuple[float, str]] = []
         for pt, lbl in pairs:
@@ -1398,7 +1398,7 @@ class MainWindow(QMainWindow):
             self._restore_labels(ax, topic)
             h, l = ax.get_legend_handles_labels()
             uniq = dict(zip(l, h))
-            ax.legend(uniq.values(), uniq.keys(), loc="upper right")
+            self.legend_data[ax] = (list(uniq.values()), list(uniq.keys()))
             self.ax_topic[ax] = topic
 
             # Span-Selector
@@ -1433,7 +1433,9 @@ class MainWindow(QMainWindow):
                 ax_tr.set_yticks([])
                 ax_tr.set_xlabel("Zeit ab Start [s]")
                 ax_tr.set_title("Label-Track")
-                ax_tr.legend(fontsize="x-small", ncol=3, loc="upper right")
+                h, l = ax_tr.get_legend_handles_labels()
+                uniq = dict(zip(l, h))
+                self.legend_data[ax_tr] = (list(uniq.values()), list(uniq.keys()))
 
         self.canvas.draw_idle()
         log.debug("Plots updated")
@@ -1684,7 +1686,7 @@ class MainWindow(QMainWindow):
         self.label_patches_track.setdefault(topic, []).append((xmin, xmax, lname))
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
-        ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
+        self.legend_data[ax] = (list(uniq.values()), list(uniq.keys()))
         self.canvas.draw_idle()
 
     def _delete_label_range(self, topic: str, xmin: float, xmax: float) -> None:

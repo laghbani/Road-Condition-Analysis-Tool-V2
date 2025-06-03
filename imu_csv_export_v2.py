@@ -630,7 +630,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
             if len(peaks):
                 df0 = self.dfs[topic0]
-                peak_times = df0.loc[peaks, "time_abs"].to_numpy()
+                peak_times = df0.loc[peaks, "time"].to_numpy()
                 labels = df0.loc[peaks, "label_name"].to_numpy()
                 pairs = sorted(zip(peak_times, labels))
                 tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
@@ -652,13 +652,13 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             t0 = self.t0 or 0.0
             for pt, lbl in uniq:
                 safe_lbl = lbl.replace("/", "__").strip()
-                pdir = media_dir / f"{pt - t0:.2f}_{safe_lbl}"
+                pdir = media_dir / f"{pt:.2f}_{safe_lbl}"
                 pdir.mkdir(parents=True, exist_ok=True)
                 for vtopic, frames in self.video_frames_by_topic.items():
                     times = self.video_times_by_topic.get(vtopic, [])
                     tr = np.array(times) - t0
-                    start = pt - t0 - pre
-                    end = pt - t0 + post
+                    start = pt - pre
+                    end = pt + post
                     i0 = int(np.searchsorted(tr, start, "left"))
                     i1 = int(np.searchsorted(tr, end, "right"))
                     for j, fr in enumerate(frames[i0:i1]):
@@ -669,8 +669,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 for ptopic, frames in self.pc_frames_by_topic.items():
                     times = self.pc_times_by_topic.get(ptopic, [])
                     tr = np.array(times) - t0
-                    start = pt - t0 - pre
-                    end = pt - t0 + post
+                    start = pt - pre
+                    end = pt + post
                     i0 = int(np.searchsorted(tr, start, "left"))
                     i1 = int(np.searchsorted(tr, end, "right"))
                     for j, pc in enumerate(frames[i0:i1]):
