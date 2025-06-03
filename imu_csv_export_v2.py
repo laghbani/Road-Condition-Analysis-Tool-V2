@@ -644,14 +644,14 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 uniq = []
         if uniq:
             media_dir = dest / "peaks"
-            media_dir.mkdir(exist_ok=True)
+            media_dir.mkdir(parents=True, exist_ok=True)
             pre = getattr(self.tab_vpc, "spn_pre", None)
             post = getattr(self.tab_vpc, "spn_post", None)
             pre = pre.value() if pre else 2.0
             post = post.value() if post else 2.0
             t0 = self.t0 or 0.0
             for pt, lbl in uniq:
-                safe_lbl = lbl.replace("/", "__")
+                safe_lbl = lbl.replace("/", "__").strip()
                 pdir = media_dir / f"{pt - t0:.2f}_{safe_lbl}"
                 pdir.mkdir(parents=True, exist_ok=True)
                 for vtopic, frames in self.video_frames_by_topic.items():
