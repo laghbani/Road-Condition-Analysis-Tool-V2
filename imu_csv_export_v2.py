@@ -264,7 +264,8 @@ def _img_to_bgr(obj):
 
 
 def _save_pcd(path: Path, pts: np.ndarray) -> None:
-    """Write a simple ASCII PCD file with just XYZ coordinates."""
+    """Write a binary PCD file with just XYZ coordinates."""
+    pts = np.asarray(pts, dtype=np.float32)
     header = (
         "# .PCD v0.7 - Point Cloud Data file format\n"
         "VERSION 0.7\n"
@@ -276,11 +277,11 @@ def _save_pcd(path: Path, pts: np.ndarray) -> None:
         "HEIGHT 1\n"
         "VIEWPOINT 0 0 0 1 0 0 0\n"
         f"POINTS {len(pts)}\n"
-        "DATA ascii\n"
-    )
-    with open(path, "w") as f:
+        "DATA binary\n"
+    ).encode()
+    with open(path, "wb") as f:
         f.write(header)
-        np.savetxt(f, pts, fmt="%.3f")
+        pts.tofile(f)
 
 
 def write_gpx(df: pd.DataFrame, path: Path) -> None:

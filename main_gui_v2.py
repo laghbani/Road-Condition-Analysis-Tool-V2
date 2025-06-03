@@ -1800,10 +1800,12 @@ class MainWindow(QMainWindow):
         if not self.peak_exports:
             QMessageBox.information(self, "Info", "No labeled peaks found.")
             return
-        dlg = PeakExportDialog(self.peak_exports, self)
+        rel = [(pt - (self.t0 or 0.0), lbl, flag) for pt, lbl, flag in self.peak_exports]
+        dlg = PeakExportDialog(rel, self)
         if dlg.exec() != QDialog.Accepted:
             return
-        self.peak_exports = dlg.result()
+        res = dlg.result()
+        self.peak_exports = [(pt + (self.t0 or 0.0), lbl, flag) for pt, lbl, flag in res]
 
     def _set_weighting(self, comfort: bool) -> None:
         self.iso_comfort = comfort
