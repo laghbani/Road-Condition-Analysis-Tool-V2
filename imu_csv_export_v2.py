@@ -263,6 +263,26 @@ def _img_to_bgr(obj):
     return np.asarray(obj)
 
 
+def _save_pcd(path: Path, pts: np.ndarray) -> None:
+    """Write a simple ASCII PCD file with just XYZ coordinates."""
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        f"WIDTH {len(pts)}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {len(pts)}\n"
+        "DATA ascii\n"
+    )
+    with open(path, "w") as f:
+        f.write(header)
+        np.savetxt(f, pts, fmt="%.3f")
+
+
 def write_gpx(df: pd.DataFrame, path: Path) -> None:
     """Write GPS data *df* to a very small GPX file."""
     with open(path, "w") as f:
@@ -654,8 +674,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                     i1 = int(np.searchsorted(tr, end, "right"))
                     for j, pc in enumerate(frames[i0:i1]):
                         pts = _pc_to_xyz(pc)
-                        pc_path = pdir / f"{ptopic.strip('/').replace('/', '__')}_{j:03d}.txt"
-                        np.savetxt(pc_path, pts, fmt="%.3f")
+                        pc_path = pdir / f"{ptopic.strip('/').replace('/', '__')}_{j:03d}.pcd"
+                        _save_pcd(pc_path, pts)
 
     progress.set_bar_value(len(self.dfs))
     progress.accept()

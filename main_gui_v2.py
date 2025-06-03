@@ -1269,9 +1269,19 @@ class MainWindow(QMainWindow):
             return
 
         df0 = self.dfs[topic0]
-        peak_times = df0.loc[peaks, "time_abs"].to_numpy()
+        peak_times_abs = df0.loc[peaks, "time_abs"].to_numpy()
+        peak_times_rel = df0.loc[peaks, "time"].to_numpy()
         labels = df0.loc[peaks, "label_name"].to_numpy()
-        pairs = sorted(zip(peak_times, labels))
+        patches = self.label_patches_track.get(topic0, [])
+        fixed_labels: list[str] = []
+        for trel, lbl in zip(peak_times_rel, labels):
+            if lbl == UNKNOWN_NAME:
+                for s, e, name in patches:
+                    if s <= trel <= e:
+                        lbl = name
+                        break
+            fixed_labels.append(lbl)
+        pairs = sorted(zip(peak_times_abs, fixed_labels))
         tol = min(0.5, self.peak_distance / 2)
         uniq: list[tuple[float, str]] = []
         for pt, lbl in pairs:
@@ -1759,6 +1769,7 @@ class MainWindow(QMainWindow):
         self.rot_mode, self.mount_overrides = dlg.result()
         self._preprocess_all()
         self._draw_plots()
+        self._update_peak_exports()
 
     def _open_peak_dialog(self) -> None:
         dlg = PeakDialog(self.peak_threshold, self.peak_distance, self.use_max_peak, self)
@@ -1782,6 +1793,7 @@ class MainWindow(QMainWindow):
                 mask = (df["time"] >= s) & (df["time"] <= e)
                 df.loc[mask, ["label_id", "label_name"]] = [lid, lbl]
         self._draw_plots()
+        self._update_peak_exports()
 
     def _open_peak_export_manager(self) -> None:
         self._update_peak_exports()
