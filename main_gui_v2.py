@@ -1359,13 +1359,24 @@ class MainWindow(QMainWindow):
 
         if ev.button != 3:
             return
+
+        targets = self.active_topics if self.act_label_all.isChecked() else [topic]
+
+        if ev.dblclick:
+            # delete label under cursor if available
+            patches = self.label_patches.get(topic, [])
+            for s, e, _ in patches:
+                if s <= ev.xdata <= e:
+                    for t in targets:
+                        self.undo.push(DeleteLabelCmd(self, t, s, e))
+                    return
+
         if topic not in self.current_span:
             return
         xmin, xmax = self.current_span[topic]
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
-        targets = self.active_topics if self.act_label_all.isChecked() else [topic]
         if ev.dblclick:
             for t in targets:
                 self.undo.push(DeleteLabelCmd(self, t, xmin, xmax))
@@ -1399,13 +1410,17 @@ class MainWindow(QMainWindow):
         self.video_topic = t if t else None
         vframes = self.video_frames_by_topic.get(t, [])
         pframes = self.pc_frames_by_topic.get(self.pc_topic, [])
-        self.tab_vpc.load_arrays(vframes, pframes)
+        vtimes = self.video_times_by_topic.get(t, [])
+        times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
+        self.tab_vpc.load_arrays(vframes, pframes, times_rel)
 
     def _change_pc_topic(self, t: str) -> None:
         self.pc_topic = t if t else None
         vframes = self.video_frames_by_topic.get(self.video_topic, [])
         pframes = self.pc_frames_by_topic.get(t, [])
-        self.tab_vpc.load_arrays(vframes, pframes)
+        vtimes = self.video_times_by_topic.get(self.video_topic or "", [])
+        times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
+        self.tab_vpc.load_arrays(vframes, pframes, times_rel)
 
     def _show_peak_video(self, topic: str, t_peak: float) -> None:
         vid_topic = self.video_topic or ""
@@ -1428,13 +1443,16 @@ class MainWindow(QMainWindow):
             i0 = int(np.searchsorted(tr, start, "left"))
             i1 = int(np.searchsorted(tr, end, "right"))
             vframes = vframes[i0:i1]
+            times_sel = tr[i0:i1] - (t_peak - t0)
+        else:
+            times_sel = []
         if ptimes:
             trp = np.array(ptimes) - t0
             i0 = int(np.searchsorted(trp, start, "left"))
             i1 = int(np.searchsorted(trp, end, "right"))
             pframes = pframes[i0:i1]
 
-        self.tab_vpc.load_arrays(vframes, pframes)
+        self.tab_vpc.load_arrays(vframes, pframes, list(times_sel))
         self.tabs.setCurrentIndex(2)
         self.tab_vpc.play()
 

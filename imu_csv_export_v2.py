@@ -13,6 +13,11 @@ import pandas as pd
 from scipy.spatial.transform import Rotation as R
 from scipy.signal import butter, filtfilt
 from progress_ui import ProgressWindow
+import cv2
+from sensor_msgs.msg import PointCloud2, Image, CompressedImage
+from cv_bridge import CvBridge
+from sensor_msgs_py import point_cloud2 as pc2
+from videopc_widget import _pc_to_xyz
 
 
 CITY_BBOX = {
@@ -196,6 +201,15 @@ def sha1_of_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _img_to_bgr(obj):
+    if isinstance(obj, Image):
+        return CvBridge().imgmsg_to_cv2(obj, desired_encoding="bgr8")
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        arr = cv2.imdecode(np.frombuffer(obj, np.uint8), cv2.IMREAD_COLOR)
+        return arr
+    return np.asarray(obj)
+
+
 def write_gpx(df: pd.DataFrame, path: Path) -> None:
     """Write GPS data *df* to a very small GPX file."""
     with open(path, "w") as f:
@@ -348,8 +362,17 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     bag_root = Path(self.bag_path)
 
+    QFileDialog = _get_qt_widget(self, "QFileDialog")
+    if QFileDialog is not None:
+        start_dir = "/home/afius/Desktop/anomaly-data-hs-merseburg"
+        sel = QFileDialog.getExistingDirectory(self, "Select export directory", start_dir)
+        if not sel:
+            return
+        root = Path(sel)
+    else:
+        root = Path("/home/afius/Desktop/anomaly-data-hs-merseburg")
+
     # Zielordner automatisch erzeugen
-    root = Path("/home/afius/Desktop/anomaly-data-hs-merseburg")
     label_date = datetime.now().strftime("%Y%m%d")
     city = "unknown"
     if gps_df is not None and not gps_df.empty:
@@ -520,6 +543,46 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
         write_gpx(gps_df, dest / f"{bag_root.stem}_track.gpx")
         save_map(gps_comfort, dest / f"{bag_root.stem}_comfort.html")
         save_map(gps_health, dest / f"{bag_root.stem}_health.html")
+
+    # --- export peak media ----------------------------------------------
+    if hasattr(self, "iso_metrics") and self.iso_metrics:
+        topic0 = next(iter(self.dfs))
+        peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+        if len(peaks):
+            peak_times = self.dfs[topic0].loc[peaks, "time_abs"].to_numpy()
+            media_dir = dest / "peaks"
+            media_dir.mkdir(exist_ok=True)
+            pre = getattr(self.tab_vpc, "spn_pre", None)
+            post = getattr(self.tab_vpc, "spn_post", None)
+            pre = pre.value() if pre else 2.0
+            post = post.value() if post else 2.0
+            t0 = self.t0 or 0.0
+            for pt in peak_times:
+                pdir = media_dir / f"{pt - t0:.2f}"
+                pdir.mkdir(exist_ok=True)
+                for vtopic, frames in self.video_frames_by_topic.items():
+                    times = self.video_times_by_topic.get(vtopic, [])
+                    tr = np.array(times) - t0
+                    start = pt - t0 - pre
+                    end = pt - t0 + post
+                    i0 = int(np.searchsorted(tr, start, "left"))
+                    i1 = int(np.searchsorted(tr, end, "right"))
+                    for j, fr in enumerate(frames[i0:i1]):
+                        img = _img_to_bgr(fr)
+                        img_path = pdir / f"{vtopic.strip('/').replace('/', '__')}_{j:03d}.png"
+                        if img is not None:
+                            cv2.imwrite(str(img_path), img)
+                for ptopic, frames in self.pc_frames_by_topic.items():
+                    times = self.pc_times_by_topic.get(ptopic, [])
+                    tr = np.array(times) - t0
+                    start = pt - t0 - pre
+                    end = pt - t0 + post
+                    i0 = int(np.searchsorted(tr, start, "left"))
+                    i1 = int(np.searchsorted(tr, end, "right"))
+                    for j, pc in enumerate(frames[i0:i1]):
+                        pts = _pc_to_xyz(pc)
+                        pc_path = pdir / f"{ptopic.strip('/').replace('/', '__')}_{j:03d}.txt"
+                        np.savetxt(pc_path, pts, fmt="%.3f")
 
     progress.set_bar_value(len(self.dfs))
     progress.accept()

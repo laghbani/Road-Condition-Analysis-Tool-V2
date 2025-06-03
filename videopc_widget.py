@@ -123,10 +123,14 @@ class VideoPointCloudTab(QWidget):
         self.spn_fps.setValue(10)
         ctrl.addWidget(self.spn_fps)
 
+        self.lbl_time = QLabel("0.0 s")
+        ctrl.addWidget(self.lbl_time)
+
         self.video_frames: list[QImage] = []
         self.pc_frames: list[QImage] = []
         self.img_arrays: list = []
         self.pc_arrays: list = []
+        self.frame_times: list[float] = []
         self.scatter_item: GLScatterPlotItem | None = None
         self._last_pts: np.ndarray | None = None
         self._last_cols: np.ndarray | None = None
@@ -161,21 +165,27 @@ class VideoPointCloudTab(QWidget):
     def load_frames(self, video: list[QImage], pc: list[QImage]) -> None:
         self.video_frames = video
         self.pc_frames = pc
+        self.frame_times = []
         self.sync_index = 0
         if video:
             self.show_video_frame(video[0])
         if pc:
             self.show_pc_frame(pc[0])
 
-    def load_arrays(self, images: list, pcs: list) -> None:
+    def load_arrays(self, images: list, pcs: list, times: list[float] | None = None) -> None:
         """Load raw data for video frames and point clouds."""
         self.img_arrays = images
         self.pc_arrays = pcs
+        self.frame_times = times or []
         self.sync_index = 0
         if images:
             self.show_frame(0)
         if pcs:
             self.draw_scatter(pcs[0])
+        if self.frame_times:
+            self.lbl_time.setText(f"{self.frame_times[0]:.2f} s")
+        else:
+            self.lbl_time.setText("0.0 s")
 
     def play(self) -> None:
         """Start playback if any frames are available."""
@@ -277,6 +287,10 @@ class VideoPointCloudTab(QWidget):
         elif self.pc_arrays:
             idx = min(self.sync_index, len(self.pc_arrays) - 1)
             self.draw_scatter(self.pc_arrays[idx])
+
+        if self.frame_times:
+            if self.sync_index < len(self.frame_times):
+                self.lbl_time.setText(f"{self.frame_times[self.sync_index]:.2f} s")
 
         self.sync_index += 1
 
