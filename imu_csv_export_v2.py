@@ -651,8 +651,9 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             post = post.value() if post else 2.0
             t0 = self.t0 or 0.0
             for pt, lbl in uniq:
-                pdir = media_dir / f"{pt - t0:.2f}_{lbl}"
-                pdir.mkdir(exist_ok=True)
+                safe_lbl = lbl.replace("/", "__")
+                pdir = media_dir / f"{pt - t0:.2f}_{safe_lbl}"
+                pdir.mkdir(parents=True, exist_ok=True)
                 for vtopic, frames in self.video_frames_by_topic.items():
                     times = self.video_times_by_topic.get(vtopic, [])
                     tr = np.array(times) - t0
