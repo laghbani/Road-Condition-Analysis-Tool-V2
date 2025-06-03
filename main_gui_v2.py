@@ -94,7 +94,7 @@ try:
     except Exception:
         QWebEngineView = None
     from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QTimer
-    from PyQt5.QtGui import QKeySequence, QPainter, QImage
+    from PyQt5.QtGui import QKeySequence, QPainter, QImage, QColor
 except ImportError:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
@@ -109,7 +109,7 @@ except ImportError:
     except Exception:
         QWebEngineView = None
     from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal, QTimer
-    from PySide6.QtGui import QKeySequence, QPainter, QImage
+    from PySide6.QtGui import QKeySequence, QPainter, QImage, QColor
 
 # ---------------------------------------------------------------------------#
 # ROS-Import                                                                 #
@@ -628,6 +628,75 @@ class LabelManagerDialog(QDialog):
         return res
 
 
+class PeakExportDialog(QDialog):
+    """Dialog to manage which peaks should be exported."""
+
+    def __init__(self, peaks: list[tuple[float, str, bool]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Peak Save Management")
+        self.resize(300, 300)
+
+        self.tbl = QTableWidget(self)
+        self.tbl.setColumnCount(3)
+        self.tbl.setHorizontalHeaderLabels(["Time [s]", "Label", "Export"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.itemChanged.connect(self._item_changed)
+
+        btn_del = QPushButton("Delete selected")
+        btn_del.clicked.connect(self._delete_selected)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        v = QVBoxLayout(self)
+        v.addWidget(self.tbl)
+        v.addWidget(btn_del)
+        v.addWidget(btns)
+
+        self.set_peaks(peaks)
+
+    def set_peaks(self, peaks: list[tuple[float, str, bool]]) -> None:
+        self.tbl.setRowCount(len(peaks))
+        for i, (t, lbl, export) in enumerate(peaks):
+            it0 = QTableWidgetItem(f"{t:.2f}")
+            it1 = QTableWidgetItem(lbl)
+            it2 = QTableWidgetItem()
+            it2.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            it2.setCheckState(Qt.Checked if export else Qt.Unchecked)
+            self.tbl.setItem(i, 0, it0)
+            self.tbl.setItem(i, 1, it1)
+            self.tbl.setItem(i, 2, it2)
+            self._color_row(i, export)
+
+    def _color_row(self, row: int, export: bool) -> None:
+        col = QColor("lightgreen" if export else "lightcoral")
+        for c in range(self.tbl.columnCount()):
+            item = self.tbl.item(row, c)
+            if item:
+                item.setBackground(col)
+
+    def _item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == 2:
+            export = item.checkState() == Qt.Checked
+            self._color_row(item.row(), export)
+
+    def _delete_selected(self) -> None:
+        rows = sorted({i.row() for i in self.tbl.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.tbl.removeRow(r)
+
+    def result(self) -> list[tuple[float, str, bool]]:
+        res = []
+        for r in range(self.tbl.rowCount()):
+            t = float(self.tbl.item(r, 0).text())
+            lbl = self.tbl.item(r, 1).text()
+            chk = self.tbl.item(r, 2)
+            export = chk.checkState() == Qt.Checked if chk else False
+            res.append((t, lbl, export))
+        return res
+
+
 # ===========================================================================
 # Undo/Redo Commands
 # ===========================================================================
@@ -751,6 +820,9 @@ class MainWindow(QMainWindow):
         self.peak_threshold: float = 3.19
         self.peak_distance: float = 1.5
         self.use_max_peak: bool = False
+
+        # Peak export management
+        self.peak_exports: list[tuple[float, str, bool]] = []
 
         # Video/PointCloud playback
         self.video_topic: str | None = None
@@ -906,6 +978,10 @@ class MainWindow(QMainWindow):
         act_peaks = QAction("Peak detection …", self)
         act_peaks.triggered.connect(self._open_peak_dialog)
         m_imu.addAction(act_peaks)
+
+        act_save_mgmt = QAction("Peak export management …", self)
+        act_save_mgmt.triggered.connect(self._open_peak_export_manager)
+        m_imu.addAction(act_save_mgmt)
 
         from PyQt5.QtWidgets import QActionGroup
         ag = QActionGroup(self)
@@ -1172,6 +1248,43 @@ class MainWindow(QMainWindow):
                     df[name] = arr
                 self.iso_metrics[topic] = iso
         log.debug("Preprocessing finished")
+        self._update_peak_exports()
+
+    def _update_peak_exports(self) -> None:
+        """Update list of peaks for export with deduplication."""
+        if not self.iso_metrics:
+            self.peak_exports = []
+            return
+
+        topic0 = next(iter(self.dfs))
+        peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+        if not peaks:
+            self.peak_exports = []
+            return
+
+        df0 = self.dfs[topic0]
+        peak_times = df0.loc[peaks, "time_abs"].to_numpy()
+        labels = df0.loc[peaks, "label_name"].to_numpy()
+        pairs = sorted(zip(peak_times, labels))
+        tol = min(0.5, self.peak_distance / 2)
+        uniq: list[tuple[float, str]] = []
+        for pt, lbl in pairs:
+            if lbl == UNKNOWN_NAME:
+                continue
+            if not uniq or pt - uniq[-1][0] > tol:
+                uniq.append((pt, lbl))
+
+        new_list: list[tuple[float, str, bool]] = []
+        for pt, lbl in uniq:
+            found = False
+            for old_pt, old_lbl, flag in self.peak_exports:
+                if abs(old_pt - pt) < 1e-3 and old_lbl == lbl:
+                    new_list.append((pt, lbl, flag))
+                    found = True
+                    break
+            if not found:
+                new_list.append((pt, lbl, True))
+        self.peak_exports = new_list
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
@@ -1663,6 +1776,15 @@ class MainWindow(QMainWindow):
                 mask = (df["time"] >= s) & (df["time"] <= e)
                 df.loc[mask, ["label_id", "label_name"]] = [lid, lbl]
         self._draw_plots()
+
+    def _open_peak_export_manager(self) -> None:
+        if not self.peak_exports:
+            QMessageBox.information(self, "Info", "No labeled peaks found.")
+            return
+        dlg = PeakExportDialog(self.peak_exports, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.peak_exports = dlg.result()
 
     def _set_weighting(self, comfort: bool) -> None:
         self.iso_comfort = comfort

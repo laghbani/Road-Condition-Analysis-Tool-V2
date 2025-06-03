@@ -223,6 +223,11 @@ FSR_2G = 2 * G_STD
 FSR_8G = 8 * G_STD
 CAND_G = np.array([2, 4, 8, 16]) * G_STD        #  19.6, 39.2 … 156.9 m/s²
 
+# Known sensor models with fixed full-scale ranges
+MODEL_FSR = {
+    "StereoLabs ZED 2/2i": FSR_8G,
+}
+
 
 def _get_qt_widget(obj, name: str):
     """Return a Qt widget class from the same binding as *obj*."""
@@ -471,7 +476,10 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work = add_speed(work, gps_df)
 
             abs_a = np.linalg.norm(df[["accel_x", "accel_y", "accel_z"]].to_numpy(), axis=1)
-            fsr = detect_fsr(abs_a)
+            sensor_model = get_sensor_model(bag_root, topic)
+            fsr = MODEL_FSR.get(sensor_model)
+            if fsr is None:
+                fsr = detect_fsr(abs_a)
             clipped = (df[["accel_x", "accel_y", "accel_z"]].abs() >= 0.98 * fsr).any(axis=1)
 
             if has_quat:
@@ -515,7 +523,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             header = {
                 "file_format": "imu_v1",
                 "sensor_topic": topic,
-                "sensor_model": get_sensor_model(bag_root, topic),
+                "sensor_model": sensor_model,
                 "coordinate_frame": first_frame_id(samps),
                 "sensor_fs_accel_g": round(fsr / G_STD, 3),
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
@@ -595,20 +603,26 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
 
     # --- export peak media ----------------------------------------------
     if hasattr(self, "iso_metrics") and self.iso_metrics:
-        topic0 = next(iter(self.dfs))
-        peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
-        if len(peaks):
-            df0 = self.dfs[topic0]
-            peak_times = df0.loc[peaks, "time_abs"].to_numpy()
-            labels = df0.loc[peaks, "label_name"].to_numpy()
-            pairs = sorted(zip(peak_times, labels))
-            tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
-            uniq: list[tuple[float, str]] = []
-            for pt, lbl in pairs:
-                if lbl == UNKNOWN_NAME:
-                    continue
-                if not uniq or pt - uniq[-1][0] > tol:
-                    uniq.append((pt, lbl))
+        if getattr(self, "peak_exports", None):
+            uniq = [(pt, lbl) for pt, lbl, flag in self.peak_exports if flag]
+        else:
+            topic0 = next(iter(self.dfs))
+            peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+            if len(peaks):
+                df0 = self.dfs[topic0]
+                peak_times = df0.loc[peaks, "time_abs"].to_numpy()
+                labels = df0.loc[peaks, "label_name"].to_numpy()
+                pairs = sorted(zip(peak_times, labels))
+                tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
+                uniq = []
+                for pt, lbl in pairs:
+                    if lbl == UNKNOWN_NAME:
+                        continue
+                    if not uniq or pt - uniq[-1][0] > tol:
+                        uniq.append((pt, lbl))
+            else:
+                uniq = []
+        if uniq:
             media_dir = dest / "peaks"
             media_dir.mkdir(exist_ok=True)
             pre = getattr(self.tab_vpc, "spn_pre", None)
