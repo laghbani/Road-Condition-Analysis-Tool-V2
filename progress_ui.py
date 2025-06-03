@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 class ProgressWindow(QDialog):
-    """Mehrstufiger Fortschrittsdialog mit Prozent-Anzeige und Detail-Liste."""
+    """Multi step progress dialog with percentage display and detail list."""
 
     def __init__(self, title: str, steps: list[str], parent=None) -> None:
         super().__init__(parent)
@@ -15,7 +15,7 @@ class ProgressWindow(QDialog):
 
         vbox = QVBoxLayout(self)
 
-        self.lbl_step = QLabel("Initialisiere …")
+        self.lbl_step = QLabel("Initializing …")
         vbox.addWidget(self.lbl_step)
 
         self.bar = QProgressBar()
@@ -33,7 +33,7 @@ class ProgressWindow(QDialog):
         vbox.addWidget(self.lst, stretch=1)
 
         self._aborted = False
-        self.btn_abort = QPushButton("Abbrechen")
+        self.btn_abort = QPushButton("Abort")
         self.btn_abort.clicked.connect(self._on_abort)
         vbox.addWidget(self.btn_abort)
 
@@ -44,7 +44,7 @@ class ProgressWindow(QDialog):
         self.reject()
 
     def advance(self, text: str | None = None) -> bool:
-        """Fortschritt +1 Step.  Rückgabe: True = nicht abgebrochen."""
+        """Advance by one step.  Returns ``True`` if not aborted."""
         if text:
             self.lbl_step.setText(text)
         new_val = self.bar.value() + 1
@@ -55,17 +55,17 @@ class ProgressWindow(QDialog):
 
     # ------------------------------------------------------------------
     def set_bar_range(self, maximum: int) -> None:
-        """Extern den Fortschrittsbalken neu skalieren."""
+        """Externally adjust the progress bar range."""
         self.bar.setMaximum(maximum)
         QApplication.processEvents()
 
     def set_bar_value(self, value: int) -> None:
-        """Extern den Fortschritt setzen."""
+        """Set progress bar value from outside."""
         self.bar.setValue(value)
         QApplication.processEvents()
 
     def set_bar_steps(self, step: int) -> None:
-        """Zurück auf Schritt-basierten Fortschritt setzen."""
+        """Switch back to step-based progress."""
         self.bar.setMaximum(self.total_steps)
         self.bar.setValue(step)
         QApplication.processEvents()

@@ -85,7 +85,7 @@ try:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
         QActionGroup, QUndoStack, QUndoCommand
     )
@@ -100,7 +100,7 @@ except ImportError:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
         QActionGroup, QUndoStack, QUndoCommand
     )
@@ -136,6 +136,9 @@ try:
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
+
+# Application version
+APP_VERSION = "2.01"
 
 # ===========================================================================
 # Rotation Modes & Default Overrides
@@ -296,14 +299,14 @@ class BagReaderWorker(QThread):
     def run(self) -> None:
         try:
             log.debug("BagReaderWorker started")
-            self.stepChanged.emit("Öffne Bag-Datei …")
+            self.stepChanged.emit("Open bag file …")
             reader = SequentialReader()
             reader.open(
                 StorageOptions(str(self.bag_path), "sqlite3"),
                 ConverterOptions("cdr", "cdr"),
             )
 
-            self.stepChanged.emit("Ermittle Topics …")
+            self.stepChanged.emit("Discover topics …")
             topics_info = reader.get_all_topics_and_types()
             topic_types = {t.name: t.type for t in topics_info}
             imu_topics = [t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/Imu"]
@@ -323,7 +326,7 @@ class BagReaderWorker(QThread):
             cnt = 0
             bridge = CvBridge()
 
-            self.stepChanged.emit("Lese Daten …")
+            self.stepChanged.emit("Read data …")
             while reader.has_next():
                 topic, data, ts = reader.read_next()
                 if topic in samples:
@@ -493,7 +496,7 @@ class MountDialog(QDialog):
     def _edit_matrix(self, topic: str):
         R0 = self.overrides.get(topic, np.eye(3))
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Override für {topic}")
+        dlg.setWindowTitle(f"Override for {topic}")
         l = QVBoxLayout(dlg)
         tbl = QTableWidget(3, 3)
         for i in range(3):
@@ -716,11 +719,11 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ROS 2 IMU-Labeling Tool")
+        self.setWindowTitle(f"Multisensory Road Condition Analysis v{APP_VERSION}")
         self.resize(1500, 900)
 
         # Persistent settings
-        self.settings = QSettings("FH-Zürich", "IMU-LabelTool")
+        self.settings = QSettings("HS-Merseburg", "RCAT")
         self.undo = QUndoStack(self)
 
         # Daten-Strukturen
@@ -844,12 +847,12 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         mb = self.menuBar()
 
-        m_file = mb.addMenu("&Datei")
-        act_open = QAction("&Bag öffnen …", self)
+        m_file = mb.addMenu("&File")
+        act_open = QAction("&Open Bag …", self)
         act_open.triggered.connect(self._open_bag)
         m_file.addAction(act_open)
 
-        self.act_export = QAction("&CSV exportieren", self)
+        self.act_export = QAction("&Export CSV", self)
         self.act_export.setEnabled(False)
         self.act_export.triggered.connect(
             lambda: export_csv_smart_v2(self, gps_df=self._gps_df))
@@ -864,7 +867,7 @@ class MainWindow(QMainWindow):
         m_file.addAction(act_load_cfg)
 
         m_file.addSeparator()
-        m_file.addAction("Beenden", lambda: QApplication.instance().quit())
+        m_file.addAction("Quit", lambda: QApplication.instance().quit())
 
         # Edit menu with Undo/Redo
         m_edit = mb.addMenu("&Edit")
@@ -880,7 +883,7 @@ class MainWindow(QMainWindow):
         m_edit.addAction(act_manage)
 
         m_imu = mb.addMenu("&IMU Settings")
-        self.act_topics = QAction("Topics auswählen …", self)
+        self.act_topics = QAction("Select topics …", self)
         self.act_topics.setEnabled(False)
         self.act_topics.triggered.connect(self._configure_topics)
         m_imu.addAction(self.act_topics)
@@ -959,10 +962,16 @@ class MainWindow(QMainWindow):
         m_view.addAction(act_check)
         self.act_check = act_check
 
+        # Help menu
+        m_help = mb.addMenu("&Help")
+        act_help = QAction("User Guide", self)
+        act_help.triggered.connect(self._show_help)
+        m_help.addAction(act_help)
+
     # ------------------------------------------------------------------ Bag
     def _open_bag(self) -> None:
         pth, _ = QFileDialog.getOpenFileName(
-            self, "ROS 2 Bag wählen", "", "ROS 2 Bag (*.db3 *.sqlite3 *.mcap);;Alle Dateien (*)"
+            self, "Select ROS 2 bag", "", "ROS 2 Bag (*.db3 *.sqlite3 *.mcap);;All Files (*)"
         )
         if not pth:
             return
@@ -978,15 +987,15 @@ class MainWindow(QMainWindow):
         self.available_topics.clear()
 
         steps = [
-            "Öffne Bag-Datei",
-            "Ermittle Topics",
-            "Lese Daten",
-            "Erzeuge DataFrames",
-            "Vorverarbeitung (g-Korrektur, ISO-Weights …)",
-            "Erstelle Plots",
-            "Erstelle Karte",
+            "Open bag file",
+            "Discover topics",
+            "Read data",
+            "Build DataFrames",
+            "Preprocess (g-correction, ISO weights …)",
+            "Create plots",
+            "Create map",
         ]
-        progress = ProgressWindow("Bag einlesen", steps, parent=self)
+        progress = ProgressWindow("Loading bag", steps, parent=self)
 
         self.worker = BagReaderWorker(self.bag_path)
         self.worker.stepChanged.connect(progress.advance)
@@ -1004,7 +1013,7 @@ class MainWindow(QMainWindow):
             return
         if err:
             log.error("Error from worker: %s", err)
-            QMessageBox.critical(self, "Lesefehler", str(err))
+            QMessageBox.critical(self, "Read error", str(err))
             progress.accept()
             return
 
@@ -1014,7 +1023,7 @@ class MainWindow(QMainWindow):
          vid_frames, pc_frames,
          vid_times, pc_times) = result
         if not available:
-            QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
+            QMessageBox.information(self, "No IMU topics", "No IMU topics found.")
             progress.accept()
             return
 
@@ -1040,7 +1049,7 @@ class MainWindow(QMainWindow):
             self._change_pc_topic(pc_topics[0])
 
         progress.set_bar_steps(3)
-        if not progress.advance("Erzeuge DataFrames …"):
+        if not progress.advance("Build DataFrames …"):
             log.debug("Aborted during DataFrame generation")
             progress.accept()
             return
@@ -1052,7 +1061,7 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        if not progress.advance("Vorverarbeitung …"):
+        if not progress.advance("Preprocessing …"):
             log.debug("Aborted during preprocessing")
             progress.accept()
             return
@@ -1064,7 +1073,7 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        if not progress.advance("Erstelle Plots …"):
+        if not progress.advance("Create plots …"):
             log.debug("Aborted before plotting")
             progress.accept()
             return
@@ -1077,7 +1086,7 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        if not progress.advance("Erstelle Karte …"):
+        if not progress.advance("Create map …"):
             log.debug("Aborted before map creation")
             progress.accept()
             return
@@ -1649,10 +1658,24 @@ class MainWindow(QMainWindow):
             return
         sel = dlg.selected_topics()
         if not sel:
-            QMessageBox.information(self, "Hinweis", "Mindestens ein Topic aktivieren.")
+            QMessageBox.information(self, "Note", "Activate at least one topic.")
             return
         self.active_topics = sel
         self._draw_plots()
+
+    def _show_help(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("User Guide")
+        vbox = QVBoxLayout(dlg)
+        browser = QTextBrowser()
+        help_path = pathlib.Path(__file__).with_name("help_en.html")
+        browser.setHtml(help_path.read_text(encoding="utf-8"))
+        vbox.addWidget(browser)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok)
+        btns.accepted.connect(dlg.accept)
+        vbox.addWidget(btns)
+        dlg.resize(600, 500)
+        dlg.exec()
 
 
 

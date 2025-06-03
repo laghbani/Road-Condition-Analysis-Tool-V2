@@ -62,7 +62,7 @@ class MapWidget(QWebEngineView):
         if ev.button() == Qt.RightButton:
             m = QMenu(self)
             m.addAction(
-                "Sensor→Vehicle-Mtx ausblenden",
+                "Hide sensor→vehicle matrix",
                 lambda: self.set_data(self._gps_df, None),
             )
             m.exec(ev.globalPos())
