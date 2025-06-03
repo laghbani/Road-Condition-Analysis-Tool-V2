@@ -85,7 +85,7 @@ try:
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
         QActionGroup, QUndoStack, QUndoCommand
     )
@@ -94,13 +94,13 @@ try:
     except Exception:
         QWebEngineView = None
     from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QTimer
-    from PyQt5.QtGui import QKeySequence, QPainter, QImage
+    from PyQt5.QtGui import QKeySequence, QPainter, QImage, QColor
 except ImportError:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QFileDialog, QMessageBox,
         QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+        QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
         QActionGroup, QUndoStack, QUndoCommand
     )
@@ -109,7 +109,7 @@ except ImportError:
     except Exception:
         QWebEngineView = None
     from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal, QTimer
-    from PySide6.QtGui import QKeySequence, QPainter, QImage
+    from PySide6.QtGui import QKeySequence, QPainter, QImage, QColor
 
 # ---------------------------------------------------------------------------#
 # ROS-Import                                                                 #
@@ -136,6 +136,9 @@ try:
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
+
+# Application version
+APP_VERSION = "2.01"
 
 # ===========================================================================
 # Rotation Modes & Default Overrides
@@ -296,14 +299,14 @@ class BagReaderWorker(QThread):
     def run(self) -> None:
         try:
             log.debug("BagReaderWorker started")
-            self.stepChanged.emit("Öffne Bag-Datei …")
+            self.stepChanged.emit("Open bag file …")
             reader = SequentialReader()
             reader.open(
                 StorageOptions(str(self.bag_path), "sqlite3"),
                 ConverterOptions("cdr", "cdr"),
             )
 
-            self.stepChanged.emit("Ermittle Topics …")
+            self.stepChanged.emit("Discover topics …")
             topics_info = reader.get_all_topics_and_types()
             topic_types = {t.name: t.type for t in topics_info}
             imu_topics = [t for t, ty in topic_types.items() if ty == "sensor_msgs/msg/Imu"]
@@ -323,7 +326,7 @@ class BagReaderWorker(QThread):
             cnt = 0
             bridge = CvBridge()
 
-            self.stepChanged.emit("Lese Daten …")
+            self.stepChanged.emit("Read data …")
             while reader.has_next():
                 topic, data, ts = reader.read_next()
                 if topic in samples:
@@ -493,7 +496,7 @@ class MountDialog(QDialog):
     def _edit_matrix(self, topic: str):
         R0 = self.overrides.get(topic, np.eye(3))
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Override für {topic}")
+        dlg.setWindowTitle(f"Override for {topic}")
         l = QVBoxLayout(dlg)
         tbl = QTableWidget(3, 3)
         for i in range(3):
@@ -625,6 +628,75 @@ class LabelManagerDialog(QDialog):
         return res
 
 
+class PeakExportDialog(QDialog):
+    """Dialog to manage which peaks should be exported."""
+
+    def __init__(self, peaks: list[tuple[float, str, bool]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Peak Save Management")
+        self.resize(300, 300)
+
+        self.tbl = QTableWidget(self)
+        self.tbl.setColumnCount(3)
+        self.tbl.setHorizontalHeaderLabels(["Time [s]", "Label", "Export"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.itemChanged.connect(self._item_changed)
+
+        btn_del = QPushButton("Delete selected")
+        btn_del.clicked.connect(self._delete_selected)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        v = QVBoxLayout(self)
+        v.addWidget(self.tbl)
+        v.addWidget(btn_del)
+        v.addWidget(btns)
+
+        self.set_peaks(peaks)
+
+    def set_peaks(self, peaks: list[tuple[float, str, bool]]) -> None:
+        self.tbl.setRowCount(len(peaks))
+        for i, (t, lbl, export) in enumerate(peaks):
+            it0 = QTableWidgetItem(f"{t:.2f}")
+            it1 = QTableWidgetItem(lbl)
+            it2 = QTableWidgetItem()
+            it2.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            it2.setCheckState(Qt.Checked if export else Qt.Unchecked)
+            self.tbl.setItem(i, 0, it0)
+            self.tbl.setItem(i, 1, it1)
+            self.tbl.setItem(i, 2, it2)
+            self._color_row(i, export)
+
+    def _color_row(self, row: int, export: bool) -> None:
+        col = QColor("lightgreen" if export else "lightcoral")
+        for c in range(self.tbl.columnCount()):
+            item = self.tbl.item(row, c)
+            if item:
+                item.setBackground(col)
+
+    def _item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == 2:
+            export = item.checkState() == Qt.Checked
+            self._color_row(item.row(), export)
+
+    def _delete_selected(self) -> None:
+        rows = sorted({i.row() for i in self.tbl.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.tbl.removeRow(r)
+
+    def result(self) -> list[tuple[float, str, bool]]:
+        res = []
+        for r in range(self.tbl.rowCount()):
+            t = float(self.tbl.item(r, 0).text())
+            lbl = self.tbl.item(r, 1).text()
+            chk = self.tbl.item(r, 2)
+            export = chk.checkState() == Qt.Checked if chk else False
+            res.append((t, lbl, export))
+        return res
+
+
 # ===========================================================================
 # Undo/Redo Commands
 # ===========================================================================
@@ -645,6 +717,7 @@ class AddLabelCmd(QUndoCommand):
     def redo(self) -> None:  # type: ignore[override]
         self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -653,6 +726,7 @@ class AddLabelCmd(QUndoCommand):
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
 
 class DeleteLabelCmd(QUndoCommand):
@@ -671,6 +745,7 @@ class DeleteLabelCmd(QUndoCommand):
     def redo(self) -> None:  # type: ignore[override]
         self.win._delete_label_range(self.topic, self.xmin, self.xmax)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -679,6 +754,7 @@ class DeleteLabelCmd(QUndoCommand):
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
 
 class EditLabelCmd(QUndoCommand):
@@ -699,6 +775,7 @@ class EditLabelCmd(QUndoCommand):
         self.win._delete_label_range(self.topic, self.xmin, self.xmax)
         self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -707,6 +784,7 @@ class EditLabelCmd(QUndoCommand):
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
 # ===========================================================================
 # Main-Window
@@ -716,11 +794,11 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ROS 2 IMU-Labeling Tool")
+        self.setWindowTitle(f"Multisensory Road Condition Analysis v{APP_VERSION}")
         self.resize(1500, 900)
 
         # Persistent settings
-        self.settings = QSettings("FH-Zürich", "IMU-LabelTool")
+        self.settings = QSettings("HS-Merseburg", "RCAT")
         self.undo = QUndoStack(self)
 
         # Daten-Strukturen
@@ -748,6 +826,9 @@ class MainWindow(QMainWindow):
         self.peak_threshold: float = 3.19
         self.peak_distance: float = 1.5
         self.use_max_peak: bool = False
+
+        # Peak export management
+        self.peak_exports: list[tuple[float, str, bool]] = []
 
         # Video/PointCloud playback
         self.video_topic: str | None = None
@@ -779,6 +860,7 @@ class MainWindow(QMainWindow):
         self.canvas = FigureCanvas(self.fig)
         v_plot.addWidget(self.canvas)
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
+        self.canvas.mpl_connect("motion_notify_event", self._mouse_move)
 
         hl = QHBoxLayout()
         v_plot.addLayout(hl)
@@ -840,16 +922,22 @@ class MainWindow(QMainWindow):
         self.settings.setValue("active_topics", self.active_topics)
         super().closeEvent(e)
 
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Delete:
+            self._button_delete_label()
+        else:
+            super().keyPressEvent(event)
+
     # ------------------------------------------------------------------ Menu
     def _build_menu(self) -> None:
         mb = self.menuBar()
 
-        m_file = mb.addMenu("&Datei")
-        act_open = QAction("&Bag öffnen …", self)
+        m_file = mb.addMenu("&File")
+        act_open = QAction("&Open Bag …", self)
         act_open.triggered.connect(self._open_bag)
         m_file.addAction(act_open)
 
-        self.act_export = QAction("&CSV exportieren", self)
+        self.act_export = QAction("&Export CSV", self)
         self.act_export.setEnabled(False)
         self.act_export.triggered.connect(
             lambda: export_csv_smart_v2(self, gps_df=self._gps_df))
@@ -864,7 +952,7 @@ class MainWindow(QMainWindow):
         m_file.addAction(act_load_cfg)
 
         m_file.addSeparator()
-        m_file.addAction("Beenden", lambda: QApplication.instance().quit())
+        m_file.addAction("Quit", lambda: QApplication.instance().quit())
 
         # Edit menu with Undo/Redo
         m_edit = mb.addMenu("&Edit")
@@ -879,8 +967,12 @@ class MainWindow(QMainWindow):
         act_manage.triggered.connect(self._open_label_manager)
         m_edit.addAction(act_manage)
 
+        self.act_label_all = QAction("Label all topics", self, checkable=True)
+        self.act_label_all.setChecked(False)
+        m_edit.addAction(self.act_label_all)
+
         m_imu = mb.addMenu("&IMU Settings")
-        self.act_topics = QAction("Topics auswählen …", self)
+        self.act_topics = QAction("Select topics …", self)
         self.act_topics.setEnabled(False)
         self.act_topics.triggered.connect(self._configure_topics)
         m_imu.addAction(self.act_topics)
@@ -892,6 +984,10 @@ class MainWindow(QMainWindow):
         act_peaks = QAction("Peak detection …", self)
         act_peaks.triggered.connect(self._open_peak_dialog)
         m_imu.addAction(act_peaks)
+
+        act_save_mgmt = QAction("Peak export management …", self)
+        act_save_mgmt.triggered.connect(self._open_peak_export_manager)
+        m_imu.addAction(act_save_mgmt)
 
         from PyQt5.QtWidgets import QActionGroup
         ag = QActionGroup(self)
@@ -907,9 +1003,9 @@ class MainWindow(QMainWindow):
         m_imu.addAction(self.act_health)
 
         m_view = mb.addMenu("&View")
-        self.act_verify = QAction("Verify your labeling", self)
+        self.act_verify = QAction("Verify your labeling", self, checkable=True)
         self.act_verify.setEnabled(False)
-        self.act_verify.triggered.connect(lambda: self._draw_plots(verify=True))
+        self.act_verify.toggled.connect(lambda chk: self._draw_plots(verify=chk))
         m_view.addAction(self.act_verify)
 
         self.act_show_raw = QAction("Show raw acceleration", self, checkable=True)
@@ -959,10 +1055,16 @@ class MainWindow(QMainWindow):
         m_view.addAction(act_check)
         self.act_check = act_check
 
+        # Help menu
+        m_help = mb.addMenu("&Help")
+        act_help = QAction("User Guide", self)
+        act_help.triggered.connect(self._show_help)
+        m_help.addAction(act_help)
+
     # ------------------------------------------------------------------ Bag
     def _open_bag(self) -> None:
         pth, _ = QFileDialog.getOpenFileName(
-            self, "ROS 2 Bag wählen", "", "ROS 2 Bag (*.db3 *.sqlite3 *.mcap);;Alle Dateien (*)"
+            self, "Select ROS 2 bag", "", "ROS 2 Bag (*.db3 *.sqlite3 *.mcap);;All Files (*)"
         )
         if not pth:
             return
@@ -978,15 +1080,15 @@ class MainWindow(QMainWindow):
         self.available_topics.clear()
 
         steps = [
-            "Öffne Bag-Datei",
-            "Ermittle Topics",
-            "Lese Daten",
-            "Erzeuge DataFrames",
-            "Vorverarbeitung (g-Korrektur, ISO-Weights …)",
-            "Erstelle Plots",
-            "Erstelle Karte",
+            "Open bag file",
+            "Discover topics",
+            "Read data",
+            "Build DataFrames",
+            "Preprocess (g-correction, ISO weights …)",
+            "Create plots",
+            "Create map",
         ]
-        progress = ProgressWindow("Bag einlesen", steps, parent=self)
+        progress = ProgressWindow("Loading bag", steps, parent=self)
 
         self.worker = BagReaderWorker(self.bag_path)
         self.worker.stepChanged.connect(progress.advance)
@@ -1004,7 +1106,7 @@ class MainWindow(QMainWindow):
             return
         if err:
             log.error("Error from worker: %s", err)
-            QMessageBox.critical(self, "Lesefehler", str(err))
+            QMessageBox.critical(self, "Read error", str(err))
             progress.accept()
             return
 
@@ -1014,7 +1116,7 @@ class MainWindow(QMainWindow):
          vid_frames, pc_frames,
          vid_times, pc_times) = result
         if not available:
-            QMessageBox.information(self, "Keine IMU-Topics", "Es wurden keine IMU-Topics gefunden.")
+            QMessageBox.information(self, "No IMU topics", "No IMU topics found.")
             progress.accept()
             return
 
@@ -1040,7 +1142,7 @@ class MainWindow(QMainWindow):
             self._change_pc_topic(pc_topics[0])
 
         progress.set_bar_steps(3)
-        if not progress.advance("Erzeuge DataFrames …"):
+        if not progress.advance("Build DataFrames …"):
             log.debug("Aborted during DataFrame generation")
             progress.accept()
             return
@@ -1052,7 +1154,7 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        if not progress.advance("Vorverarbeitung …"):
+        if not progress.advance("Preprocessing …"):
             log.debug("Aborted during preprocessing")
             progress.accept()
             return
@@ -1064,7 +1166,7 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        if not progress.advance("Erstelle Plots …"):
+        if not progress.advance("Create plots …"):
             log.debug("Aborted before plotting")
             progress.accept()
             return
@@ -1077,7 +1179,7 @@ class MainWindow(QMainWindow):
             progress.accept()
             return
 
-        if not progress.advance("Erstelle Karte …"):
+        if not progress.advance("Create map …"):
             log.debug("Aborted before map creation")
             progress.accept()
             return
@@ -1152,6 +1254,53 @@ class MainWindow(QMainWindow):
                     df[name] = arr
                 self.iso_metrics[topic] = iso
         log.debug("Preprocessing finished")
+        self._update_peak_exports()
+
+    def _update_peak_exports(self) -> None:
+        """Update list of peaks for export with deduplication."""
+        if not self.iso_metrics:
+            self.peak_exports = []
+            return
+
+        topic0 = next(iter(self.dfs))
+        peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+        if not peaks:
+            self.peak_exports = []
+            return
+
+        df0 = self.dfs[topic0]
+        peak_times_abs = df0.loc[peaks, "time_abs"].to_numpy()
+        peak_times_rel = df0.loc[peaks, "time"].to_numpy()
+        labels = df0.loc[peaks, "label_name"].to_numpy()
+        patches = self.label_patches_track.get(topic0, [])
+        fixed_labels: list[str] = []
+        for trel, lbl in zip(peak_times_rel, labels):
+            if lbl == UNKNOWN_NAME:
+                for s, e, name in patches:
+                    if s <= trel <= e:
+                        lbl = name
+                        break
+            fixed_labels.append(lbl)
+        pairs = sorted(zip(peak_times_abs, fixed_labels))
+        tol = min(0.5, self.peak_distance / 2)
+        uniq: list[tuple[float, str]] = []
+        for pt, lbl in pairs:
+            if lbl == UNKNOWN_NAME:
+                continue
+            if not uniq or pt - uniq[-1][0] > tol:
+                uniq.append((pt, lbl))
+
+        new_list: list[tuple[float, str, bool]] = []
+        for pt, lbl in uniq:
+            found = False
+            for old_pt, old_lbl, flag in self.peak_exports:
+                if abs(old_pt - pt) < 1e-3 and old_lbl == lbl:
+                    new_list.append((pt, lbl, flag))
+                    found = True
+                    break
+            if not found:
+                new_list.append((pt, lbl, True))
+        self.peak_exports = new_list
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
@@ -1339,13 +1488,45 @@ class MainWindow(QMainWindow):
 
         if ev.button != 3:
             return
+
+        targets = self.active_topics if self.act_label_all.isChecked() else [topic]
+
+        if ev.dblclick:
+            # delete label under cursor if available
+            patches = self.label_patches.get(topic, [])
+            for s, e, _ in patches:
+                if s <= ev.xdata <= e:
+                    for t in targets:
+                        self.undo.push(DeleteLabelCmd(self, t, s, e))
+                    return
+
         if topic not in self.current_span:
             return
         xmin, xmax = self.current_span[topic]
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
-        self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
+        if ev.dblclick:
+            for t in targets:
+                self.undo.push(DeleteLabelCmd(self, t, xmin, xmax))
+        else:
+            for t in targets:
+                self.undo.push(AddLabelCmd(self, t, xmin, xmax, lname))
+
+    def _mouse_move(self, ev) -> None:
+        if ev.inaxes not in self.ax_topic or ev.xdata is None:
+            return
+        topic = self.ax_topic[ev.inaxes]
+        peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+        if not peaks:
+            return
+        df = self.dfs[topic]
+        times = df.loc[peaks, "time"].to_numpy()
+        idx = int(np.argmin(np.abs(times - ev.xdata)))
+        if abs(times[idx] - ev.xdata) <= 0.2:
+            self.statusBar().showMessage(f"Peak at {times[idx]:.2f} s")
+        else:
+            self.statusBar().clearMessage()
 
     def _tab_changed(self, idx: int) -> None:
         if idx == 1:
@@ -1358,13 +1539,17 @@ class MainWindow(QMainWindow):
         self.video_topic = t if t else None
         vframes = self.video_frames_by_topic.get(t, [])
         pframes = self.pc_frames_by_topic.get(self.pc_topic, [])
-        self.tab_vpc.load_arrays(vframes, pframes)
+        vtimes = self.video_times_by_topic.get(t, [])
+        times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
+        self.tab_vpc.load_arrays(vframes, pframes, times_rel)
 
     def _change_pc_topic(self, t: str) -> None:
         self.pc_topic = t if t else None
         vframes = self.video_frames_by_topic.get(self.video_topic, [])
         pframes = self.pc_frames_by_topic.get(t, [])
-        self.tab_vpc.load_arrays(vframes, pframes)
+        vtimes = self.video_times_by_topic.get(self.video_topic or "", [])
+        times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
+        self.tab_vpc.load_arrays(vframes, pframes, times_rel)
 
     def _show_peak_video(self, topic: str, t_peak: float) -> None:
         vid_topic = self.video_topic or ""
@@ -1387,13 +1572,16 @@ class MainWindow(QMainWindow):
             i0 = int(np.searchsorted(tr, start, "left"))
             i1 = int(np.searchsorted(tr, end, "right"))
             vframes = vframes[i0:i1]
+            times_sel = tr[i0:i1]
+        else:
+            times_sel = []
         if ptimes:
             trp = np.array(ptimes) - t0
             i0 = int(np.searchsorted(trp, start, "left"))
             i1 = int(np.searchsorted(trp, end, "right"))
             pframes = pframes[i0:i1]
 
-        self.tab_vpc.load_arrays(vframes, pframes)
+        self.tab_vpc.load_arrays(vframes, pframes, list(times_sel))
         self.tabs.setCurrentIndex(2)
         self.tab_vpc.play()
 
@@ -1523,7 +1711,9 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
-        self.undo.push(AddLabelCmd(self, t, xmin, xmax, lname))
+        targets = self.active_topics if self.act_label_all.isChecked() else [t]
+        for topic in targets:
+            self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
 
     def _button_edit_label(self) -> None:
         t = self.last_selected_topic
@@ -1533,14 +1723,18 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
-        self.undo.push(EditLabelCmd(self, t, xmin, xmax, lname))
+        targets = self.active_topics if self.act_label_all.isChecked() else [t]
+        for topic in targets:
+            self.undo.push(EditLabelCmd(self, topic, xmin, xmax, lname))
 
     def _button_delete_label(self) -> None:
         t = self.last_selected_topic
         if not t or t not in self.current_span:
             return
         xmin, xmax = self.current_span[t]
-        self.undo.push(DeleteLabelCmd(self, t, xmin, xmax))
+        targets = self.active_topics if self.act_label_all.isChecked() else [t]
+        for topic in targets:
+            self.undo.push(DeleteLabelCmd(self, topic, xmin, xmax))
 
     def _check_export_status(self):
         rows = []
@@ -1575,6 +1769,7 @@ class MainWindow(QMainWindow):
         self.rot_mode, self.mount_overrides = dlg.result()
         self._preprocess_all()
         self._draw_plots()
+        self._update_peak_exports()
 
     def _open_peak_dialog(self) -> None:
         dlg = PeakDialog(self.peak_threshold, self.peak_distance, self.use_max_peak, self)
@@ -1598,6 +1793,17 @@ class MainWindow(QMainWindow):
                 mask = (df["time"] >= s) & (df["time"] <= e)
                 df.loc[mask, ["label_id", "label_name"]] = [lid, lbl]
         self._draw_plots()
+        self._update_peak_exports()
+
+    def _open_peak_export_manager(self) -> None:
+        self._update_peak_exports()
+        if not self.peak_exports:
+            QMessageBox.information(self, "Info", "No labeled peaks found.")
+            return
+        dlg = PeakExportDialog(self.peak_exports, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.peak_exports = dlg.result()
 
     def _set_weighting(self, comfort: bool) -> None:
         self.iso_comfort = comfort
@@ -1610,7 +1816,8 @@ class MainWindow(QMainWindow):
         QFileDialog = _get_qt_widget(self, "QFileDialog")
         if QFileDialog is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        start = "/home/afius/Desktop/anomaly-data-hs-merseburg/Setting/"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Settings", start, "JSON Files (*.json)")
         if not path:
             return
         cfg = {
@@ -1627,7 +1834,8 @@ class MainWindow(QMainWindow):
         QFileDialog = _get_qt_widget(self, "QFileDialog")
         if QFileDialog is None:
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Load Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        start = "/home/afius/Desktop/anomaly-data-hs-merseburg/Setting/"
+        path, _ = QFileDialog.getOpenFileName(self, "Load Settings", start, "JSON Files (*.json)")
         if not path:
             return
         data = json.loads(pathlib.Path(path).read_text())
@@ -1649,10 +1857,24 @@ class MainWindow(QMainWindow):
             return
         sel = dlg.selected_topics()
         if not sel:
-            QMessageBox.information(self, "Hinweis", "Mindestens ein Topic aktivieren.")
+            QMessageBox.information(self, "Note", "Activate at least one topic.")
             return
         self.active_topics = sel
         self._draw_plots()
+
+    def _show_help(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("User Guide")
+        vbox = QVBoxLayout(dlg)
+        browser = QTextBrowser()
+        help_path = pathlib.Path(__file__).with_name("help_en.html")
+        browser.setHtml(help_path.read_text(encoding="utf-8"))
+        vbox.addWidget(browser)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok)
+        btns.accepted.connect(dlg.accept)
+        vbox.addWidget(btns)
+        dlg.resize(600, 500)
+        dlg.exec()
 
 
 
