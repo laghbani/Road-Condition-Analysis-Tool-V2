@@ -550,6 +550,13 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
         peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
         if len(peaks):
             peak_times = self.dfs[topic0].loc[peaks, "time_abs"].to_numpy()
+            peak_times.sort()
+            tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
+            uniq = []
+            for pt in peak_times:
+                if not uniq or pt - uniq[-1] > tol:
+                    uniq.append(pt)
+            peak_times = uniq
             media_dir = dest / "peaks"
             media_dir.mkdir(exist_ok=True)
             pre = getattr(self.tab_vpc, "spn_pre", None)
