@@ -19,6 +19,21 @@ from cv_bridge import CvBridge
 from sensor_msgs_py import point_cloud2 as pc2
 from videopc_widget import _pc_to_xyz
 
+# label colors used for exporting labeled plots
+ANOMALY_COLORS = {
+    "normal": "#00FF00",
+    "depression": "#FF0000",
+    "cover": "#FFA500",
+    "cobble road/ traditional road": "#FFFF00",
+    "transverse grove": "#00FF00",
+    "gravel road": "#FAF2A1",
+    "cracked / irregular pavement and aspahlt": "#E06D06",
+    "bump": "#54F2F2",
+    "uneven/repaired asphalt road": "#A30B37",
+    "Damaged pavemant / asphalt road": "#2B15AA",
+}
+UNKNOWN_NAME = "unknown"
+
 
 CITY_BBOX = {
     "Merseburg": ((51.34, 51.38), (11.95, 12.07)),
@@ -58,6 +73,39 @@ def save_plot(df: pd.DataFrame, cols: list[str], path: Path, title: str) -> None
     plt.xlabel("time [s]")
     plt.title(title)
     plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def save_labeled_plot(df: pd.DataFrame, path: Path) -> None:
+    """Save acceleration plot with label regions shaded."""
+    plt.figure()
+    plt.plot(df["time"], df["accel_x"], label="accel_x")
+    plt.plot(df["time"], df["accel_y"], label="accel_y")
+    plt.plot(df["time"], df["accel_z"], label="accel_z")
+
+    times = df["time"].to_numpy()
+    names = df["label_name"].to_numpy()
+    start = None
+    last = UNKNOWN_NAME
+    for t, name in zip(times, names):
+        if name != last:
+            if last != UNKNOWN_NAME and start is not None:
+                color = ANOMALY_COLORS.get(last, "#cccccc")
+                plt.axvspan(start, prev_t, color=color, alpha=0.2, label=last)
+            start = t
+            last = name
+        prev_t = t
+    if last != UNKNOWN_NAME and start is not None:
+        color = ANOMALY_COLORS.get(last, "#cccccc")
+        plt.axvspan(start, prev_t, color=color, alpha=0.2, label=last)
+
+    handles, labels = plt.gca().get_legend_handles_labels()
+    uniq = dict(zip(labels, handles))
+    plt.legend(uniq.values(), uniq.keys(), fontsize="x-small")
+    plt.xlabel("time [s]")
+    plt.title("Acceleration with Labels")
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -518,6 +566,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 save_plot(work, ["accel_veh_x", "accel_veh_y", "accel_veh_z"], detail_dir / "acc_vehicle.png", "Vehicle Frame")
             save_plot(work, ["awx", "awy", "awz"], detail_dir / "weighted.png", "Weighted")
             save_plot(work, ["rms_x", "rms_y", "rms_z"], detail_dir / "rms.png", "Running RMS")
+            save_labeled_plot(work, detail_dir / "labels.png")
 
         except Exception as exc:
             QMessageBox = _get_qt_widget(self, "QMessageBox")
@@ -549,14 +598,17 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
         topic0 = next(iter(self.dfs))
         peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
         if len(peaks):
-            peak_times = self.dfs[topic0].loc[peaks, "time_abs"].to_numpy()
-            peak_times.sort()
+            df0 = self.dfs[topic0]
+            peak_times = df0.loc[peaks, "time_abs"].to_numpy()
+            labels = df0.loc[peaks, "label_name"].to_numpy()
+            pairs = sorted(zip(peak_times, labels))
             tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
-            uniq = []
-            for pt in peak_times:
-                if not uniq or pt - uniq[-1] > tol:
-                    uniq.append(pt)
-            peak_times = uniq
+            uniq: list[tuple[float, str]] = []
+            for pt, lbl in pairs:
+                if lbl == UNKNOWN_NAME:
+                    continue
+                if not uniq or pt - uniq[-1][0] > tol:
+                    uniq.append((pt, lbl))
             media_dir = dest / "peaks"
             media_dir.mkdir(exist_ok=True)
             pre = getattr(self.tab_vpc, "spn_pre", None)
@@ -564,8 +616,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             pre = pre.value() if pre else 2.0
             post = post.value() if post else 2.0
             t0 = self.t0 or 0.0
-            for pt in peak_times:
-                pdir = media_dir / f"{pt - t0:.2f}"
+            for pt, lbl in uniq:
+                pdir = media_dir / f"{pt - t0:.2f}_{lbl}"
                 pdir.mkdir(exist_ok=True)
                 for vtopic, frames in self.video_frames_by_topic.items():
                     times = self.video_times_by_topic.get(vtopic, [])

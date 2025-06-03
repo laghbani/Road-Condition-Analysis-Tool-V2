@@ -1443,7 +1443,7 @@ class MainWindow(QMainWindow):
             i0 = int(np.searchsorted(tr, start, "left"))
             i1 = int(np.searchsorted(tr, end, "right"))
             vframes = vframes[i0:i1]
-            times_sel = tr[i0:i1] - (t_peak - t0)
+            times_sel = tr[i0:i1]
         else:
             times_sel = []
         if ptimes:
@@ -1675,7 +1675,8 @@ class MainWindow(QMainWindow):
         QFileDialog = _get_qt_widget(self, "QFileDialog")
         if QFileDialog is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        start = "/home/afius/Desktop/anomaly-data-hs-merseburg/Setting/"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Settings", start, "JSON Files (*.json)")
         if not path:
             return
         cfg = {
@@ -1692,7 +1693,8 @@ class MainWindow(QMainWindow):
         QFileDialog = _get_qt_widget(self, "QFileDialog")
         if QFileDialog is None:
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Load Settings", str(pathlib.Path.cwd()), "JSON Files (*.json)")
+        start = "/home/afius/Desktop/anomaly-data-hs-merseburg/Setting/"
+        path, _ = QFileDialog.getOpenFileName(self, "Load Settings", start, "JSON Files (*.json)")
         if not path:
             return
         data = json.loads(pathlib.Path(path).read_text())
