@@ -1,0 +1,55 @@
+<h1>Multisensory Road Condition Analysis</h1>
+<p>Version 2.01</p>
+<h2>Acceleration Signals</h2>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>Name</th><th>Description</th></tr>
+<tr><td>Raw Acceleration</td><td>Direct measurements from the IMU.</td></tr>
+<tr><td>g-corrected Acceleration</td><td>Acceleration corrected for gravity.</td></tr>
+<tr><td>Vehicle Frame Acceleration</td><td>Acceleration rotated into the vehicle frame.</td></tr>
+<tr><td>ISO Weighted</td><td>Acceleration filtered using ISO&nbsp;2631‑1 weighting.</td></tr>
+</table>
+<h2>Map and Videos</h2>
+<p>The map tab displays the GPS track with optional heading arrows.
+The video/point cloud tab visualizes recorded frames and point clouds synchronized
+with the acceleration data.</p>
+<h2>Settings Parameters</h2>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>Parameter</th><th>Meaning</th></tr>
+<tr><td>Mounting Overrides</td><td>Manual rotation matrices for each sensor.</td></tr>
+<tr><td>Peak Detection</td><td>ISO peak threshold and minimum distance.</td></tr>
+<tr><td>Weighting Mode</td><td>Toggle between comfort and health weighting.</td></tr>
+</table>
+<h2>CSV File Structure</h2>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>Column</th><th>Description</th></tr>
+<tr><td>time</td><td>Time relative to the start of the bag.</td></tr>
+<tr><td>time_abs</td><td>Absolute ROS2 timestamp.</td></tr>
+<tr><td>accel_x/y/z</td><td>Raw acceleration components in sensor axes.</td></tr>
+<tr><td>speed_mps</td><td>Interpolated vehicle speed from GPS.</td></tr>
+<tr><td>gyro_x/y/z</td><td>(Optional) Angular rate in rad/s.</td></tr>
+<tr><td>accel_corr_x/y/z</td><td>Acceleration after gravity compensation.</td></tr>
+<tr><td>grav_x/y/z</td><td>Estimated gravity vector.</td></tr>
+<tr><td>accel_veh_x/y/z</td><td>(Optional) Acceleration in the vehicle frame.</td></tr>
+<tr><td>|a|_raw</td><td>Magnitude of raw acceleration.</td></tr>
+<tr><td>|ω|_raw</td><td>Magnitude of angular rate.</td></tr>
+<tr><td>clipped_flag</td><td>1 if the sensor was saturated.</td></tr>
+<tr><td>label_id</td><td>Numeric identifier of the label.</td></tr>
+<tr><td>label_name</td><td>Textual label of the segment.</td></tr>
+</table>
+<h2>Metadata JSON</h2>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>Field</th><th>Description</th></tr>
+<tr><td>file_format</td><td>Version identifier of the export.</td></tr>
+<tr><td>sensor_topic</td><td>ROS topic of the IMU data.</td></tr>
+<tr><td>sensor_model</td><td>Hardware model derived from the bag.</td></tr>
+<tr><td>coordinate_frame</td><td>Original frame identifier of the IMU.</td></tr>
+<tr><td>sensor_fs_accel_g</td><td>Full-scale range of the accelerometer in g.</td></tr>
+<tr><td>bias_vector_mps2</td><td>Estimated bias vector used for correction.</td></tr>
+<tr><td>g_compensation</td><td>Method chosen for gravity removal.</td></tr>
+<tr><td>vehicle_rot_mat</td><td>3×3 matrix rotating sensor to vehicle frame.</td></tr>
+<tr><td>rotation_available</td><td>Whether a valid rotation was computed.</td></tr>
+<tr><td>sampling_rate_hz</td><td>Nominal sampling rate of the sensor.</td></tr>
+<tr><td>exporter_sha1</td><td>SHA‑1 of the exporter software.</td></tr>
+</table>
+<h2>About</h2>
+<p>All rights reserved for Mahmoud Laghbani (<a href="mailto:mahmoud.laghbani@hs-merseburg.de">mahmoud.laghbani@hs-merseburg.de</a>).</p>
