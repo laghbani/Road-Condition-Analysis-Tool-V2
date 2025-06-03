@@ -13,6 +13,26 @@ import pandas as pd
 from scipy.spatial.transform import Rotation as R
 from scipy.signal import butter, filtfilt
 from progress_ui import ProgressWindow
+import cv2
+from sensor_msgs.msg import PointCloud2, Image, CompressedImage
+from cv_bridge import CvBridge
+from sensor_msgs_py import point_cloud2 as pc2
+from videopc_widget import _pc_to_xyz
+
+# label colors used for exporting labeled plots
+ANOMALY_COLORS = {
+    "normal": "#00FF00",
+    "depression": "#FF0000",
+    "cover": "#FFA500",
+    "cobble road/ traditional road": "#FFFF00",
+    "transverse grove": "#00FF00",
+    "gravel road": "#FAF2A1",
+    "cracked / irregular pavement and aspahlt": "#E06D06",
+    "bump": "#54F2F2",
+    "uneven/repaired asphalt road": "#A30B37",
+    "Damaged pavemant / asphalt road": "#2B15AA",
+}
+UNKNOWN_NAME = "unknown"
 
 
 CITY_BBOX = {
@@ -53,6 +73,39 @@ def save_plot(df: pd.DataFrame, cols: list[str], path: Path, title: str) -> None
     plt.xlabel("time [s]")
     plt.title(title)
     plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def save_labeled_plot(df: pd.DataFrame, path: Path) -> None:
+    """Save acceleration plot with label regions shaded."""
+    plt.figure()
+    plt.plot(df["time"], df["accel_x"], label="accel_x")
+    plt.plot(df["time"], df["accel_y"], label="accel_y")
+    plt.plot(df["time"], df["accel_z"], label="accel_z")
+
+    times = df["time"].to_numpy()
+    names = df["label_name"].to_numpy()
+    start = None
+    last = UNKNOWN_NAME
+    for t, name in zip(times, names):
+        if name != last:
+            if last != UNKNOWN_NAME and start is not None:
+                color = ANOMALY_COLORS.get(last, "#cccccc")
+                plt.axvspan(start, prev_t, color=color, alpha=0.2, label=last)
+            start = t
+            last = name
+        prev_t = t
+    if last != UNKNOWN_NAME and start is not None:
+        color = ANOMALY_COLORS.get(last, "#cccccc")
+        plt.axvspan(start, prev_t, color=color, alpha=0.2, label=last)
+
+    handles, labels = plt.gca().get_legend_handles_labels()
+    uniq = dict(zip(labels, handles))
+    plt.legend(uniq.values(), uniq.keys(), fontsize="x-small")
+    plt.xlabel("time [s]")
+    plt.title("Acceleration with Labels")
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -170,6 +223,11 @@ FSR_2G = 2 * G_STD
 FSR_8G = 8 * G_STD
 CAND_G = np.array([2, 4, 8, 16]) * G_STD        #  19.6, 39.2 … 156.9 m/s²
 
+# Known sensor models with fixed full-scale ranges
+MODEL_FSR = {
+    "StereoLabs ZED 2/2i": FSR_8G,
+}
+
 
 def _get_qt_widget(obj, name: str):
     """Return a Qt widget class from the same binding as *obj*."""
@@ -194,6 +252,36 @@ def sha1_of_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _img_to_bgr(obj):
+    if isinstance(obj, Image):
+        return CvBridge().imgmsg_to_cv2(obj, desired_encoding="bgr8")
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        arr = cv2.imdecode(np.frombuffer(obj, np.uint8), cv2.IMREAD_COLOR)
+        return arr
+    return np.asarray(obj)
+
+
+def _save_pcd(path: Path, pts: np.ndarray) -> None:
+    """Write a binary PCD file with just XYZ coordinates."""
+    pts = np.asarray(pts, dtype=np.float32)
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        f"WIDTH {len(pts)}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {len(pts)}\n"
+        "DATA binary\n"
+    ).encode()
+    with open(path, "wb") as f:
+        f.write(header)
+        pts.tofile(f)
 
 
 def write_gpx(df: pd.DataFrame, path: Path) -> None:
@@ -348,8 +436,17 @@ def auto_vehicle_frame(df: pd.DataFrame, gps_df: pd.DataFrame | None) -> list | 
 def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     bag_root = Path(self.bag_path)
 
+    QFileDialog = _get_qt_widget(self, "QFileDialog")
+    if QFileDialog is not None:
+        start_dir = "/home/afius/Desktop/anomaly-data-hs-merseburg"
+        sel = QFileDialog.getExistingDirectory(self, "Select export directory", start_dir)
+        if not sel:
+            return
+        root = Path(sel)
+    else:
+        root = Path("/home/afius/Desktop/anomaly-data-hs-merseburg")
+
     # Zielordner automatisch erzeugen
-    root = Path("/home/afius/Desktop/anomaly-data-hs-merseburg")
     label_date = datetime.now().strftime("%Y%m%d")
     city = "unknown"
     if gps_df is not None and not gps_df.empty:
@@ -400,7 +497,10 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             work = add_speed(work, gps_df)
 
             abs_a = np.linalg.norm(df[["accel_x", "accel_y", "accel_z"]].to_numpy(), axis=1)
-            fsr = detect_fsr(abs_a)
+            sensor_model = get_sensor_model(bag_root, topic)
+            fsr = MODEL_FSR.get(sensor_model)
+            if fsr is None:
+                fsr = detect_fsr(abs_a)
             clipped = (df[["accel_x", "accel_y", "accel_z"]].abs() >= 0.98 * fsr).any(axis=1)
 
             if has_quat:
@@ -444,7 +544,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             header = {
                 "file_format": "imu_v1",
                 "sensor_topic": topic,
-                "sensor_model": get_sensor_model(bag_root, topic),
+                "sensor_model": sensor_model,
                 "coordinate_frame": first_frame_id(samps),
                 "sensor_fs_accel_g": round(fsr / G_STD, 3),
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
@@ -495,6 +595,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 save_plot(work, ["accel_veh_x", "accel_veh_y", "accel_veh_z"], detail_dir / "acc_vehicle.png", "Vehicle Frame")
             save_plot(work, ["awx", "awy", "awz"], detail_dir / "weighted.png", "Weighted")
             save_plot(work, ["rms_x", "rms_y", "rms_z"], detail_dir / "rms.png", "Running RMS")
+            save_labeled_plot(work, detail_dir / "labels.png")
 
         except Exception as exc:
             QMessageBox = _get_qt_widget(self, "QMessageBox")
@@ -520,6 +621,62 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
         write_gpx(gps_df, dest / f"{bag_root.stem}_track.gpx")
         save_map(gps_comfort, dest / f"{bag_root.stem}_comfort.html")
         save_map(gps_health, dest / f"{bag_root.stem}_health.html")
+
+    # --- export peak media ----------------------------------------------
+    if hasattr(self, "iso_metrics") and self.iso_metrics:
+        if getattr(self, "peak_exports", None):
+            uniq = [(pt, lbl) for pt, lbl, flag in self.peak_exports if flag]
+        else:
+            topic0 = next(iter(self.dfs))
+            peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+            if len(peaks):
+                df0 = self.dfs[topic0]
+                peak_times = df0.loc[peaks, "time_abs"].to_numpy()
+                labels = df0.loc[peaks, "label_name"].to_numpy()
+                pairs = sorted(zip(peak_times, labels))
+                tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
+                uniq = []
+                for pt, lbl in pairs:
+                    if lbl == UNKNOWN_NAME:
+                        continue
+                    if not uniq or pt - uniq[-1][0] > tol:
+                        uniq.append((pt, lbl))
+            else:
+                uniq = []
+        if uniq:
+            media_dir = dest / "peaks"
+            media_dir.mkdir(exist_ok=True)
+            pre = getattr(self.tab_vpc, "spn_pre", None)
+            post = getattr(self.tab_vpc, "spn_post", None)
+            pre = pre.value() if pre else 2.0
+            post = post.value() if post else 2.0
+            t0 = self.t0 or 0.0
+            for pt, lbl in uniq:
+                pdir = media_dir / f"{pt - t0:.2f}_{lbl}"
+                pdir.mkdir(exist_ok=True)
+                for vtopic, frames in self.video_frames_by_topic.items():
+                    times = self.video_times_by_topic.get(vtopic, [])
+                    tr = np.array(times) - t0
+                    start = pt - t0 - pre
+                    end = pt - t0 + post
+                    i0 = int(np.searchsorted(tr, start, "left"))
+                    i1 = int(np.searchsorted(tr, end, "right"))
+                    for j, fr in enumerate(frames[i0:i1]):
+                        img = _img_to_bgr(fr)
+                        img_path = pdir / f"{vtopic.strip('/').replace('/', '__')}_{j:03d}.png"
+                        if img is not None:
+                            cv2.imwrite(str(img_path), img)
+                for ptopic, frames in self.pc_frames_by_topic.items():
+                    times = self.pc_times_by_topic.get(ptopic, [])
+                    tr = np.array(times) - t0
+                    start = pt - t0 - pre
+                    end = pt - t0 + post
+                    i0 = int(np.searchsorted(tr, start, "left"))
+                    i1 = int(np.searchsorted(tr, end, "right"))
+                    for j, pc in enumerate(frames[i0:i1]):
+                        pts = _pc_to_xyz(pc)
+                        pc_path = pdir / f"{ptopic.strip('/').replace('/', '__')}_{j:03d}.pcd"
+                        _save_pcd(pc_path, pts)
 
     progress.set_bar_value(len(self.dfs))
     progress.accept()
