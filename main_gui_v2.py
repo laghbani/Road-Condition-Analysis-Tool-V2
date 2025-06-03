@@ -717,6 +717,7 @@ class AddLabelCmd(QUndoCommand):
     def redo(self) -> None:  # type: ignore[override]
         self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -725,6 +726,7 @@ class AddLabelCmd(QUndoCommand):
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
 
 class DeleteLabelCmd(QUndoCommand):
@@ -743,6 +745,7 @@ class DeleteLabelCmd(QUndoCommand):
     def redo(self) -> None:  # type: ignore[override]
         self.win._delete_label_range(self.topic, self.xmin, self.xmax)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -751,6 +754,7 @@ class DeleteLabelCmd(QUndoCommand):
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
 
 class EditLabelCmd(QUndoCommand):
@@ -771,6 +775,7 @@ class EditLabelCmd(QUndoCommand):
         self.win._delete_label_range(self.topic, self.xmin, self.xmax)
         self.win._assign_label(self.topic, self.xmin, self.xmax, self.lname)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
     def undo(self) -> None:  # type: ignore[override]
         df = self.win.dfs[self.topic]
@@ -779,6 +784,7 @@ class EditLabelCmd(QUndoCommand):
         ax = next(a for a, t in self.win.ax_topic.items() if t == self.topic)
         self.win._restore_labels(ax, self.topic)
         self.win._draw_plots(self.win.act_verify.isChecked())
+        self.win._update_peak_exports()
 
 # ===========================================================================
 # Main-Window
@@ -1778,6 +1784,7 @@ class MainWindow(QMainWindow):
         self._draw_plots()
 
     def _open_peak_export_manager(self) -> None:
+        self._update_peak_exports()
         if not self.peak_exports:
             QMessageBox.information(self, "Info", "No labeled peaks found.")
             return
