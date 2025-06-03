@@ -1251,7 +1251,13 @@ class MainWindow(QMainWindow):
                 if self.act_show_peaks.isChecked():
                     peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
                     if len(peaks):
-                        ax.plot(df.loc[peaks, "time"], df.loc[peaks, "awv"], "k*", markersize=8, label="peaks")
+                        ax.plot(
+                            df.loc[peaks, "time"],
+                            df.loc[peaks, "awv"],
+                            "k*",
+                            markersize=12,
+                            label="peaks",
+                        )
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
@@ -1342,7 +1348,7 @@ class MainWindow(QMainWindow):
                 df = self.dfs[topic]
                 times = df.loc[peaks, "time"].to_numpy()
                 idx = int(np.argmin(np.abs(times - ev.xdata)))
-                if abs(times[idx] - ev.xdata) <= 0.2:
+                if abs(times[idx] - ev.xdata) <= 0.5:
                     self._show_peak_video(topic, times[idx])
                     return
 
@@ -1474,7 +1480,7 @@ class MainWindow(QMainWindow):
                 if row.peak:
                     folium.Marker(
                         location=[row.lat, row.lon],
-                        icon=folium.Icon(color="black", icon="star"),
+                        icon=folium.Icon(color="black", icon="star", icon_size=(40, 40)),
                         popup=f"Peak@{row.time:.2f}"
                     ).add_to(fmap)
                 else:

@@ -95,7 +95,7 @@ def save_map(gps: pd.DataFrame, path: Path) -> None:
         if row.peak:
             folium.Marker(
                 location=[row.lat, row.lon],
-                icon=folium.Icon(color="black", icon="star"),
+                icon=folium.Icon(color="black", icon="star", icon_size=(40, 40)),
                 popup=f"Peak@{row.time:.2f}"
             ).add_to(fmap)
         else:

@@ -1,5 +1,9 @@
 <h1>Multisensory Road Condition Analysis</h1>
 <p>Version 2.01</p>
+<p>This application lets you load ROS&nbsp;2 bag files and inspect IMU
+signals together with synchronized GPS tracks, videos and point
+clouds.  Use the menu bar to open a bag and select the IMU topics you
+want to analyse.</p>
 <h2>Acceleration Signals</h2>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>Name</th><th>Description</th></tr>
@@ -10,17 +14,36 @@
 </table>
 <h2>Map and Videos</h2>
 <p>The map tab displays the GPS track with optional heading arrows.
-The video/point cloud tab visualizes recorded frames and point clouds synchronized
-with the acceleration data.</p>
+Peaks detected in the acceleration signal are marked by black star
+icons.  Clicking on a star opens the video/point cloud tab and shows a
+short clip around that time.  You can also click star markers in the
+plots to jump directly to the corresponding video segment.</p>
 <h2>Settings Parameters</h2>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>Parameter</th><th>Meaning</th></tr>
-<tr><td>Mounting Overrides</td><td>Manual rotation matrices for each sensor.</td></tr>
-<tr><td>Peak Detection</td><td>ISO peak threshold and minimum distance.</td></tr>
-<tr><td>Weighting Mode</td><td>Toggle between comfort and health weighting.</td></tr>
+<tr><td>Mounting Overrides</td><td>Manually specify sensor&nbsp;&rarr;&nbsp;vehicle rotation matrices.</td></tr>
+<tr><td>Rotation Mode</td><td>Choose between stored overrides or automatic alignment.</td></tr>
+<tr><td>Peak Detection</td><td>Configure ISO peak threshold, minimum distance and whether only the maximum peak is kept.</td></tr>
+<tr><td>Weighting Mode</td><td>Toggle between comfort (default) and health weighting.</td></tr>
 </table>
 <h2>Exported CSV/JSON</h2>
-<p>Exported CSV files contain the processed acceleration signals and labels.
-JSON files store metadata such as rotation availability and ISO metrics.</p>
+<p>The <code>Export&nbsp;CSV</code> command writes a CSV file with all
+processed signals and labels.  A simplified example is shown below:</p>
+<pre>
+time,time_abs,accel_x,accel_y,accel_z,speed_mps,accel_corr_x,accel_corr_y,accel_corr_z,label_name
+0.00,1700000000.00,0.04,0.02,9.81,0.00,0.04,0.02,-0.05,unknown
+</pre>
+<p>A JSON file with the same stem stores meta information such as sensor
+model and rotation matrix:</p>
+<pre>
+{
+  "file_format": "imu_v1",
+  "sensor_topic": "/imu0",
+  "sensor_fs_accel_g": 16,
+  "rotation_available": true,
+  "vehicle_rot_mat": [[1,0,0],[0,1,0],[0,0,1]],
+  "sampling_rate_hz": 50.0
+}
+</pre>
 <h2>About</h2>
 <p>All rights reserved for Mahmoud Laghbani (<a href="mailto:mahmoud.laghbani@hs-merseburg.de">mahmoud.laghbani@hs-merseburg.de</a>).</p>
