@@ -206,7 +206,7 @@ def write_gpx(df: pd.DataFrame, path: Path) -> None:
         f.write('</trkseg></trk></gpx>')
 
 
-def detect_fsr(abs_a: np.ndarray) -> float:
+def detect_fsr(abs_a: np.ndarray, sensor_model: str | None = None) -> float:
     """
     Versucht die Full-Scale-Range ausschließlich aus den Daten abzuleiten.
     Idee:  Bei einem saturierten Sensor häufen sich Samples in der Nähe des
@@ -214,6 +214,15 @@ def detect_fsr(abs_a: np.ndarray) -> float:
            Kandidaten liegen, und wählen den kleinsten Kandidaten, der
            »signifikant« getroffen wird.
     """
+    # Falls der Sensortyp bekannt ist, kann eine feste FSR hinterlegt sein.
+    if sensor_model is not None:
+        DEFAULT_FSR_BY_MODEL = {
+            "StereoLabs ZED 2/2i": FSR_8G,
+        }
+        fsr = DEFAULT_FSR_BY_MODEL.get(sensor_model)
+        if fsr is not None:
+            return fsr
+
     hits = [(c, np.sum(abs_a >= 0.98 * c)) for c in CAND_G]
     # 0.02 % der Gesamtlänge als Faustregel
     thr = 0.0002 * len(abs_a)
@@ -399,8 +408,9 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             # Speed aus GPS-Daten ableiten
             work = add_speed(work, gps_df)
 
+            sensor_model = get_sensor_model(bag_root, topic)
             abs_a = np.linalg.norm(df[["accel_x", "accel_y", "accel_z"]].to_numpy(), axis=1)
-            fsr = detect_fsr(abs_a)
+            fsr = detect_fsr(abs_a, sensor_model)
             clipped = (df[["accel_x", "accel_y", "accel_z"]].abs() >= 0.98 * fsr).any(axis=1)
 
             if has_quat:
@@ -444,7 +454,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
             header = {
                 "file_format": "imu_v1",
                 "sensor_topic": topic,
-                "sensor_model": get_sensor_model(bag_root, topic),
+                "sensor_model": sensor_model,
                 "coordinate_frame": first_frame_id(samps),
                 "sensor_fs_accel_g": round(fsr / G_STD, 3),
                 "bias_vector_mps2": [round(x, 3) for x in bias_vec] if bias_vec is not None else None,
