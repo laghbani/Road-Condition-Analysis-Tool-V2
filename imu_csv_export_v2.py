@@ -624,7 +624,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     # --- export peak media ----------------------------------------------
     uniq: list[tuple[float, str]] = []
     if getattr(self, "peak_exports", None):
-        uniq = [(pt, lbl) for pt, lbl, flag in self.peak_exports if flag]
+        uniq = [(pt, lbl) for pt, _, lbl, flag in self.peak_exports if flag]
     elif hasattr(self, "iso_metrics") and self.iso_metrics:
         topic0 = next(iter(self.dfs))
         peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])

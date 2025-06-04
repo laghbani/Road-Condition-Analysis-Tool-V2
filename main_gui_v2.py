@@ -631,14 +631,14 @@ class LabelManagerDialog(QDialog):
 class PeakExportDialog(QDialog):
     """Dialog to manage which peaks should be exported."""
 
-    def __init__(self, peaks: list[tuple[float, str, bool]], parent=None):
+    def __init__(self, peaks: list[tuple[float, str, str, bool]], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Peak Save Management")
-        self.resize(300, 300)
+        self.resize(500, 400)
 
         self.tbl = QTableWidget(self)
-        self.tbl.setColumnCount(3)
-        self.tbl.setHorizontalHeaderLabels(["Time [s]", "Label", "Export"])
+        self.tbl.setColumnCount(4)
+        self.tbl.setHorizontalHeaderLabels(["Time [s]", "Topic", "Label", "Export"])
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.itemChanged.connect(self._item_changed)
 
@@ -656,17 +656,20 @@ class PeakExportDialog(QDialog):
 
         self.set_peaks(peaks)
 
-    def set_peaks(self, peaks: list[tuple[float, str, bool]]) -> None:
+    def set_peaks(self, peaks: list[tuple[float, str, str, bool]]) -> None:
+        peaks = sorted(peaks, key=lambda x: (x[1], x[0]))
         self.tbl.setRowCount(len(peaks))
-        for i, (t, lbl, export) in enumerate(peaks):
+        for i, (t, topic, lbl, export) in enumerate(peaks):
             it0 = QTableWidgetItem(f"{t:.2f}")
-            it1 = QTableWidgetItem(lbl)
-            it2 = QTableWidgetItem()
-            it2.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            it2.setCheckState(Qt.Checked if export else Qt.Unchecked)
+            it1 = QTableWidgetItem(topic)
+            it2 = QTableWidgetItem(lbl)
+            it3 = QTableWidgetItem()
+            it3.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            it3.setCheckState(Qt.Checked if export else Qt.Unchecked)
             self.tbl.setItem(i, 0, it0)
             self.tbl.setItem(i, 1, it1)
             self.tbl.setItem(i, 2, it2)
+            self.tbl.setItem(i, 3, it3)
             self._color_row(i, export)
 
     def _color_row(self, row: int, export: bool) -> None:
@@ -677,7 +680,7 @@ class PeakExportDialog(QDialog):
                 item.setBackground(col)
 
     def _item_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() == 2:
+        if item.column() == 3:
             export = item.checkState() == Qt.Checked
             self._color_row(item.row(), export)
 
@@ -686,14 +689,15 @@ class PeakExportDialog(QDialog):
         for r in rows:
             self.tbl.removeRow(r)
 
-    def result(self) -> list[tuple[float, str, bool]]:
+    def result(self) -> list[tuple[float, str, str, bool]]:
         res = []
         for r in range(self.tbl.rowCount()):
             t = float(self.tbl.item(r, 0).text())
-            lbl = self.tbl.item(r, 1).text()
-            chk = self.tbl.item(r, 2)
+            topic = self.tbl.item(r, 1).text()
+            lbl = self.tbl.item(r, 2).text()
+            chk = self.tbl.item(r, 3)
             export = chk.checkState() == Qt.Checked if chk else False
-            res.append((t, lbl, export))
+            res.append((t, topic, lbl, export))
         return res
 
 
@@ -819,6 +823,7 @@ class MainWindow(QMainWindow):
         # Track-Segmente zur Synchronisation von Verifikations-Ansicht
         self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
         self.legend_data: Dict[object, Tuple[list, list]] = {}
+        self.show_legend: bool = False
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.OVERRIDE_FIRST
@@ -829,7 +834,12 @@ class MainWindow(QMainWindow):
         self.use_max_peak: bool = False
 
         # Peak export management
-        self.peak_exports: list[tuple[float, str, bool]] = []
+        # (time, topic, label, export flag)
+        self.peak_exports: list[tuple[float, str, str, bool]] = []
+
+        # Track current peak when switching video topics
+        self.current_peak_time: float | None = None
+        self.current_peak_topic: str | None = None
 
         # Video/PointCloud playback
         self.video_topic: str | None = None
@@ -1050,6 +1060,11 @@ class MainWindow(QMainWindow):
         self.act_show_peaks.triggered.connect(lambda: self._draw_plots())
         m_view.addAction(self.act_show_peaks)
 
+        self.act_show_legend = QAction("Show legend", self, checkable=True)
+        self.act_show_legend.setChecked(False)
+        self.act_show_legend.triggered.connect(self._toggle_legend)
+        m_view.addAction(self.act_show_legend)
+
         act_check = QAction("Export Readiness …", self)
         act_check.setEnabled(False)
         act_check.triggered.connect(self._check_export_status)
@@ -1258,51 +1273,43 @@ class MainWindow(QMainWindow):
         self._update_peak_exports()
 
     def _update_peak_exports(self) -> None:
-        """Update list of peaks for export with deduplication."""
-        topic0 = next(iter(self.dfs))
-        if self.iso_metrics:
-            peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
-        else:
-            peaks = []
+        """Collect peaks from all topics for export."""
+        all_peaks: list[tuple[float, str, str]] = []  # time, topic, label
+        for topic, df in self.dfs.items():
+            peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+            times = df.loc[peaks, "time"].to_numpy() if len(peaks) else np.array([], dtype=float)
+            labels = df.loc[peaks, "label_name"].to_numpy() if len(peaks) else np.array([], dtype=object)
 
-        df0 = self.dfs[topic0]
-        peak_times_rel = df0.loc[peaks, "time"].to_numpy() if len(peaks) else np.array([], dtype=float)
-        labels = df0.loc[peaks, "label_name"].to_numpy() if len(peaks) else np.array([], dtype=object)
+            patches = self.label_patches_track.get(topic, [])
+            for trel, lbl in zip(times, labels):
+                if lbl == UNKNOWN_NAME:
+                    for s, e, name in patches:
+                        if s <= trel <= e:
+                            lbl = name
+                            break
+                all_peaks.append((trel, topic, lbl))
+            for s, e, name in patches:
+                all_peaks.append(((s + e) / 2, topic, name))
 
-        patches = self.label_patches_track.get(topic0, [])
-        fixed_labels: list[str] = []
-        for trel, lbl in zip(peak_times_rel, labels):
-            if lbl == UNKNOWN_NAME:
-                for s, e, name in patches:
-                    if s <= trel <= e:
-                        lbl = name
-                        break
-            fixed_labels.append(lbl)
-
-        # also consider labeled segments that do not coincide with detected peaks
-        for s, e, name in patches:
-            peak_times_rel = np.append(peak_times_rel, (s + e) / 2)
-            fixed_labels.append(name)
-
-        pairs = sorted(zip(peak_times_rel, fixed_labels))
-        tol = min(0.5, self.peak_distance / 2)
-        uniq: list[tuple[float, str]] = []
-        for pt, lbl in pairs:
+        all_peaks.sort(key=lambda x: x[0])
+        new_list: list[tuple[float, str, str, bool]] = []
+        last_time: float | None = None
+        for pt, topic, lbl in all_peaks:
             if lbl == UNKNOWN_NAME:
                 continue
-            if not uniq or pt - uniq[-1][0] > tol:
-                uniq.append((pt, lbl))
-
-        new_list: list[tuple[float, str, bool]] = []
-        for pt, lbl in uniq:
+            export = True
+            if last_time is not None and pt - last_time < 0.5:
+                export = False
+            else:
+                last_time = pt
             found = False
-            for old_pt, old_lbl, flag in self.peak_exports:
-                if abs(old_pt - pt) < 1e-3 and old_lbl == lbl:
-                    new_list.append((pt, lbl, flag))
+            for old_pt, old_topic, old_lbl, flag in self.peak_exports:
+                if abs(old_pt - pt) < 1e-3 and old_topic == topic and old_lbl == lbl:
+                    new_list.append((pt, topic, lbl, flag))
                     found = True
                     break
             if not found:
-                new_list.append((pt, lbl, True))
+                new_list.append((pt, topic, lbl, export))
         self.peak_exports = new_list
 
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
@@ -1440,6 +1447,7 @@ class MainWindow(QMainWindow):
                 uniq = dict(zip(l, h))
                 self.legend_data[ax_tr] = (list(uniq.values()), list(uniq.keys()))
 
+        self._update_legends()
         self.canvas.draw_idle()
         log.debug("Plots updated")
         if getattr(self, "tabs", None) and self.tabs.currentIndex() == 1:
@@ -1448,6 +1456,19 @@ class MainWindow(QMainWindow):
     def _span_selected(self, topic: str, xmin: float, xmax: float) -> None:
         self.current_span[topic] = (xmin, xmax)
         self.last_selected_topic = topic
+
+    def _update_legends(self) -> None:
+        for ax, (h, l) in self.legend_data.items():
+            if self.show_legend:
+                ax.legend(h, l)
+            else:
+                leg = ax.get_legend()
+                if leg:
+                    leg.remove()
+
+    def _toggle_legend(self, checked: bool) -> None:
+        self.show_legend = checked
+        self._update_legends()
 
     def _restore_labels(self, ax, topic: str) -> None:
         df = self.dfs[topic]
@@ -1542,21 +1563,30 @@ class MainWindow(QMainWindow):
 
     def _change_video_topic(self, t: str) -> None:
         self.video_topic = t if t else None
-        vframes = self.video_frames_by_topic.get(t, [])
-        pframes = self.pc_frames_by_topic.get(self.pc_topic, [])
-        vtimes = self.video_times_by_topic.get(t, [])
-        times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
-        self.tab_vpc.load_arrays(vframes, pframes, times_rel)
+        if self.current_peak_time is not None and self.current_peak_topic is not None:
+            self._show_peak_video(self.current_peak_topic, self.current_peak_time)
+        else:
+            vframes = self.video_frames_by_topic.get(t, [])
+            pframes = self.pc_frames_by_topic.get(self.pc_topic, [])
+            vtimes = self.video_times_by_topic.get(t, [])
+            times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
+            self.tab_vpc.load_arrays(vframes, pframes, times_rel)
 
     def _change_pc_topic(self, t: str) -> None:
         self.pc_topic = t if t else None
-        vframes = self.video_frames_by_topic.get(self.video_topic, [])
-        pframes = self.pc_frames_by_topic.get(t, [])
-        vtimes = self.video_times_by_topic.get(self.video_topic or "", [])
-        times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
-        self.tab_vpc.load_arrays(vframes, pframes, times_rel)
+        if self.current_peak_time is not None and self.current_peak_topic is not None:
+            self._show_peak_video(self.current_peak_topic, self.current_peak_time)
+        else:
+            vframes = self.video_frames_by_topic.get(self.video_topic, [])
+            pframes = self.pc_frames_by_topic.get(t, [])
+            vtimes = self.video_times_by_topic.get(self.video_topic or "", [])
+            times_rel = [vt - (self.t0 or 0.0) for vt in vtimes]
+            self.tab_vpc.load_arrays(vframes, pframes, times_rel)
 
     def _show_peak_video(self, topic: str, t_peak: float) -> None:
+        self.current_peak_time = t_peak
+        self.current_peak_topic = topic
+
         vid_topic = self.video_topic or ""
         pc_topic = self.pc_topic or ""
         vframes = self.video_frames_by_topic.get(vid_topic, [])
