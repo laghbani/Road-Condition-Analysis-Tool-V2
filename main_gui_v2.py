@@ -179,7 +179,7 @@ ANOMALY_TYPES: Dict[str, Dict[str, str | int]] = {
     "depression": {"score": 4, "color": "#FF0000"},
     "cover": {"score": 2, "color": "#FFA500"},
     "cobble road/ traditional road": {"score": 1, "color": "#FFFF00"},
-    "transverse grove": {"score": 1, "color": "#00FF00"},
+    "transverse grove": {"score": 1, "color": "#008000"},
     "gravel road": {"score": 4, "color": "#FAF2A1"},
     "cracked / irregular pavement and aspahlt": {"score": 2, "color": "#E06D06"},
     "bump": {"score": 1, "color": "#54F2F2"},

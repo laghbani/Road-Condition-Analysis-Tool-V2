@@ -25,7 +25,7 @@ ANOMALY_COLORS = {
     "depression": "#FF0000",
     "cover": "#FFA500",
     "cobble road/ traditional road": "#FFFF00",
-    "transverse grove": "#00FF00",
+    "transverse grove": "#008000",
     "gravel road": "#FAF2A1",
     "cracked / irregular pavement and aspahlt": "#E06D06",
     "bump": "#54F2F2",
@@ -576,6 +576,8 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
                 f"[{topic}]  μ(accel_corr_x, accel_corr_y, accel_corr_z) = {vec_mean.round(2)}  "
                 f" RMS(|a_corr|) = {rms_corr:.2f}"
             )
+            header["accel_corr_mean_mps2"] = [round(x, 3) for x in vec_mean]
+            header["accel_corr_rms_mps2"] = round(rms_corr, 3)
 
             def _conv(o):
                 if isinstance(o, np.ndarray):
