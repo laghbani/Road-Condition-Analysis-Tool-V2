@@ -1321,7 +1321,8 @@ class MainWindow(QMainWindow):
                             break
                 all_peaks.append((trel, topic, lbl))
             for s, e, name in patches:
-                all_peaks.append(((s + e) / 2, topic, name))
+                if not np.any((times >= s) & (times <= e)):
+                    all_peaks.append(((s + e) / 2, topic, name))
 
         all_peaks.sort(key=lambda x: x[0])
         new_list: list[tuple[float, str, str, bool]] = []
