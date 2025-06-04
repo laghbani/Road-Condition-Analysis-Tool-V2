@@ -1259,19 +1259,15 @@ class MainWindow(QMainWindow):
 
     def _update_peak_exports(self) -> None:
         """Update list of peaks for export with deduplication."""
-        if not self.iso_metrics:
-            self.peak_exports = []
-            return
-
         topic0 = next(iter(self.dfs))
-        peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
-        if not peaks:
-            self.peak_exports = []
-            return
+        if self.iso_metrics:
+            peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+        else:
+            peaks = []
 
         df0 = self.dfs[topic0]
-        peak_times_rel = df0.loc[peaks, "time"].to_numpy()
-        labels = df0.loc[peaks, "label_name"].to_numpy()
+        peak_times_rel = df0.loc[peaks, "time"].to_numpy() if len(peaks) else np.array([], dtype=float)
+        labels = df0.loc[peaks, "label_name"].to_numpy() if len(peaks) else np.array([], dtype=object)
 
         patches = self.label_patches_track.get(topic0, [])
         fixed_labels: list[str] = []

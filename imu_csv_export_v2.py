@@ -622,61 +622,59 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
         save_map(gps_health, dest / f"{bag_root.stem}_health.html")
 
     # --- export peak media ----------------------------------------------
-    if hasattr(self, "iso_metrics") and self.iso_metrics:
-        if getattr(self, "peak_exports", None):
-            uniq = [(pt, lbl) for pt, lbl, flag in self.peak_exports if flag]
-        else:
-            topic0 = next(iter(self.dfs))
-            peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
-            if len(peaks):
-                df0 = self.dfs[topic0]
-                peak_times = df0.loc[peaks, "time"].to_numpy()
-                labels = df0.loc[peaks, "label_name"].to_numpy()
-                pairs = sorted(zip(peak_times, labels))
-                tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
-                uniq = []
-                for pt, lbl in pairs:
-                    if lbl == UNKNOWN_NAME:
-                        continue
-                    if not uniq or pt - uniq[-1][0] > tol:
-                        uniq.append((pt, lbl))
-            else:
-                uniq = []
-        if uniq:
-            media_dir = dest / "peaks"
-            media_dir.mkdir(parents=True, exist_ok=True)
-            pre = getattr(self.tab_vpc, "spn_pre", None)
-            post = getattr(self.tab_vpc, "spn_post", None)
-            pre = pre.value() if pre else 2.0
-            post = post.value() if post else 2.0
-            t0 = self.t0 or 0.0
-            for pt, lbl in uniq:
-                safe_lbl = lbl.replace("/", "__").strip()
-                pdir = media_dir / f"{pt:.2f}_{safe_lbl}"
-                pdir.mkdir(parents=True, exist_ok=True)
-                for vtopic, frames in self.video_frames_by_topic.items():
-                    times = self.video_times_by_topic.get(vtopic, [])
-                    tr = np.array(times) - t0
-                    start = pt - pre
-                    end = pt + post
-                    i0 = int(np.searchsorted(tr, start, "left"))
-                    i1 = int(np.searchsorted(tr, end, "right"))
-                    for j, fr in enumerate(frames[i0:i1]):
-                        img = _img_to_bgr(fr)
-                        img_path = pdir / f"{vtopic.strip('/').replace('/', '__')}_{j:03d}.png"
-                        if img is not None:
-                            cv2.imwrite(str(img_path), img)
-                for ptopic, frames in self.pc_frames_by_topic.items():
-                    times = self.pc_times_by_topic.get(ptopic, [])
-                    tr = np.array(times) - t0
-                    start = pt - pre
-                    end = pt + post
-                    i0 = int(np.searchsorted(tr, start, "left"))
-                    i1 = int(np.searchsorted(tr, end, "right"))
-                    for j, pc in enumerate(frames[i0:i1]):
-                        pts = _pc_to_xyz(pc)
-                        pc_path = pdir / f"{ptopic.strip('/').replace('/', '__')}_{j:03d}.pcd"
-                        _save_pcd(pc_path, pts)
+    uniq: list[tuple[float, str]] = []
+    if getattr(self, "peak_exports", None):
+        uniq = [(pt, lbl) for pt, lbl, flag in self.peak_exports if flag]
+    elif hasattr(self, "iso_metrics") and self.iso_metrics:
+        topic0 = next(iter(self.dfs))
+        peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+        if len(peaks):
+            df0 = self.dfs[topic0]
+            peak_times = df0.loc[peaks, "time"].to_numpy()
+            labels = df0.loc[peaks, "label_name"].to_numpy()
+            pairs = sorted(zip(peak_times, labels))
+            tol = min(0.5, getattr(self, "peak_distance", 0.5) / 2)
+            for pt, lbl in pairs:
+                if lbl == UNKNOWN_NAME:
+                    continue
+                if not uniq or pt - uniq[-1][0] > tol:
+                    uniq.append((pt, lbl))
+
+    if uniq:
+        media_dir = dest / "peaks"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        pre = getattr(self.tab_vpc, "spn_pre", None)
+        post = getattr(self.tab_vpc, "spn_post", None)
+        pre = pre.value() if pre else 2.0
+        post = post.value() if post else 2.0
+        t0 = self.t0 or 0.0
+        for pt, lbl in uniq:
+            safe_lbl = lbl.replace("/", "__").strip()
+            pdir = media_dir / f"{pt:.2f}_{safe_lbl}"
+            pdir.mkdir(parents=True, exist_ok=True)
+            for vtopic, frames in self.video_frames_by_topic.items():
+                times = self.video_times_by_topic.get(vtopic, [])
+                tr = np.array(times) - t0
+                start = pt - pre
+                end = pt + post
+                i0 = int(np.searchsorted(tr, start, "left"))
+                i1 = int(np.searchsorted(tr, end, "right"))
+                for j, fr in enumerate(frames[i0:i1]):
+                    img = _img_to_bgr(fr)
+                    img_path = pdir / f"{vtopic.strip('/').replace('/', '__')}_{j:03d}.png"
+                    if img is not None:
+                        cv2.imwrite(str(img_path), img)
+            for ptopic, frames in self.pc_frames_by_topic.items():
+                times = self.pc_times_by_topic.get(ptopic, [])
+                tr = np.array(times) - t0
+                start = pt - pre
+                end = pt + post
+                i0 = int(np.searchsorted(tr, start, "left"))
+                i1 = int(np.searchsorted(tr, end, "right"))
+                for j, pc in enumerate(frames[i0:i1]):
+                    pts = _pc_to_xyz(pc)
+                    pc_path = pdir / f"{ptopic.strip('/').replace('/', '__')}_{j:03d}.pcd"
+                    _save_pcd(pc_path, pts)
 
     progress.set_bar_value(len(self.dfs))
     progress.accept()
