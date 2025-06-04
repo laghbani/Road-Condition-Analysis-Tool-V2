@@ -818,6 +818,7 @@ class MainWindow(QMainWindow):
         self.label_patches: Dict[str, List[Tuple[float, float, object]]] = {}
         # Track-Segmente zur Synchronisation von Verifikations-Ansicht
         self.label_patches_track: Dict[str, List[Tuple[float, float, str]]] = {}
+        self.legend_data: Dict[object, Tuple[list, list]] = {}
 
         self.mount_overrides: dict[str, np.ndarray] = DEFAULT_OVERRIDES.copy()
         self.rot_mode: RotMode = RotMode.OVERRIDE_FIRST
@@ -1258,20 +1259,16 @@ class MainWindow(QMainWindow):
 
     def _update_peak_exports(self) -> None:
         """Update list of peaks for export with deduplication."""
-        if not self.iso_metrics:
-            self.peak_exports = []
-            return
-
         topic0 = next(iter(self.dfs))
-        peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
-        if not peaks:
-            self.peak_exports = []
-            return
+        if self.iso_metrics:
+            peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
+        else:
+            peaks = []
 
         df0 = self.dfs[topic0]
-        peak_times_abs = df0.loc[peaks, "time_abs"].to_numpy()
-        peak_times_rel = df0.loc[peaks, "time"].to_numpy()
-        labels = df0.loc[peaks, "label_name"].to_numpy()
+        peak_times_rel = df0.loc[peaks, "time"].to_numpy() if len(peaks) else np.array([], dtype=float)
+        labels = df0.loc[peaks, "label_name"].to_numpy() if len(peaks) else np.array([], dtype=object)
+
         patches = self.label_patches_track.get(topic0, [])
         fixed_labels: list[str] = []
         for trel, lbl in zip(peak_times_rel, labels):
@@ -1281,7 +1278,13 @@ class MainWindow(QMainWindow):
                         lbl = name
                         break
             fixed_labels.append(lbl)
-        pairs = sorted(zip(peak_times_abs, fixed_labels))
+
+        # also consider labeled segments that do not coincide with detected peaks
+        for s, e, name in patches:
+            peak_times_rel = np.append(peak_times_rel, (s + e) / 2)
+            fixed_labels.append(name)
+
+        pairs = sorted(zip(peak_times_rel, fixed_labels))
         tol = min(0.5, self.peak_distance / 2)
         uniq: list[tuple[float, str]] = []
         for pt, lbl in pairs:
@@ -1398,7 +1401,7 @@ class MainWindow(QMainWindow):
             self._restore_labels(ax, topic)
             h, l = ax.get_legend_handles_labels()
             uniq = dict(zip(l, h))
-            ax.legend(uniq.values(), uniq.keys(), loc="upper right")
+            self.legend_data[ax] = (list(uniq.values()), list(uniq.keys()))
             self.ax_topic[ax] = topic
 
             # Span-Selector
@@ -1433,7 +1436,9 @@ class MainWindow(QMainWindow):
                 ax_tr.set_yticks([])
                 ax_tr.set_xlabel("Zeit ab Start [s]")
                 ax_tr.set_title("Label-Track")
-                ax_tr.legend(fontsize="x-small", ncol=3, loc="upper right")
+                h, l = ax_tr.get_legend_handles_labels()
+                uniq = dict(zip(l, h))
+                self.legend_data[ax_tr] = (list(uniq.values()), list(uniq.keys()))
 
         self.canvas.draw_idle()
         log.debug("Plots updated")
@@ -1684,7 +1689,7 @@ class MainWindow(QMainWindow):
         self.label_patches_track.setdefault(topic, []).append((xmin, xmax, lname))
         h, l = ax.get_legend_handles_labels()
         uniq = dict(zip(l, h))
-        ax.legend(uniq.values(), uniq.keys(), loc="upper right", ncol=2)
+        self.legend_data[ax] = (list(uniq.values()), list(uniq.keys()))
         self.canvas.draw_idle()
 
     def _delete_label_range(self, topic: str, xmin: float, xmax: float) -> None:
