@@ -606,7 +606,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
         
 
     if gps_df is not None and not gps_df.empty:
-        topic0 = next(iter(self.dfs))
+        topic0 = self.peak_source_topic or next(iter(self.dfs))
         df0 = self.dfs[topic0]
         gps_comfort = prepare_gps(gps_df, df0, True,
                                   self.peak_threshold, self.peak_distance, self.use_max_peak)
@@ -626,7 +626,7 @@ def export_csv_smart_v2(self, gps_df: pd.DataFrame | None = None) -> None:
     if getattr(self, "peak_exports", None):
         uniq = [(pt, lbl) for pt, lbl, flag in self.peak_exports if flag]
     elif hasattr(self, "iso_metrics") and self.iso_metrics:
-        topic0 = next(iter(self.dfs))
+        topic0 = self.peak_source_topic or next(iter(self.dfs))
         peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
         if len(peaks):
             df0 = self.dfs[topic0]

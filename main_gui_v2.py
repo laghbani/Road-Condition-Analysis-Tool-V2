@@ -390,6 +390,7 @@ class TopicDialog(QDialog):
         self.listw = QListWidget()
         self.listw.setSelectionMode(QListWidget.NoSelection)
         self.listw.setDragDropMode(QListWidget.InternalMove)
+        self.listw.setToolTip("Erstes Topic = Peak-Quelle")
         for t in topics:
             it = QListWidgetItem(t)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
@@ -631,10 +632,17 @@ class LabelManagerDialog(QDialog):
 class PeakExportDialog(QDialog):
     """Dialog to manage which peaks should be exported."""
 
-    def __init__(self, peaks: list[tuple[float, str, bool]], parent=None):
+    def __init__(self, peaks: list[tuple[float, str, bool]], topics: list[str], current: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Peak Save Management")
         self.resize(300, 300)
+
+        hl = QHBoxLayout()
+        hl.addWidget(QLabel("Peaks aus Topic:"))
+        self.cmb_topic = QComboBox()
+        self.cmb_topic.addItems(topics)
+        self.cmb_topic.setCurrentText(current)
+        hl.addWidget(self.cmb_topic)
 
         self.tbl = QTableWidget(self)
         self.tbl.setColumnCount(3)
@@ -650,11 +658,34 @@ class PeakExportDialog(QDialog):
         btns.rejected.connect(self.reject)
 
         v = QVBoxLayout(self)
+        v.addLayout(hl)
         v.addWidget(self.tbl)
         v.addWidget(btn_del)
         v.addWidget(btns)
 
         self.set_peaks(peaks)
+
+class MissingPeakDialog(QDialog):
+    """Dialog shown when no labeled peaks are found."""
+
+    def __init__(self, rows: list[tuple[float, str, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("No labeled peaks found")
+        self.resize(360, 240)
+        tbl = QTableWidget(self)
+        tbl.setColumnCount(3)
+        tbl.setHorizontalHeaderLabels(["Time [s]", "Label", "Reason"])
+        tbl.verticalHeader().setVisible(False)
+        tbl.setRowCount(len(rows))
+        for i, (t, lbl, reason) in enumerate(rows):
+            tbl.setItem(i, 0, QTableWidgetItem(f"{t:.2f}"))
+            tbl.setItem(i, 1, QTableWidgetItem(lbl))
+            tbl.setItem(i, 2, QTableWidgetItem(reason))
+        btn = QDialogButtonBox(QDialogButtonBox.Ok)
+        btn.accepted.connect(self.accept)
+        v = QVBoxLayout(self)
+        v.addWidget(tbl)
+        v.addWidget(btn)
 
     def set_peaks(self, peaks: list[tuple[float, str, bool]]) -> None:
         self.tbl.setRowCount(len(peaks))
@@ -686,7 +717,7 @@ class PeakExportDialog(QDialog):
         for r in rows:
             self.tbl.removeRow(r)
 
-    def result(self) -> list[tuple[float, str, bool]]:
+    def result(self) -> tuple[str, list[tuple[float, str, bool]]]:
         res = []
         for r in range(self.tbl.rowCount()):
             t = float(self.tbl.item(r, 0).text())
@@ -694,7 +725,7 @@ class PeakExportDialog(QDialog):
             chk = self.tbl.item(r, 2)
             export = chk.checkState() == Qt.Checked if chk else False
             res.append((t, lbl, export))
-        return res
+        return self.cmb_topic.currentText(), res
 
 
 # ===========================================================================
@@ -811,6 +842,7 @@ class MainWindow(QMainWindow):
 
         # Runtime-State
         self.active_topics: list[str] = []
+        self.peak_source_topic: str | None = None
         self.ax_topic: dict[object, str] = {}
         self.span_selector: dict[str, SpanSelector] = {}
         self.current_span: dict[str, Tuple[float, float]] = {}
@@ -882,6 +914,11 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.btn_add)
         hl.addWidget(self.btn_edit)
         hl.addWidget(self.btn_del)
+        self.chk_label_all = QCheckBox("Label all topics")
+        self.chk_label_all.setToolTip("wirkt auf alle angezeigten Topics")
+        self.chk_label_all.toggled.connect(self.act_label_all.setChecked)
+        self.act_label_all.toggled.connect(self.chk_label_all.setChecked)
+        hl.addWidget(self.chk_label_all)
         hl.addStretch()
 
         self.tabs.addTab(w_plot, "Plots")
@@ -916,6 +953,8 @@ class MainWindow(QMainWindow):
         topics = self.settings.value("active_topics")
         if isinstance(topics, list):
             self.active_topics = [str(t) for t in topics]
+        if self.active_topics and self.peak_source_topic is None:
+            self.peak_source_topic = self.active_topics[0]
 
     def closeEvent(self, e) -> None:
         self.settings.setValue("geom", self.saveGeometry())
@@ -1259,7 +1298,7 @@ class MainWindow(QMainWindow):
 
     def _update_peak_exports(self) -> None:
         """Update list of peaks for export with deduplication."""
-        topic0 = next(iter(self.dfs))
+        topic0 = self.peak_source_topic or next(iter(self.dfs))
         if self.iso_metrics:
             peaks = self.iso_metrics.get(topic0, {}).get("peaks", [])
         else:
@@ -1305,6 +1344,22 @@ class MainWindow(QMainWindow):
                 new_list.append((pt, lbl, True))
         self.peak_exports = new_list
 
+    def _count_unmatched_labels(self) -> int:
+        """Return number of labeled segments without a detected peak."""
+        topic = self.peak_source_topic or (self.active_topics[0] if self.active_topics else None)
+        if topic is None:
+            return 0
+        peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
+        df = self.dfs.get(topic)
+        if df is None:
+            return 0
+        ptimes = df.loc[peaks, "time"].to_numpy() if len(peaks) else np.array([], float)
+        count = 0
+        for s, e, _ in self.label_patches_track.get(topic, []):
+            if not np.any((ptimes >= s) & (ptimes <= e)):
+                count += 1
+        return count
+
     def _resolve_rotation(self, topic: str, df: pd.DataFrame) -> np.ndarray | None:
         auto = auto_vehicle_frame(df, self._gps_df)
         ov = self.mount_overrides.get(topic)
@@ -1342,6 +1397,8 @@ class MainWindow(QMainWindow):
                 sel.append(t)
 
         self.active_topics = sel
+        if self.active_topics:
+            self.peak_source_topic = self.active_topics[0]
 
     # ------------------------------------------------------------------ Plots
     def _draw_plots(self, verify: bool = False) -> None:
@@ -1394,7 +1451,8 @@ class MainWindow(QMainWindow):
                 if self.act_show_peaks.isChecked():
                     peaks = self.iso_metrics.get(topic, {}).get("peaks", [])
                     if len(peaks):
-                        ax.plot(df.loc[peaks, "time"], df.loc[peaks, "awv"], "k*", markersize=8, label="peaks")
+                        colors = ["#aaaaaa" if n == UNKNOWN_NAME else "#54F2F2" for n in df.loc[peaks, "label_name"]]
+                        ax.scatter(df.loc[peaks, "time"], df.loc[peaks, "awv"], marker="*", s=80, c=colors, label="peaks")
             if row == rows - 1:
                 ax.set_xlabel("Zeit ab Start [s]")
             ax.set_ylabel("m/s²")
@@ -1716,6 +1774,15 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
+        peaks = self.iso_metrics.get(t, {}).get("peaks", [])
+        df = self.dfs[t]
+        if peaks.size:
+            times = df.loc[peaks, "time"].to_numpy()
+            if not np.any((times >= xmin) & (times <= xmax)):
+                QMessageBox = _get_qt_widget(self, "QMessageBox")
+                if QMessageBox is not None:
+                    QMessageBox.information(self, "Info", "Segment deckt keinen Peak ab – bitte vergrößern")
+                return
         targets = self.active_topics if self.act_label_all.isChecked() else [t]
         for topic in targets:
             self.undo.push(AddLabelCmd(self, topic, xmin, xmax, lname))
@@ -1728,6 +1795,15 @@ class MainWindow(QMainWindow):
         if xmax <= xmin:
             return
         lname = self.cmb.currentData()
+        peaks = self.iso_metrics.get(t, {}).get("peaks", [])
+        df = self.dfs[t]
+        if peaks.size:
+            times = df.loc[peaks, "time"].to_numpy()
+            if not np.any((times >= xmin) & (times <= xmax)):
+                QMessageBox = _get_qt_widget(self, "QMessageBox")
+                if QMessageBox is not None:
+                    QMessageBox.information(self, "Info", "Segment deckt keinen Peak ab – bitte vergrößern")
+                return
         targets = self.active_topics if self.act_label_all.isChecked() else [t]
         for topic in targets:
             self.undo.push(EditLabelCmd(self, topic, xmin, xmax, lname))
@@ -1782,7 +1858,12 @@ class MainWindow(QMainWindow):
             return
         self.peak_threshold, self.peak_distance, self.use_max_peak = dlg.result()
         self._preprocess_all()
+        lost = self._count_unmatched_labels()
         self._draw_plots()
+        if lost:
+            self.statusBar().setStyleSheet("background: yellow")
+            self.statusBar().showMessage(f"{lost} Peaks wurden unlabeled", 5000)
+            QTimer.singleShot(5000, lambda: self.statusBar().setStyleSheet(""))
 
     def _open_label_manager(self) -> None:
         dlg = LabelManagerDialog(self.dfs, self)
@@ -1803,12 +1884,22 @@ class MainWindow(QMainWindow):
     def _open_peak_export_manager(self) -> None:
         self._update_peak_exports()
         if not self.peak_exports:
-            QMessageBox.information(self, "Info", "No labeled peaks found.")
+            topic = self.peak_source_topic or (self.active_topics[0] if self.active_topics else "")
+            rows: list[tuple[float, str, str]] = []
+            df = self.dfs.get(topic)
+            peaks = self.iso_metrics.get(topic, {}).get("peaks", []) if topic else []
+            ptimes = df.loc[peaks, "time"].to_numpy() if df is not None and len(peaks) else np.array([])
+            for s, e, lbl in self.label_patches_track.get(topic, []):
+                reason = ""
+                if not np.any((ptimes >= s) & (ptimes <= e)):
+                    reason = "Segment deckt den Peak nicht ab"
+                rows.append(((s + e) / 2, lbl, reason))
+            MissingPeakDialog(rows, self).exec()
             return
-        dlg = PeakExportDialog(self.peak_exports, self)
+        dlg = PeakExportDialog(self.peak_exports, self.active_topics, self.peak_source_topic or self.active_topics[0], self)
         if dlg.exec() != QDialog.Accepted:
             return
-        self.peak_exports = dlg.result()
+        self.peak_source_topic, self.peak_exports = dlg.result()
 
     def _set_weighting(self, comfort: bool) -> None:
         self.iso_comfort = comfort
@@ -1865,6 +1956,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Note", "Activate at least one topic.")
             return
         self.active_topics = sel
+        self.peak_source_topic = self.active_topics[0]
         self._draw_plots()
 
     def _show_help(self) -> None:
