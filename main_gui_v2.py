@@ -631,16 +631,26 @@ class LabelManagerDialog(QDialog):
 class PeakExportDialog(QDialog):
     """Dialog to manage which peaks should be exported."""
 
-    def __init__(self, peaks: list[tuple[float, str, str, bool]], parent=None):
+    def __init__(self, peaks: list[tuple[float, str, str, bool]],
+                 gap: float, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Peak Save Management")
         self.resize(500, 400)
+
+        self.min_gap = gap
 
         self.tbl = QTableWidget(self)
         self.tbl.setColumnCount(4)
         self.tbl.setHorizontalHeaderLabels(["Time [s]", "Topic", "Label", "Export"])
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.itemChanged.connect(self._item_changed)
+
+        self.spin_gap = QDoubleSpinBox()
+        self.spin_gap.setDecimals(2)
+        self.spin_gap.setRange(0.1, 10.0)
+        self.spin_gap.setSingleStep(0.1)
+        self.spin_gap.setValue(gap)
+        self.spin_gap.valueChanged.connect(self._apply_gap)
 
         btn_del = QPushButton("Delete selected")
         btn_del.clicked.connect(self._delete_selected)
@@ -651,6 +661,10 @@ class PeakExportDialog(QDialog):
 
         v = QVBoxLayout(self)
         v.addWidget(self.tbl)
+        hl_gap = QHBoxLayout()
+        hl_gap.addWidget(QLabel("Min gap [s]:"))
+        hl_gap.addWidget(self.spin_gap)
+        v.addLayout(hl_gap)
         v.addWidget(btn_del)
         v.addWidget(btns)
 
@@ -689,7 +703,26 @@ class PeakExportDialog(QDialog):
         for r in rows:
             self.tbl.removeRow(r)
 
-    def result(self) -> list[tuple[float, str, str, bool]]:
+    def _apply_gap(self) -> None:
+        self.min_gap = self.spin_gap.value()
+        rows = list(range(self.tbl.rowCount()))
+        rows.sort(key=lambda r: (self.tbl.item(r, 1).text(), float(self.tbl.item(r, 0).text())))
+        last: dict[str, float] = {}
+        for r in rows:
+            t = float(self.tbl.item(r, 0).text())
+            topic = self.tbl.item(r, 1).text()
+            chk = self.tbl.item(r, 3)
+            export = True
+            lt = last.get(topic)
+            if lt is not None and t - lt < self.min_gap:
+                export = False
+            else:
+                last[topic] = t
+            if chk:
+                chk.setCheckState(Qt.Checked if export else Qt.Unchecked)
+            self._color_row(r, export)
+
+    def result(self) -> tuple[list[tuple[float, str, str, bool]], float]:
         res = []
         for r in range(self.tbl.rowCount()):
             t = float(self.tbl.item(r, 0).text())
@@ -698,7 +731,7 @@ class PeakExportDialog(QDialog):
             chk = self.tbl.item(r, 3)
             export = chk.checkState() == Qt.Checked if chk else False
             res.append((t, topic, lbl, export))
-        return res
+        return res, self.min_gap
 
 
 # ===========================================================================
@@ -836,6 +869,7 @@ class MainWindow(QMainWindow):
         # Peak export management
         # (time, topic, label, export flag)
         self.peak_exports: list[tuple[float, str, str, bool]] = []
+        self.peak_export_gap: float = 0.5
 
         # Track current peak when switching video topics
         self.current_peak_time: float | None = None
@@ -1291,17 +1325,18 @@ class MainWindow(QMainWindow):
             for s, e, name in patches:
                 all_peaks.append(((s + e) / 2, topic, name))
 
-        all_peaks.sort(key=lambda x: x[0])
+        all_peaks.sort(key=lambda x: (x[1], x[0]))
         new_list: list[tuple[float, str, str, bool]] = []
-        last_time: float | None = None
+        last_time: dict[str, float] = {}
         for pt, topic, lbl in all_peaks:
             if lbl == UNKNOWN_NAME:
                 continue
             export = True
-            if last_time is not None and pt - last_time < 0.5:
+            lt = last_time.get(topic)
+            if lt is not None and pt - lt < self.peak_export_gap:
                 export = False
             else:
-                last_time = pt
+                last_time[topic] = pt
             found = False
             for old_pt, old_topic, old_lbl, flag in self.peak_exports:
                 if abs(old_pt - pt) < 1e-3 and old_topic == topic and old_lbl == lbl:
@@ -1469,6 +1504,8 @@ class MainWindow(QMainWindow):
     def _toggle_legend(self, checked: bool) -> None:
         self.show_legend = checked
         self._update_legends()
+        if hasattr(self, "canvas"):
+            self.canvas.draw_idle()
 
     def _restore_labels(self, ax, topic: str) -> None:
         df = self.dfs[topic]
@@ -1835,10 +1872,10 @@ class MainWindow(QMainWindow):
         if not self.peak_exports:
             QMessageBox.information(self, "Info", "No labeled peaks found.")
             return
-        dlg = PeakExportDialog(self.peak_exports, self)
+        dlg = PeakExportDialog(self.peak_exports, self.peak_export_gap, self)
         if dlg.exec() != QDialog.Accepted:
             return
-        self.peak_exports = dlg.result()
+        self.peak_exports, self.peak_export_gap = dlg.result()
 
     def _set_weighting(self, comfort: bool) -> None:
         self.iso_comfort = comfort
@@ -1860,6 +1897,7 @@ class MainWindow(QMainWindow):
             "rot_mode": self.rot_mode.name,
             "peak_threshold": self.peak_threshold,
             "peak_distance": self.peak_distance,
+            "peak_export_gap": self.peak_export_gap,
             "use_max_peak": self.use_max_peak,
             "iso_comfort": self.iso_comfort,
         }
@@ -1878,6 +1916,7 @@ class MainWindow(QMainWindow):
         self.rot_mode = RotMode[data.get("rot_mode", self.rot_mode.name)]
         self.peak_threshold = float(data.get("peak_threshold", self.peak_threshold))
         self.peak_distance = float(data.get("peak_distance", self.peak_distance))
+        self.peak_export_gap = float(data.get("peak_export_gap", self.peak_export_gap))
         self.use_max_peak = bool(data.get("use_max_peak", self.use_max_peak))
         self.iso_comfort = bool(data.get("iso_comfort", self.iso_comfort))
         self.act_comfort.setChecked(self.iso_comfort)
