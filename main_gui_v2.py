@@ -1272,6 +1272,7 @@ class MainWindow(QMainWindow):
         df0 = self.dfs[topic0]
         peak_times_rel = df0.loc[peaks, "time"].to_numpy()
         labels = df0.loc[peaks, "label_name"].to_numpy()
+
         patches = self.label_patches_track.get(topic0, [])
         fixed_labels: list[str] = []
         for trel, lbl in zip(peak_times_rel, labels):
@@ -1281,6 +1282,12 @@ class MainWindow(QMainWindow):
                         lbl = name
                         break
             fixed_labels.append(lbl)
+
+        # also consider labeled segments that do not coincide with detected peaks
+        for s, e, name in patches:
+            peak_times_rel = np.append(peak_times_rel, (s + e) / 2)
+            fixed_labels.append(name)
+
         pairs = sorted(zip(peak_times_rel, fixed_labels))
         tol = min(0.5, self.peak_distance / 2)
         uniq: list[tuple[float, str]] = []
