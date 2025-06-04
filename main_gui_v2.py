@@ -93,7 +93,7 @@ try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QTimer
+    from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, pyqtSlot, QTimer
     from PyQt5.QtGui import QKeySequence, QPainter, QImage, QColor
 except ImportError:
     from PySide6.QtWidgets import (
@@ -108,7 +108,7 @@ except ImportError:
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except Exception:
         QWebEngineView = None
-    from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal, QTimer
+    from PySide6.QtCore import Qt, QSettings, QThread, Signal as pyqtSignal, Slot as pyqtSlot, QTimer
     from PySide6.QtGui import QKeySequence, QPainter, QImage, QColor
 
 # ---------------------------------------------------------------------------#
@@ -707,6 +707,7 @@ class MissingPeakDialog(QDialog):
             if item:
                 item.setBackground(col)
 
+    @pyqtSlot(QTableWidgetItem)
     def _item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() == 2:
             export = item.checkState() == Qt.Checked
