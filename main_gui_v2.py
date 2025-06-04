@@ -706,18 +706,16 @@ class PeakExportDialog(QDialog):
     def _apply_gap(self) -> None:
         self.min_gap = self.spin_gap.value()
         rows = list(range(self.tbl.rowCount()))
-        rows.sort(key=lambda r: (self.tbl.item(r, 1).text(), float(self.tbl.item(r, 0).text())))
-        last: dict[str, float] = {}
+        rows.sort(key=lambda r: float(self.tbl.item(r, 0).text()))
+        last_time: float | None = None
         for r in rows:
             t = float(self.tbl.item(r, 0).text())
-            topic = self.tbl.item(r, 1).text()
             chk = self.tbl.item(r, 3)
             export = True
-            lt = last.get(topic)
-            if lt is not None and t - lt < self.min_gap:
+            if last_time is not None and t - last_time < self.min_gap:
                 export = False
             else:
-                last[topic] = t
+                last_time = t
             if chk:
                 chk.setCheckState(Qt.Checked if export else Qt.Unchecked)
             self._color_row(r, export)
@@ -1325,18 +1323,17 @@ class MainWindow(QMainWindow):
             for s, e, name in patches:
                 all_peaks.append(((s + e) / 2, topic, name))
 
-        all_peaks.sort(key=lambda x: (x[1], x[0]))
+        all_peaks.sort(key=lambda x: x[0])
         new_list: list[tuple[float, str, str, bool]] = []
-        last_time: dict[str, float] = {}
+        last_time: float | None = None
         for pt, topic, lbl in all_peaks:
             if lbl == UNKNOWN_NAME:
                 continue
             export = True
-            lt = last_time.get(topic)
-            if lt is not None and pt - lt < self.peak_export_gap:
+            if last_time is not None and pt - last_time < self.peak_export_gap:
                 export = False
             else:
-                last_time[topic] = pt
+                last_time = pt
             found = False
             for old_pt, old_topic, old_lbl, flag in self.peak_exports:
                 if abs(old_pt - pt) < 1e-3 and old_topic == topic and old_lbl == lbl:
