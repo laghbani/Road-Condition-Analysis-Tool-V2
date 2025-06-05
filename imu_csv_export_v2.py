@@ -278,6 +278,7 @@ def _save_pcd(path: Path, pts: np.ndarray) -> None:
         f"POINTS {len(pts)}\n"
         "DATA ascii\n"
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write(header)
         np.savetxt(f, pts, fmt="%.3f")
