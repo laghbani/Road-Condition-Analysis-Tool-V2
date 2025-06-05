@@ -21,7 +21,7 @@ from matplotlib.figure import Figure
 
 
 class StatsTab(QWidget):
-    """Display total and labeled data point counts per class from exported CSV files."""
+    """Display data point and group counts per class from exported CSV files."""
 
     def __init__(self, colors: dict[str, str], unknown_name: str, parent=None) -> None:
         super().__init__(parent)
@@ -66,8 +66,8 @@ class StatsTab(QWidget):
         self.lbl_path.setText(str(folder))
         csv_files = list(folder.rglob("*.csv"))
         csv_files = [f for f in csv_files if not f.name.endswith("_track.csv")]
-        total_counts = defaultdict(int)
-        labeled_counts = defaultdict(int)
+        dp_counts = defaultdict(int)
+        grp_counts = defaultdict(int)
         for csv in csv_files:
             try:
                 df = pd.read_csv(csv)
@@ -77,40 +77,39 @@ class StatsTab(QWidget):
                 continue
             labels = df["label_name"].fillna(self.unknown_name)
             for lbl, cnt in labels.value_counts().items():
-                total_counts[str(lbl)] += int(cnt)
-            labeled = labels[labels != self.unknown_name]
-            for lbl, cnt in labeled.value_counts().items():
-                labeled_counts[str(lbl)] += int(cnt)
-        self._plot_stats(total_counts, labeled_counts)
+                dp_counts[str(lbl)] += int(cnt)
+            seg_id = (labels != labels.shift()).cumsum()
+            for _, grp in labels.groupby(seg_id):
+                grp_counts[str(grp.iloc[0])] += 1
+        self._plot_stats(dp_counts, grp_counts)
 
-    def _plot_stats(self, total_counts: dict[str, int], labeled_counts: dict[str, int]) -> None:
+    def _plot_stats(self, dp_counts: dict[str, int], grp_counts: dict[str, int]) -> None:
         self.fig.clear()
-        if not total_counts:
+        if not dp_counts and not grp_counts:
             self.canvas.draw()
             return
 
-        all_labels = sorted(set(total_counts) | set(labeled_counts))
-        total_vals = [total_counts.get(lbl, 0) for lbl in all_labels]
-        labeled_vals = [labeled_counts.get(lbl, 0) for lbl in all_labels]
+        all_labels = sorted(set(dp_counts) | set(grp_counts))
+        dp_vals = [dp_counts.get(lbl, 0) for lbl in all_labels]
+        grp_vals = [grp_counts.get(lbl, 0) for lbl in all_labels]
         cols = [self.colors.get(lbl, "#808080") for lbl in all_labels]
 
         ax1 = self.fig.add_subplot(211)
         x = range(len(all_labels))
-        w = 0.4
-        ax1.bar([i - w/2 for i in x], total_vals, width=w, label="All Points", color=cols, alpha=0.5)
-        ax1.bar([i + w/2 for i in x], labeled_vals, width=w, label="Labeled Points", color=cols, alpha=0.9)
+        bar1 = ax1.bar(x, dp_vals, label="Data Points", color=cols, alpha=0.7)
+        bar2 = ax1.bar(x, grp_vals, label="Groups", color="black", alpha=0.2)
         ax1.set_xticks(list(x))
         ax1.set_xticklabels(all_labels, rotation=45)
         ax1.set_ylabel("Count")
-        ax1.set_title("All vs. Labeled Points per Class")
+        ax1.set_title("Data Points (solid color) vs. Groups (gray overlay)")
         ax1.legend()
 
         ax2 = self.fig.add_subplot(212)
-        if sum(labeled_vals) > 0:
-            ax2.pie(labeled_vals, labels=all_labels, colors=cols, autopct="%1.1f%%", startangle=140)
+        if sum(dp_vals) > 0:
+            ax2.pie(dp_vals, labels=all_labels, colors=cols, autopct="%1.1f%%", startangle=140)
         else:
-            ax2.text(0.5, 0.5, "No labeled data", ha="center", va="center")
-        ax2.set_title("Share of Labeled Data Points per Class")
+            ax2.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax2.set_title("Share of Data Points per Class")
 
         self.fig.tight_layout()
         self.canvas.draw()
