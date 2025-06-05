@@ -21,6 +21,10 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QProgressBar,
     QTextBrowser,
+    QSpinBox,
+    QDoubleSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -30,7 +34,7 @@ class TrainWorker(QThread):
 
     progress = pyqtSignal(int)
     log = pyqtSignal(str)
-    finished = pyqtSignal(str)
+    finished = pyqtSignal(str, dict)
 
     def __init__(
         self,
@@ -126,10 +130,11 @@ class TrainWorker(QThread):
 
             with torch.no_grad():
                 preds = model(Xte).argmax(1).numpy()
-            rep = classification_report(yte.numpy(), preds)
-            self.finished.emit(rep)
+            rep_str = classification_report(yte.numpy(), preds)
+            rep_dict = classification_report(yte.numpy(), preds, output_dict=True)
+            self.finished.emit(rep_str, rep_dict)
         except Exception as exc:  # pragma: no cover - just log
-            self.finished.emit(f"Error: {exc}")
+            self.finished.emit(f"Error: {exc}", {})
 
 
 class TrainingTab(QWidget):
@@ -151,6 +156,20 @@ class TrainingTab(QWidget):
         hl.addWidget(self.btn_browse)
         vbox.addLayout(hl)
 
+        par = QHBoxLayout()
+        par.addWidget(QLabel("Epochs:"))
+        self.sp_epochs = QSpinBox()
+        self.sp_epochs.setRange(1, 1000)
+        self.sp_epochs.setValue(20)
+        par.addWidget(self.sp_epochs)
+        par.addWidget(QLabel("LR:"))
+        self.sp_lr = QDoubleSpinBox()
+        self.sp_lr.setDecimals(5)
+        self.sp_lr.setRange(1e-5, 1.0)
+        self.sp_lr.setValue(1e-3)
+        par.addWidget(self.sp_lr)
+        vbox.addLayout(par)
+
         self.btn_train = QPushButton("Train model")
         self.btn_train.clicked.connect(self._train)
         vbox.addWidget(self.btn_train)
@@ -160,6 +179,9 @@ class TrainingTab(QWidget):
 
         self.txt = QTextBrowser()
         vbox.addWidget(self.txt, 1)
+
+        self.table = QTableWidget()
+        vbox.addWidget(self.table)
 
     # ------------------------------------------------------------------
     def _browse(self) -> None:
@@ -172,16 +194,46 @@ class TrainingTab(QWidget):
         self.btn_train.setEnabled(False)
         self.progress.setValue(0)
         self.txt.clear()
-        self.worker = TrainWorker(self.folder, self.label_map, self.unknown_id)
+        self.table.clear()
+        self.worker = TrainWorker(
+            self.folder,
+            self.label_map,
+            self.unknown_id,
+            epochs=self.sp_epochs.value(),
+            lr=self.sp_lr.value(),
+        )
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self._append)
         self.worker.finished.connect(self._done)
         self.worker.start()
 
-    def _done(self, msg: str) -> None:
+    def _done(self, rep_str: str, rep_dict: dict) -> None:
         self.progress.setValue(100)
-        self._append(msg)
+        self._append(rep_str)
+        self._populate_table(rep_dict)
         self.btn_train.setEnabled(True)
 
     def _append(self, text: str) -> None:
         self.txt.append(text)
+
+    def _populate_table(self, rep: dict) -> None:
+        if not rep:
+            return
+        headers = ["Class", "Prec", "Recall", "F1", "Support"]
+        rows = [k for k in rep.keys() if isinstance(rep[k], dict)]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(rows))
+        for r, cls in enumerate(rows):
+            d = rep[cls]
+            vals = [
+                cls,
+                f"{d['precision']:.2f}",
+                f"{d['recall']:.2f}",
+                f"{d['f1-score']:.2f}",
+                str(d['support']),
+            ]
+            for c, val in enumerate(vals):
+                self.table.setItem(r, c, QTableWidgetItem(val))
+        self.table.resizeColumnsToContents()
+
