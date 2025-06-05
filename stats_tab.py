@@ -42,7 +42,7 @@ class StatsTab(QWidget):
         vbox.addLayout(hl)
 
         # ----- plot -----
-        self.fig = Figure(figsize=(5, 4))
+        self.fig = Figure(figsize=(6, 5))
         self.canvas = FigureCanvas(self.fig)
         vbox.addWidget(self.canvas, stretch=1)
 
@@ -105,17 +105,30 @@ class StatsTab(QWidget):
         grp_vals = [grp_counts.get(lbl, 0) for lbl in all_labels]
         cols = [self.colors.get(lbl, "#808080") for lbl in all_labels]
 
+        total_dp = sum(dp_vals)
+
+        # scale unknown bar to half height for visual clarity
+        dp_display = dp_vals[:]
+        grp_display = grp_vals[:]
+        if self.unknown_name in all_labels:
+            idx = all_labels.index(self.unknown_name)
+            dp_display[idx] = dp_display[idx] / 2
+            grp_display[idx] = grp_display[idx] / 2
+
         x = range(len(all_labels))
         width = 0.4
 
         ax1 = self.fig.add_subplot(211)
-        ax1.bar([i - width/2 for i in x], dp_vals, width=width, label="Data Points", color=cols, alpha=0.9)
-        ax1.bar([i + width/2 for i in x], grp_vals, width=width, label="Groups", color="black", alpha=0.6)
+        ax1.bar([i - width/2 for i in x], dp_display, width=width, label="Data Points", color=cols, alpha=0.9)
+        ax1.bar([i + width/2 for i in x], grp_display, width=width, label="Groups", color="black", alpha=0.6)
 
-        for i, val in enumerate(dp_vals):
-            ax1.text(i - width/2, val + max(dp_vals) * 0.01, str(val), ha="center", va="bottom", fontsize=8)
-        for i, val in enumerate(grp_vals):
-            ax1.text(i + width/2, val + max(grp_vals) * 0.01, str(val), ha="center", va="bottom", fontsize=8, color="black")
+        for i, (orig, disp) in enumerate(zip(dp_vals, dp_display)):
+            ax1.text(i - width/2, disp + max(dp_display) * 0.01, str(orig), ha="center", va="bottom", fontsize=8)
+        for i, (orig, disp) in enumerate(zip(grp_vals, grp_display)):
+            ax1.text(i + width/2, disp + max(grp_display) * 0.01, str(orig), ha="center", va="bottom", fontsize=8, color="black")
+
+        ax1.text(0.99, 0.98, f"Total: {total_dp}", transform=ax1.transAxes,
+                 ha="right", va="top", fontsize=9)
 
         ax1.set_xticks(x)
         ax1.set_xticklabels(all_labels, rotation=45, ha="right", fontsize=8)
@@ -125,9 +138,11 @@ class StatsTab(QWidget):
 
         ax2 = self.fig.add_subplot(212)
         if sum(dp_vals) > 0:
-            ax2.pie(dp_vals, labels=all_labels, colors=cols, autopct="%1.1f%%", startangle=140)
+            ax2.pie(dp_vals, labels=all_labels, colors=cols, autopct="%1.1f%%", startangle=140, radius=1.2)
+            ax2.set_aspect('equal')
         else:
             ax2.text(0.5, 0.5, "No data", ha="center", va="center")
+            ax2.set_aspect('equal')
         ax2.set_title("Share of Labeled Data Points")
 
         self.fig.tight_layout()
