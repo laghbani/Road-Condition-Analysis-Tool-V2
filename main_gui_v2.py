@@ -479,7 +479,7 @@ class MountDialog(QDialog):
 
     @staticmethod
     def _axes_widget(R: np.ndarray):
-        fig = Figure(figsize=(5.5, 5.5))
+        fig = Figure(figsize=(4.5, 4.5))
         canvas = FigureCanvas(fig)
         ax = fig.add_subplot(111, projection="3d")
         ax.set_xlim([-1, 1])
