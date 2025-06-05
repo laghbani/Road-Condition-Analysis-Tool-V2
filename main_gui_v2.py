@@ -133,6 +133,7 @@ try:
     from iso_weighting import calc_awv
     from progress_ui import ProgressWindow
     from videopc_widget import VideoPointCloudTab
+    from stats_tab import StatsTab
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -946,6 +947,12 @@ class MainWindow(QMainWindow):
         self.tab_vpc.cmb_video.currentTextChanged.connect(self._change_video_topic)
         self.tab_vpc.cmb_pc.currentTextChanged.connect(self._change_pc_topic)
 
+        # ------------------------------------------------------ Stats
+        colors = {n: d["color"] for n, d in ANOMALY_TYPES.items()}
+        colors[UNKNOWN_NAME] = UNKNOWN_COLOR
+        self.tab_stats = StatsTab(colors, UNKNOWN_NAME)
+        self.tabs.addTab(self.tab_stats, "Stats")
+
         self.tabs.currentChanged.connect(self._tab_changed)
 
     # ------------------------------------------------------------------ Settings
@@ -983,8 +990,7 @@ class MainWindow(QMainWindow):
 
         self.act_export = QAction("&Export CSV", self)
         self.act_export.setEnabled(False)
-        self.act_export.triggered.connect(
-            lambda: export_csv_smart_v2(self, gps_df=self._gps_df))
+        self.act_export.triggered.connect(self._export_and_show_stats)
         m_file.addAction(self.act_export)
 
         act_save_cfg = QAction("Save settings …", self)
@@ -1875,6 +1881,15 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         self.peak_exports, self.peak_export_gap = dlg.result()
+
+    def _export_and_show_stats(self) -> None:
+        export_csv_smart_v2(self, gps_df=self._gps_df)
+        if hasattr(self, "last_export_dir"):
+            try:
+                self.tab_stats.load_folder(self.last_export_dir)
+                self.tabs.setCurrentWidget(self.tab_stats)
+            except Exception:
+                pass
 
     def _set_weighting(self, comfort: bool) -> None:
         self.iso_comfort = comfort
