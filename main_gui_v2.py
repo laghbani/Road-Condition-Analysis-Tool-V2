@@ -449,6 +449,7 @@ class MountDialog(QDialog):
             "Topic", "Override aktiv", "Edit", "Ist-Achsen", "Neu-Achsen"
         ])
         self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tbl.verticalHeader().setDefaultSectionSize(120)
         for row, t in enumerate(topics):
             item = QTableWidgetItem(t)
             item.setFlags(Qt.ItemIsEnabled)
@@ -478,7 +479,7 @@ class MountDialog(QDialog):
 
     @staticmethod
     def _axes_widget(R: np.ndarray):
-        fig = Figure(figsize=(3.5, 3.5))
+        fig = Figure(figsize=(5.5, 5.5))
         canvas = FigureCanvas(fig)
         ax = fig.add_subplot(111, projection="3d")
         ax.set_xlim([-1, 1])
