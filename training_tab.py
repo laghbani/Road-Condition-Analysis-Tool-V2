@@ -94,6 +94,9 @@ class TrainWorker(QThread):
 
             scaler = StandardScaler()
             X = scaler.fit_transform(X)
+            if not np.isfinite(X).all():
+                self.log.emit("⚠️ Invalid numeric values detected. Replacing NaNs/Infs with zero.")
+                X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
             unique, counts = np.unique(y_orig, return_counts=True)
             class_info = {uid: cnt for uid, cnt in zip(unique, counts)}
@@ -155,7 +158,8 @@ class TrainingTab(QWidget):
         super().__init__(parent)
         self.label_map = label_map
         self.unknown_id = unknown_id
-        self.folder = Path("/home/afius/Desktop/anomaly-data-hs-merseburg")
+        default = Path.home() / "Desktop/anomaly-data-hs-merseburg"
+        self.folder = default if default.exists() else Path.cwd()
 
         vbox = QVBoxLayout(self)
         hl = QHBoxLayout()
