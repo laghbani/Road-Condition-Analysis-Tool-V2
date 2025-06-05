@@ -134,6 +134,7 @@ try:
     from progress_ui import ProgressWindow
     from videopc_widget import VideoPointCloudTab
     from stats_tab import StatsTab
+    from training_tab import TrainingTab
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -952,6 +953,10 @@ class MainWindow(QMainWindow):
         colors[UNKNOWN_NAME] = UNKNOWN_COLOR
         self.tab_stats = StatsTab(colors, UNKNOWN_NAME)
         self.tabs.addTab(self.tab_stats, "Stats")
+
+        # ------------------------------------------------------ Train
+        self.tab_train = TrainingTab(MainWindow.LABEL_IDS, UNKNOWN_ID)
+        self.tabs.addTab(self.tab_train, "Train")
 
         self.tabs.currentChanged.connect(self._tab_changed)
 
