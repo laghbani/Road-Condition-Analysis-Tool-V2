@@ -49,7 +49,8 @@ class StatsTab(QWidget):
         vbox.addLayout(hl2)
 
         # ----- plot -----
-        self.fig = Figure(figsize=(7, 6))
+        # make the plot area a bit larger so that labels fit better
+        self.fig = Figure(figsize=(9, 8))
         self.canvas = FigureCanvas(self.fig)
         vbox.addWidget(self.canvas, stretch=1)
 
@@ -57,7 +58,9 @@ class StatsTab(QWidget):
         self.unknown_name = unknown_name
 
     def _browse(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select CSV Folder")
+        # open the folder selection dialog in the anomaly-data directory by default
+        start_dir = "/home/afius/Desktop/anomaly-data-hs-merseburg"
+        path = QFileDialog.getExistingDirectory(self, "Select CSV Folder", start_dir)
         if path:
             self.load_folder(path)
 
@@ -97,7 +100,11 @@ class StatsTab(QWidget):
 
         total = sum(dp_counts.values())
         unknown = dp_counts.get(self.unknown_name, 0)
-        self.lbl_totals.setText(f"Total: {total} | Unknown: {unknown}")
+        labeled = total - unknown
+        # show totals, labeled count and unknown count in the header
+        self.lbl_totals.setText(
+            f"Total: {total} | Labeled: {labeled} | Unknown: {unknown}"
+        )
 
         self._plot_stats(dp_counts, grp_counts)
 
@@ -135,7 +142,8 @@ class StatsTab(QWidget):
         for rect, val in zip(bar_dp, dp_vals):
             ax_dp.text(rect.get_x() + rect.get_width()/2, rect.get_height(), str(val), ha="center", va="bottom", fontsize=8)
 
-        bar_grp = ax_grp.bar(x, grp_vals, color="gray")
+        # color the group bars the same as the data point bars
+        bar_grp = ax_grp.bar(x, grp_vals, color=cols)
         ax_grp.set_xticks(x)
         ax_grp.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
         ax_grp.set_ylabel("Groups")
