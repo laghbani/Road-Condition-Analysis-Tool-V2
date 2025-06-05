@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pandas as pd
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QFileDialog,
 )
 
 try:
@@ -30,6 +35,9 @@ class StatsTab(QWidget):
         self.btn_browse = QPushButton("Browse…")
         self.btn_browse.clicked.connect(self._browse)
         hl.addWidget(self.btn_browse)
+        self.btn_pdf = QPushButton("Save PDF…")
+        self.btn_pdf.clicked.connect(self._save_pdf)
+        hl.addWidget(self.btn_pdf)
         hl.addStretch()
         vbox.addLayout(hl)
 
@@ -46,10 +54,18 @@ class StatsTab(QWidget):
         if path:
             self.load_folder(path)
 
+    def _save_pdf(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export Plot as PDF", "", "PDF Files (*.pdf)")
+        if path:
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            self.fig.savefig(path)
+
     def load_folder(self, folder: str | Path) -> None:
         folder = Path(folder)
         self.lbl_path.setText(str(folder))
-        csv_files = [p for p in folder.glob("*.csv") if not p.name.endswith("_track.csv")]
+        csv_files = list(folder.rglob("*.csv"))
+        csv_files = [f for f in csv_files if not f.name.endswith("_track.csv")]
         dp_counts = defaultdict(int)
         grp_counts = defaultdict(int)
         for csv in csv_files:
@@ -72,21 +88,28 @@ class StatsTab(QWidget):
         if not dp_counts and not grp_counts:
             self.canvas.draw()
             return
+
+        all_labels = sorted(set(dp_counts) | set(grp_counts))
+        dp_vals = [dp_counts.get(lbl, 0) for lbl in all_labels]
+        grp_vals = [grp_counts.get(lbl, 0) for lbl in all_labels]
+        cols = [self.colors.get(lbl, "#808080") for lbl in all_labels]
+
         ax1 = self.fig.add_subplot(211)
-        names = list(dp_counts)
-        vals = [dp_counts[n] for n in names]
-        cols = [self.colors.get(n, "#808080") for n in names]
-        ax1.bar(names, vals, color=cols)
-        ax1.set_title("Data Points per Class")
-        ax1.tick_params(axis='x', rotation=45)
+        x = range(len(all_labels))
+        ax1.bar(x, dp_vals, label="Data Points", color=cols, alpha=0.7)
+        ax1.bar(x, grp_vals, label="Groups", color="black", alpha=0.2)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(all_labels, rotation=45)
+        ax1.set_ylabel("Count")
+        ax1.set_title("Data Points (solid) vs. Groups (gray)")
+        ax1.legend()
 
         ax2 = self.fig.add_subplot(212)
-        names_g = list(grp_counts)
-        vals_g = [grp_counts[n] for n in names_g]
-        cols_g = [self.colors.get(n, "#808080") for n in names_g]
-        ax2.bar(names_g, vals_g, color=cols_g)
-        ax2.set_title("Groups per Class")
-        ax2.tick_params(axis='x', rotation=45)
+        if sum(dp_vals) > 0:
+            ax2.pie(dp_vals, labels=all_labels, colors=cols, autopct="%1.1f%%", startangle=140)
+        else:
+            ax2.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax2.set_title("Share of Data Points per Class")
 
         self.fig.tight_layout()
         self.canvas.draw()
