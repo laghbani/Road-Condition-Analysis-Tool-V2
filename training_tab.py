@@ -13,8 +13,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QFileDialog, QProgressBar, QTextBrowser
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QLabel,
+    QFileDialog,
+    QProgressBar,
+    QTextBrowser,
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -23,13 +29,24 @@ class TrainWorker(QThread):
     """Background worker that trains a simple model."""
 
     progress = pyqtSignal(int)
+    log = pyqtSignal(str)
     finished = pyqtSignal(str)
 
-    def __init__(self, folder: Path, label_map: Dict[str, int], unknown_id: int) -> None:
+    def __init__(
+        self,
+        folder: Path,
+        label_map: Dict[str, int],
+        unknown_id: int,
+        *,
+        epochs: int = 20,
+        lr: float = 1e-3,
+    ) -> None:
         super().__init__()
         self.folder = folder
         self.label_map = label_map
         self.unknown_id = unknown_id
+        self.epochs = epochs
+        self.lr = lr
 
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -65,6 +82,15 @@ class TrainWorker(QThread):
             scaler = StandardScaler()
             X = scaler.fit_transform(X)
 
+            unique, counts = np.unique(y, return_counts=True)
+            class_info = {uid: cnt for uid, cnt in zip(unique, counts)}
+            self.log.emit(f"Samples: {len(X)}, Features: {X.shape[1]}")
+            for uid, cnt in class_info.items():
+                name = next((n for n, i in self.label_map.items() if i == uid), str(uid))
+                self.log.emit(f"Class {name}: {cnt} samples")
+                if cnt < 50:
+                    self.log.emit(f"⚠️ More data recommended for class '{name}'")
+
             Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
             Xtr = torch.tensor(Xtr, dtype=torch.float32)
@@ -77,19 +103,26 @@ class TrainWorker(QThread):
                 nn.ReLU(),
                 nn.Linear(128, len(np.unique(y)))
             )
-            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+            params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            self.log.emit(f"Model parameters: {params}")
+            opt = torch.optim.Adam(model.parameters(), lr=self.lr)
             crit = nn.CrossEntropyLoss()
 
             loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=32, shuffle=True)
 
-            epochs = 20
-            for ep in range(epochs):
+            for ep in range(1, self.epochs + 1):
+                tloss = []
                 for xb, yb in loader:
                     opt.zero_grad()
                     loss = crit(model(xb), yb)
                     loss.backward()
                     opt.step()
-                self.progress.emit(int((ep + 1) / epochs * 100))
+                    tloss.append(float(loss))
+
+                with torch.no_grad():
+                    vloss = crit(model(Xte), yte).item()
+                self.log.emit(f"Epoch {ep}/{self.epochs} loss={np.mean(tloss):.4f} val={vloss:.4f}")
+                self.progress.emit(int(ep / self.epochs * 100))
 
             with torch.no_grad():
                 preds = model(Xte).argmax(1).numpy()
@@ -141,10 +174,14 @@ class TrainingTab(QWidget):
         self.txt.clear()
         self.worker = TrainWorker(self.folder, self.label_map, self.unknown_id)
         self.worker.progress.connect(self.progress.setValue)
+        self.worker.log.connect(self._append)
         self.worker.finished.connect(self._done)
         self.worker.start()
 
     def _done(self, msg: str) -> None:
         self.progress.setValue(100)
-        self.txt.setPlainText(msg)
+        self._append(msg)
         self.btn_train.setEnabled(True)
+
+    def _append(self, text: str) -> None:
+        self.txt.append(text)
