@@ -18,6 +18,7 @@ try:
 except Exception:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.gridspec import GridSpec
 
 
 class StatsTab(QWidget):
@@ -41,8 +42,14 @@ class StatsTab(QWidget):
         hl.addStretch()
         vbox.addLayout(hl)
 
+        hl2 = QHBoxLayout()
+        self.lbl_totals = QLabel("")
+        hl2.addWidget(self.lbl_totals)
+        hl2.addStretch()
+        vbox.addLayout(hl2)
+
         # ----- plot -----
-        self.fig = Figure(figsize=(6, 5))
+        self.fig = Figure(figsize=(7, 6))
         self.canvas = FigureCanvas(self.fig)
         vbox.addWidget(self.canvas, stretch=1)
 
@@ -88,6 +95,10 @@ class StatsTab(QWidget):
             for _, grp in labels.groupby(seg_id):
                 grp_counts[str(grp.iloc[0])] += 1
 
+        total = sum(dp_counts.values())
+        unknown = dp_counts.get(self.unknown_name, 0)
+        self.lbl_totals.setText(f"Total: {total} | Unknown: {unknown}")
+
         self._plot_stats(dp_counts, grp_counts)
 
     def _plot_stats(
@@ -100,50 +111,42 @@ class StatsTab(QWidget):
             self.canvas.draw()
             return
 
-        all_labels = sorted(set(dp_counts) | set(grp_counts))
-        dp_vals = [dp_counts.get(lbl, 0) for lbl in all_labels]
-        grp_vals = [grp_counts.get(lbl, 0) for lbl in all_labels]
-        cols = [self.colors.get(lbl, "#808080") for lbl in all_labels]
+        labels = [lbl for lbl in sorted(set(dp_counts) | set(grp_counts)) if lbl != self.unknown_name]
+        dp_vals = [dp_counts.get(lbl, 0) for lbl in labels]
+        grp_vals = [grp_counts.get(lbl, 0) for lbl in labels]
+        cols = [self.colors.get(lbl, "#808080") for lbl in labels]
 
-        total_dp = sum(dp_vals)
+        gs = self.fig.add_gridspec(2, 2)
+        ax_dp = self.fig.add_subplot(gs[0, 0])
+        ax_grp = self.fig.add_subplot(gs[0, 1])
+        ax_pie = self.fig.add_subplot(gs[1, :])
 
-        # scale unknown bar to half height for visual clarity
-        dp_display = dp_vals[:]
-        grp_display = grp_vals[:]
-        if self.unknown_name in all_labels:
-            idx = all_labels.index(self.unknown_name)
-            dp_display[idx] = dp_display[idx] / 2
-            grp_display[idx] = grp_display[idx] / 2
+        x = range(len(labels))
+        width = 0.6
 
-        x = range(len(all_labels))
-        width = 0.4
+        bar_dp = ax_dp.bar(x, dp_vals, color=cols)
+        ax_dp.set_xticks(x)
+        ax_dp.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax_dp.set_ylabel("Data Points")
+        ax_dp.set_title("Data Points per Class")
+        for rect, val in zip(bar_dp, dp_vals):
+            ax_dp.text(rect.get_x() + rect.get_width()/2, rect.get_height(), str(val), ha="center", va="bottom", fontsize=8)
 
-        ax1 = self.fig.add_subplot(211)
-        ax1.bar([i - width/2 for i in x], dp_display, width=width, label="Data Points", color=cols, alpha=0.9)
-        ax1.bar([i + width/2 for i in x], grp_display, width=width, label="Groups", color="black", alpha=0.6)
+        bar_grp = ax_grp.bar(x, grp_vals, color="gray")
+        ax_grp.set_xticks(x)
+        ax_grp.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax_grp.set_ylabel("Groups")
+        ax_grp.set_title("Groups per Class")
+        for rect, val in zip(bar_grp, grp_vals):
+            ax_grp.text(rect.get_x() + rect.get_width()/2, rect.get_height(), str(val), ha="center", va="bottom", fontsize=8)
 
-        for i, (orig, disp) in enumerate(zip(dp_vals, dp_display)):
-            ax1.text(i - width/2, disp + max(dp_display) * 0.01, str(orig), ha="center", va="bottom", fontsize=8)
-        for i, (orig, disp) in enumerate(zip(grp_vals, grp_display)):
-            ax1.text(i + width/2, disp + max(grp_display) * 0.01, str(orig), ha="center", va="bottom", fontsize=8, color="black")
-
-        ax1.text(0.99, 0.98, f"Total: {total_dp}", transform=ax1.transAxes,
-                 ha="right", va="top", fontsize=9)
-
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(all_labels, rotation=45, ha="right", fontsize=8)
-        ax1.set_ylabel("Count")
-        ax1.set_title("Data Points vs. Group Segments per Class")
-        ax1.legend()
-
-        ax2 = self.fig.add_subplot(212)
         if sum(dp_vals) > 0:
-            ax2.pie(dp_vals, labels=all_labels, colors=cols, autopct="%1.1f%%", startangle=140, radius=1.2)
-            ax2.set_aspect('equal')
+            ax_pie.pie(dp_vals, labels=labels, colors=cols, autopct="%1.1f%%", startangle=140, radius=1.4)
+            ax_pie.set_aspect('equal')
         else:
-            ax2.text(0.5, 0.5, "No data", ha="center", va="center")
-            ax2.set_aspect('equal')
-        ax2.set_title("Share of Labeled Data Points")
+            ax_pie.text(0.5, 0.5, "No data", ha="center", va="center")
+            ax_pie.set_aspect('equal')
+        ax_pie.set_title("Share of Labeled Data Points")
 
         self.fig.tight_layout()
         self.canvas.draw()
