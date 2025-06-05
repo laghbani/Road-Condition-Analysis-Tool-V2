@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QListWidget,
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -71,8 +72,8 @@ class TrainWorker(QThread):
                 else:
                     continue
                 feat_cols = [c for c in df.columns if c not in {"time", "label_id", "label_name", "classification"}]
-                X = df[feat_cols]
-                X["_y"] = y.astype(int)
+                X = df[feat_cols].copy()
+                X.loc[:, "_y"] = y.astype(int)
                 dfs.append(X)
 
             if not dfs:
@@ -156,6 +157,10 @@ class TrainingTab(QWidget):
         hl.addWidget(self.btn_browse)
         vbox.addLayout(hl)
 
+        self.list_files = QListWidget()
+        vbox.addWidget(self.list_files)
+        self._update_file_list()
+
         par = QHBoxLayout()
         par.addWidget(QLabel("Epochs:"))
         self.sp_epochs = QSpinBox()
@@ -189,12 +194,14 @@ class TrainingTab(QWidget):
         if path:
             self.folder = Path(path)
             self.lbl_folder.setText(path)
+            self._update_file_list()
 
     def _train(self) -> None:
         self.btn_train.setEnabled(False)
         self.progress.setValue(0)
         self.txt.clear()
         self.table.clear()
+        self._update_file_list()
         self.worker = TrainWorker(
             self.folder,
             self.label_map,
@@ -206,6 +213,18 @@ class TrainingTab(QWidget):
         self.worker.log.connect(self._append)
         self.worker.finished.connect(self._done)
         self.worker.start()
+        self._append(
+            f"Training for {self.sp_epochs.value()} epochs at lr={self.sp_lr.value():.5f}"
+        )
+
+    def _update_file_list(self) -> None:
+        """Display CSV and JSON files in the selected folder."""
+        self.list_files.clear()
+        if not self.folder.exists():
+            return
+        for ext in ("*.csv", "*.json"):
+            for file in sorted(self.folder.glob(ext)):
+                self.list_files.addItem(file.name)
 
     def _done(self, rep_str: str, rep_dict: dict) -> None:
         self.progress.setValue(100)
