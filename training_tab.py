@@ -81,17 +81,25 @@ class TrainWorker(QThread):
                 return
 
             data = pd.concat(dfs, ignore_index=True)
-            y = data.pop("_y").to_numpy()
+            y_orig = data.pop("_y").to_numpy().astype(int)
             X = data.to_numpy()
+
+            # map original IDs (incl. unknown) to contiguous indices
+            id_to_name = {v: k for k, v in self.label_map.items()}
+            id_to_name[self.unknown_id] = "unknown"
+            unique_ids = sorted(id_to_name.keys())
+            id_to_idx = {uid: i for i, uid in enumerate(unique_ids)}
+            idx_to_name = {i: id_to_name[uid] for uid, i in id_to_idx.items()}
+            y = np.array([id_to_idx.get(v, id_to_idx[self.unknown_id]) for v in y_orig], dtype=int)
 
             scaler = StandardScaler()
             X = scaler.fit_transform(X)
 
-            unique, counts = np.unique(y, return_counts=True)
+            unique, counts = np.unique(y_orig, return_counts=True)
             class_info = {uid: cnt for uid, cnt in zip(unique, counts)}
             self.log.emit(f"Samples: {len(X)}, Features: {X.shape[1]}")
             for uid, cnt in class_info.items():
-                name = next((n for n, i in self.label_map.items() if i == uid), str(uid))
+                name = id_to_name.get(uid, str(uid))
                 self.log.emit(f"Class {name}: {cnt} samples")
                 if cnt < 50:
                     self.log.emit(f"⚠️ More data recommended for class '{name}'")
@@ -106,7 +114,7 @@ class TrainWorker(QThread):
             model = nn.Sequential(
                 nn.Linear(Xtr.shape[1], 128),
                 nn.ReLU(),
-                nn.Linear(128, len(np.unique(y)))
+                nn.Linear(128, len(id_to_idx))
             )
             params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             self.log.emit(f"Model parameters: {params}")
@@ -130,9 +138,11 @@ class TrainWorker(QThread):
                 self.progress.emit(int(ep / self.epochs * 100))
 
             with torch.no_grad():
-                preds = model(Xte).argmax(1).numpy()
-            rep_str = classification_report(yte.numpy(), preds)
-            rep_dict = classification_report(yte.numpy(), preds, output_dict=True)
+                preds_idx = model(Xte).argmax(1).numpy()
+            preds_orig = [unique_ids[i] for i in preds_idx]
+            true_orig = [unique_ids[i] for i in yte.numpy()]
+            rep_str = classification_report(true_orig, preds_orig, zero_division=0)
+            rep_dict = classification_report(true_orig, preds_orig, zero_division=0, output_dict=True)
             self.finished.emit(rep_str, rep_dict)
         except Exception as exc:  # pragma: no cover - just log
             self.finished.emit(f"Error: {exc}", {})
@@ -223,8 +233,11 @@ class TrainingTab(QWidget):
         if not self.folder.exists():
             return
         for ext in ("*.csv", "*.json"):
-            for file in sorted(self.folder.glob(ext)):
-                self.list_files.addItem(file.name)
+            for file in sorted(self.folder.rglob(ext)):
+                try:
+                    self.list_files.addItem(str(file.relative_to(self.folder)))
+                except ValueError:
+                    self.list_files.addItem(file.name)
 
     def _done(self, rep_str: str, rep_dict: dict) -> None:
         self.progress.setValue(100)
