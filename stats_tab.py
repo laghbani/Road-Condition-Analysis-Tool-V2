@@ -116,17 +116,20 @@ class StatsTab(QWidget):
         grp_vals = [grp_counts.get(lbl, 0) for lbl in labels]
         cols = [self.colors.get(lbl, "#808080") for lbl in labels]
 
-        gs = self.fig.add_gridspec(2, 2)
-        ax_dp = self.fig.add_subplot(gs[0, 0])
-        ax_grp = self.fig.add_subplot(gs[0, 1])
-        ax_pie = self.fig.add_subplot(gs[1, :])
+        # layout: pie chart on the left spanning both rows and
+        # bar charts stacked on the right
+        gs = self.fig.add_gridspec(2, 2, width_ratios=[1.4, 1])
+        ax_pie = self.fig.add_subplot(gs[:, 0])
+        ax_dp = self.fig.add_subplot(gs[0, 1])
+        ax_grp = self.fig.add_subplot(gs[1, 1], sharex=ax_dp)
 
         x = range(len(labels))
         width = 0.6
 
         bar_dp = ax_dp.bar(x, dp_vals, color=cols)
         ax_dp.set_xticks(x)
-        ax_dp.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        # x labels only on the lower plot
+        ax_dp.set_xticklabels([])
         ax_dp.set_ylabel("Data Points")
         ax_dp.set_title("Data Points per Class")
         for rect, val in zip(bar_dp, dp_vals):
@@ -141,8 +144,15 @@ class StatsTab(QWidget):
             ax_grp.text(rect.get_x() + rect.get_width()/2, rect.get_height(), str(val), ha="center", va="bottom", fontsize=8)
 
         if sum(dp_vals) > 0:
-            ax_pie.pie(dp_vals, labels=labels, colors=cols, autopct="%1.1f%%", startangle=140, radius=1.4)
-            ax_pie.set_aspect('equal')
+            ax_pie.pie(
+                dp_vals,
+                labels=None,  # show only percentages
+                colors=cols,
+                autopct="%1.1f%%",
+                startangle=140,
+                radius=1.8,
+            )
+            ax_pie.set_aspect("equal")
         else:
             ax_pie.text(0.5, 0.5, "No data", ha="center", va="center")
             ax_pie.set_aspect('equal')
