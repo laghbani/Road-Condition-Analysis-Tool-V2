@@ -29,7 +29,7 @@ from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QLabel, QListWidget, QPushButton, QProgressBar,
     QSpinBox, QDoubleSpinBox, QTextBrowser, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QHBoxLayout, QWidget, QSplitter, QFormLayout, QFrame, QSlider,
-    QHeaderView
+    QHeaderView, QComboBox
 )
 
 # ───────────────────────────────────────────  Matplotlib Setup ──
@@ -88,12 +88,14 @@ class TrainWorker(QThread):
         weight_decay: float = 1e-5,
         patience: int = 5,
         keep_known: float = 0.95,
+        group_based: bool = False,
     ) -> None:
         super().__init__()
         self.folder, self.label_map = folder, label_map
         self.unknown_id = unknown_id
         self.epochs, self.lr, self.batch_size = epochs, lr, batch_size
         self.weight_decay, self.patience, self.keep_known = weight_decay, patience, keep_known
+        self.group_based = group_based
 
     # ----------------------------------------------------------------------
     def _load_csv_folder(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -123,9 +125,19 @@ class TrainWorker(QThread):
                 c for c in df.columns
                 if c not in {"time", "label_id", "label_name", "classification"}
             ]
-            X = df[feat_cols].copy()
-            X["_y"] = y.astype(int)
-            dfs.append(X)
+            df_feats = df[feat_cols].copy()
+            df_feats["_y"] = y.astype(int)
+
+            if self.group_based:
+                seg_id = (df_feats["_y"] != df_feats["_y"].shift()).cumsum()
+                grp = df_feats.groupby(seg_id)
+                X_grp = grp[feat_cols].mean()
+                y_grp = grp["_y"].first()
+                df_g = X_grp.copy()
+                df_g["_y"] = y_grp
+                dfs.append(df_g)
+            else:
+                dfs.append(df_feats)
 
         if not dfs:
             raise RuntimeError("No valid CSV files found.")
@@ -378,6 +390,10 @@ class TrainingTab(QWidget):
         self.sp_pat = QSpinBox(); self.sp_pat.setRange(1, 20); self.sp_pat.setValue(5)
         param_box.addRow("Early-Stop Patience", self.sp_pat)
 
+        self.cmb_mode = QComboBox();
+        self.cmb_mode.addItems(["Data Points", "Groups"])
+        param_box.addRow("Training Mode", self.cmb_mode)
+
         # NEU: Slider für Tabellen-Schriftgröße
         self.sl_font = QSlider(Qt.Horizontal); self.sl_font.setRange(8, 18); self.sl_font.setValue(11)
         self.sl_font.valueChanged.connect(self._set_table_font)
@@ -481,6 +497,7 @@ class TrainingTab(QWidget):
             batch_size=self.sp_batch.value(),
             weight_decay=self.sp_wd.value(),
             patience=self.sp_pat.value(),
+            group_based=self.cmb_mode.currentIndex() == 1,
         )
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self._append)
@@ -491,7 +508,7 @@ class TrainingTab(QWidget):
         self._append(
             f"Training started with epochs={self.sp_epochs.value()}  "
             f"lr={self.sp_lr.value():.5f}  batch={self.sp_batch.value()}  "
-            f"wd={self.sp_wd.value():.6f}"
+            f"wd={self.sp_wd.value():.6f}  mode={self.cmb_mode.currentText()}"
         )
 
     # ------------------------------------------------------------------
