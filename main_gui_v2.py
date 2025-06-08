@@ -813,6 +813,17 @@ class _AIDataset(Dataset):
             cols.append("speed_mps")
 
         arr = df[cols].to_numpy(np.float32)
+
+        # add derived magnitude columns if missing
+        if "|a|_raw" not in df.columns:
+            mag_a = np.linalg.norm(df[list(base)].to_numpy(np.float32), axis=1)
+            arr = np.column_stack([arr, mag_a])
+            cols.append("|a|_raw")
+        if {"gyro_x", "gyro_y", "gyro_z"}.issubset(df.columns) and "|ω|_raw" not in df.columns:
+            mag_g = np.linalg.norm(df[["gyro_x", "gyro_y", "gyro_z"]].to_numpy(np.float32), axis=1)
+            arr = np.column_stack([arr, mag_g])
+            cols.append("|ω|_raw")
+
         if add_speed and "speed_mps" in df.columns:
             idx_speed = cols.index("speed_mps")
             arr[:, idx_speed] = np.clip(arr[:, idx_speed] / speed_max, 0, 1)
