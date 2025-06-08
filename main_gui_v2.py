@@ -21,6 +21,10 @@ from enum import Enum, auto
 import logging
 import torch
 from torch.utils.data import Dataset, DataLoader
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
 
 import numpy as np
 import pandas as pd
@@ -992,6 +996,7 @@ class MainWindow(QMainWindow):
         # AI model handling
         self.ai_model_path: str | None = None
         self.ai_model: torch.nn.Module | None = None
+        self.ai_session: "ort.InferenceSession | None" = None
         self.ai_params: dict = {"window": 256, "stride": 128, "threshold": 0.9}
         self.auto_label_active: bool = False
 
@@ -2098,18 +2103,26 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- AI actions
     def _select_ai_model(self) -> None:
         start = "/home/afius/Desktop/anomaly-data-hs-merseburg/"
-        path, _ = QFileDialog.getOpenFileName(self, "Select AI model", start,
-                                             "PyTorch Model (*.pt *.pth)")
+        filt = "Model (*.pt *.pth *.onnx);;PyTorch Model (*.pt *.pth);;ONNX Model (*.onnx);;All Files (*)"
+        path, _ = QFileDialog.getOpenFileName(self, "Select AI model", start, filt)
         if not path:
             return
         try:
-            state = torch.load(path, map_location="cpu")
-            key = next(k for k in state if k.endswith("weight"))
-            c_in = state[key].shape[1]
-            self.ai_model = HybridNet(c_in, len(self.LABEL_IDS))
-            self.ai_model.load_state_dict(state)
-            self.ai_model.eval()
+            ext = pathlib.Path(path).suffix.lower()
             self.ai_model_path = path
+            self.ai_model = None
+            self.ai_session = None
+            if ext == ".onnx":
+                if ort is None:
+                    raise RuntimeError("onnxruntime not available")
+                self.ai_session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            else:
+                state = torch.load(path, map_location="cpu")
+                key = next(k for k in state if k.endswith("weight"))
+                c_in = state[key].shape[1]
+                self.ai_model = HybridNet(c_in, len(self.LABEL_IDS))
+                self.ai_model.load_state_dict(state)
+                self.ai_model.eval()
         except Exception as exc:
             QMessageBox.warning(self, "Model load", f"Failed to load model: {exc}")
 
@@ -2127,7 +2140,7 @@ class MainWindow(QMainWindow):
             self._apply_model()
 
     def _apply_model(self) -> None:
-        if self.ai_model is None:
+        if self.ai_model is None and self.ai_session is None:
             QMessageBox.information(self, "AI", "Load a model first.")
             self.act_auto_ai.setChecked(False)
             return
@@ -2136,13 +2149,20 @@ class MainWindow(QMainWindow):
                             stride=self.ai_params["stride"], add_speed=True)
             dl = DataLoader(ds, batch_size=64)
             preds: list[Tuple[int, float]] = []
+            inp_name = None
+            if self.ai_session is not None:
+                inp_name = self.ai_session.get_inputs()[0].name
             for xb in dl:
-                with torch.no_grad():
-                    lg = self.ai_model(xb)
-                    prob = torch.softmax(lg, 1)
-                    mx, cls = torch.max(prob, 1)
-                    for c, m in zip(cls, mx):
-                        preds.append((int(c), float(m)))
+                if self.ai_session is not None:
+                    logits = self.ai_session.run(None, {inp_name: xb.numpy()})[0]
+                    prob = torch.softmax(torch.from_numpy(logits), 1)
+                else:
+                    with torch.no_grad():
+                        logits = self.ai_model(xb)
+                        prob = torch.softmax(logits, 1)
+                mx, cls = torch.max(prob, 1)
+                for c, m in zip(cls, mx):
+                    preds.append((int(c), float(m)))
 
             labels = np.full(len(df), UNKNOWN_ID, int)
             conf = np.zeros(len(df), float)
