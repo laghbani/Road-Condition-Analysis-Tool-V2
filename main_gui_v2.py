@@ -794,7 +794,8 @@ class _AIDataset(Dataset):
     ]
 
     def __init__(self, df: pd.DataFrame, *, window: int, stride: int,
-                 add_speed: bool = True, fft_bins: int = 0, speed_max: float = 6):
+                 add_speed: bool = True, fft_bins: int = 0, speed_max: float = 6,
+                 min_channels: int = 0):
         super().__init__()
         self.X: list[np.ndarray] = []
         L = window
@@ -842,6 +843,13 @@ class _AIDataset(Dataset):
             self.X = [np.zeros((len(cols), L), np.float32)]
 
         self.X = np.stack(self.X).astype(np.float32)
+
+        if min_channels and self.X.shape[1] < min_channels:
+            pad = np.zeros(
+                (self.X.shape[0], min_channels - self.X.shape[1], L),
+                dtype=np.float32,
+            )
+            self.X = np.concatenate([self.X, pad], axis=1)
 
         C = self.X.shape[1]
         flat = self.X.transpose(0, 2, 1).reshape(-1, C)
@@ -1008,6 +1016,7 @@ class MainWindow(QMainWindow):
         self.ai_model_path: str | None = None
         self.ai_model: torch.nn.Module | None = None
         self.ai_session: "ort.InferenceSession | None" = None
+        self.ai_in_channels: int = 0
         self.ai_params: dict = {"window": 256, "stride": 128, "threshold": 0.9}
         self.auto_label_active: bool = False
 
@@ -2123,14 +2132,19 @@ class MainWindow(QMainWindow):
             self.ai_model_path = path
             self.ai_model = None
             self.ai_session = None
+            self.ai_in_channels = 0
             if ext == ".onnx":
                 if ort is None:
                     raise RuntimeError("onnxruntime not available")
                 self.ai_session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+                inp = self.ai_session.get_inputs()[0]
+                if len(inp.shape) >= 3 and inp.shape[1] is not None:
+                    self.ai_in_channels = int(inp.shape[1])
             else:
                 state = torch.load(path, map_location="cpu")
                 key = next(k for k in state if k.endswith("weight"))
                 c_in = state[key].shape[1]
+                self.ai_in_channels = int(c_in)
                 self.ai_model = HybridNet(c_in, len(self.LABEL_IDS))
                 self.ai_model.load_state_dict(state)
                 self.ai_model.eval()
@@ -2156,8 +2170,13 @@ class MainWindow(QMainWindow):
             self.act_auto_ai.setChecked(False)
             return
         for topic, df in self.dfs.items():
-            ds = _AIDataset(df, window=self.ai_params["window"],
-                            stride=self.ai_params["stride"], add_speed=True)
+            ds = _AIDataset(
+                df,
+                window=self.ai_params["window"],
+                stride=self.ai_params["stride"],
+                add_speed=True,
+                min_channels=self.ai_in_channels,
+            )
             dl = DataLoader(ds, batch_size=64)
             preds: list[Tuple[int, float]] = []
             inp_name = None
