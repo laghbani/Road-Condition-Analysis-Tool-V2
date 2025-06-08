@@ -1,613 +1,716 @@
-###############################################################################
-# training_tab_pro_plus.py
-# ─────────────────────────────────────────────────────────────────────────────
-# Multisensory Road-Condition Analysis – Training-Tab (Pro +  große Tabelle)
-#
-# Abhängigkeiten:
-#   PyQt5, matplotlib, numpy, pandas, scikit-learn, torch
-#   (getestet unter Python ≥3.9)
-###############################################################################
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+road_anomaly_trainer_hybrid.py
+==============================
 
-import itertools
+• GroupKFold pro CSV-Datei (kein Daten-Leakage)
+• RandomOverSampler ("not majority") gleicht Klassen aus
+• HybridNet: ConvStem → BiLSTM → Attention-Pooling
+• Focal-Loss (γ = 1, Label-Smooth = 0.05), Gradient-Clipping
+• Log-Loss-Plot, frei wählbarer Dropout (GUI)
+• Vollständiges Qt-GUI mit Confusion-Matrix, PR-Kurven, ONNX-Export
+"""
+
+# ──────────────────── BASIS-IMPORTS & LOGGING ────────────────────
+from __future__ import annotations
+import os, sys, itertools, logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.optim.lr_scheduler import OneCycleLR
+
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    precision_recall_curve, auc
+)
+from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont
-from PyQt5.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QListWidget, QPushButton, QProgressBar,
-    QSpinBox, QDoubleSpinBox, QTextBrowser, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QHBoxLayout, QWidget, QSplitter, QFormLayout, QFrame, QSlider,
-    QHeaderView
-)
+from imblearn.over_sampling import RandomOverSampler   # Oversampling
 
-# ───────────────────────────────────────────  Matplotlib Setup ──
+# ───────── Optionales Time-Warp (nur wenn torio+torchaudio da sind) ─────────
+HAVE_AUDIO = False
+
+# ─────────────────── PyQt- & Matplotlib-Setup ────────────────────
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtGui import QFont, QPalette, QColor
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QSplitter, QFileDialog, QLabel, QPushButton,
+    QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget,
+    QTableWidgetItem, QTextBrowser, QTabWidget, QVBoxLayout, QHBoxLayout,
+    QFormLayout, QFrame, QScrollArea, QHeaderView, QMessageBox
+)
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.pyplot as plt
+from numpy.fft import rfft
 
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
 plt.rcParams.update({
-    "toolbar": "None",
-    "figure.dpi": 110,
-    "axes.grid": True,
-    "grid.alpha": 0.3,
+    "toolbar": "None", "figure.dpi": 120,
+    "axes.facecolor": "#fafafa", "axes.grid": True, "grid.alpha": .25,
+    "font.size": 9,
 })
-# ────────────────────────────────────────────────────────────────
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"   # Intel-MKL Workaround
 
+# ═══════════════════ Hilfs-Funktionen + Augment ==================
+def _nice(n: int) -> str: return f"{n:,}".replace(",", " ")
 
-# ════════════════════════════════════════════════════════════════
-# Utility-Funktionen
-# ════════════════════════════════════════════════════════════════
-def _compute_oob_threshold(max_probs: np.ndarray, keep: float = 0.95) -> float:
-    """Schwellwert τ für -OOB-Erkennung."""
-    return float(np.quantile(max_probs, 1.0 - keep))
+def add_gauss(x: np.ndarray, snr_db: float = 25) -> np.ndarray:
+    pwr = np.mean(x ** 2)
+    sigma = np.sqrt(pwr / 10 ** (snr_db / 10))
+    return x + np.random.normal(0, sigma, x.shape).astype(np.float32)
 
+def sign_flip(x: np.ndarray, p: float = .5) -> np.ndarray:
+    if np.random.rand() < p: x[:3] *= -1
+    return x
 
-def _nice_number(n: int) -> str:
-    """Formatiert große Zahlen mit schmalem Leerzeichen-Tausendertrenner."""
-    return f"{n:,}".replace(",", " ")   # schmaler Space (U+00A0)
+def time_warp(x: np.ndarray, factor: float = .1) -> np.ndarray:
+    if not HAVE_AUDIO: return x
+    rate = 1 + np.random.uniform(-factor, factor)
+    ten = torch.from_numpy(x.copy()).unsqueeze(0)
+    warpd, _ = torchaudio.functional.time_stretch(ten, rate, n_freq=1)
+    return warpd.squeeze(0).numpy()
 
-
-# ════════════════════════════════════════════════════════════════
-# Train-Thread  (Daten laden, Netz trainieren, Ergebnisse emitten)
-# ════════════════════════════════════════════════════════════════
-class TrainWorker(QThread):
-    # --------------------------- Signale ------------------------------------
-    progress = pyqtSignal(int)                                  # 0-100 %
-    step = pyqtSignal(int, float, float)                        # epoch, train-loss, val-loss
-    log = pyqtSignal(str)
-    finished = pyqtSignal(
-        str,          # rep_str
-        dict,         # rep_dict
-        float,        # tau
-        object,       # cm  (np.ndarray)
-        object,       # class_weights (np.ndarray)
-        dict,         # idx_to_name
-        int,          # n_train
-        int           # n_val
-    )
-    def __init__(
-        self,
-        folder: Path,
-        label_map: Dict[str, int],
-        unknown_id: int,
-        *,
-        epochs: int = 50,
-        lr: float = 1e-3,
-        batch_size: int = 256,
-        weight_decay: float = 1e-5,
-        patience: int = 5,
-        keep_known: float = 0.95,
-    ) -> None:
+# ═══════════════════ Datensatz-Klasse ============================
+class IMUWindowDataset(Dataset):
+    EXTRA_CANDS = [
+        ("gyro_x", "gyro_y", "gyro_z"),
+        ("|a|_raw",), ("|ω|_raw",),
+    ]
+    def __init__(self, csvs: List[Path], *, label_map: Dict[str, int],
+                 window: int = 256, stride: int = 128, majority_thr: float = .7,
+                 add_speed: bool = True, fft_bins: int = 0, speed_max: float = 6,
+                 unknown_id: int = 99, augment: bool = False):
         super().__init__()
-        self.folder, self.label_map = folder, label_map
-        self.unknown_id = unknown_id
-        self.epochs, self.lr, self.batch_size = epochs, lr, batch_size
-        self.weight_decay, self.patience, self.keep_known = weight_decay, patience, keep_known
+        self.X: list[np.ndarray] = []
+        self.y: list[int] = []
+        self.grp: list[str]     = []                  # Gruppen-ID → CSV-Name
+        L = window
 
-    # ----------------------------------------------------------------------
-    def _load_csv_folder(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Alle CSVs im Ordner einlesen → X, y."""
-        dfs: List[pd.DataFrame] = []
-        csv_files = [
-            f for f in self.folder.rglob("*.csv")
-            if not f.name.endswith("_track.csv")
-        ]
-        for csv in csv_files:
+        for csv in csvs:
             try:
                 df = pd.read_csv(csv)
             except Exception:
                 continue
-
-            # Label-Spalte finden
-            if "label_id" in df.columns:
-                y = df["label_id"].fillna(self.unknown_id)
-            elif "classification" in df.columns:
-                y = df["classification"].fillna(self.unknown_id)
-            elif "label_name" in df.columns:
-                y = df["label_name"].map(self.label_map).fillna(self.unknown_id)
-            else:
+            if "label_id" not in df.columns:
                 continue
 
-            feat_cols = [
-                c for c in df.columns
-                if c not in {"time", "label_id", "label_name", "classification"}
-            ]
-            X = df[feat_cols].copy()
-            X["_y"] = y.astype(int)
-            dfs.append(X)
+            # Basis-Kanäle wählen
+            if {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(df.columns):
+                base = ["accel_veh_x", "accel_veh_y", "accel_veh_z"]
+            elif {"accel_corr_x", "accel_corr_y", "accel_corr_z"}.issubset(df.columns):
+                base = ["accel_corr_x", "accel_corr_y", "accel_corr_z"]
+            else:
+                base = ["accel_x", "accel_y", "accel_z"]
+            cols: list[str] = list(base)
+            for cand in self.EXTRA_CANDS:
+                if set(cand).issubset(df.columns):
+                    cols.extend(cand)
+            if add_speed and "speed_mps" in df.columns:
+                cols.append("speed_mps")
 
-        if not dfs:
-            raise RuntimeError("No valid CSV files found.")
+            arr = df[cols].to_numpy(np.float32)
+            lbl = df["label_id"].to_numpy(np.int16)
 
-        data = pd.concat(dfs, ignore_index=True)
-        y_orig = data.pop("_y").to_numpy(dtype=int)
-        X = data.to_numpy()
-        return X, y_orig
+            if add_speed and "speed_mps" in df.columns:
+                idx_speed = cols.index("speed_mps")
+                arr[:, idx_speed] = np.clip(arr[:, idx_speed] / speed_max, 0, 1)
 
-    # ----------------------------------------------------------------------
-    def run(self) -> None:   # Haupt-Routine (läuft im Thread)
-        try:
-            X_raw, y_orig = self._load_csv_folder()
+            for s in range(0, len(df) - L + 1, stride):
+                win_lbl = lbl[s:s+L]
+                maj = np.bincount(win_lbl).argmax()
+                if maj == unknown_id or (win_lbl == maj).mean() < majority_thr:
+                    continue
+                win = arr[s:s+L].T                     # C × L
+                if fft_bins:
+                    specs = []
+                    for c in range(3):
+                        mag = np.abs(rfft(win[c]))[:fft_bins].astype(np.float32)
+                        specs.append(np.repeat(mag[:, None], L, axis=1))
+                    win = np.concatenate([win, *specs], 0)
+                if augment:
+                    win = sign_flip(add_gauss(win))
+                self.X.append(win); self.y.append(int(maj)); self.grp.append(csv.stem)
 
-            # nur bekannte Klassen
-            mask = y_orig != self.unknown_id
-            X_known, y_known = X_raw[mask], y_orig[mask]
-            n_train_samples = len(y_known)
+        if not self.X:
+            raise RuntimeError("Keine Fenster nach Filterung übrig.")
 
-            # ID <-> Idx Mapping
-            unique_ids = sorted(set(y_known))
-            id_to_idx = {uid: i for i, uid in enumerate(unique_ids)}
-            idx_to_name = {
-                i: next(k for k, v in self.label_map.items() if v == uid)
-                for i, uid in enumerate(unique_ids)
-            }
-            y_idx = np.array([id_to_idx[v] for v in y_known], dtype=int)
+        self.X = np.stack(self.X).astype(np.float32)
+        self.y = np.array(self.y, dtype=np.int64)
+        self.grp = np.array(self.grp)
 
-            # Normalisierung
-            scaler = StandardScaler()
-            X_known = scaler.fit_transform(X_known)
-            X_known = np.nan_to_num(X_known, nan=0.0)
+        # Standard-Scaling kanalweise
+        C = self.X.shape[1]
+        flat = self.X.transpose(0, 2, 1).reshape(-1, C)
+        flat = StandardScaler().fit_transform(flat)
+        self.X = flat.reshape(-1, self.X.shape[2], C).transpose(0, 2, 1)
 
-            # Class-Weights für unbalancierte Daten
-            class_weights = compute_class_weight(
-                "balanced", classes=np.unique(y_idx), y=y_idx
-            ).astype(np.float32)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, idx): return torch.from_numpy(self.X[idx]), int(self.y[idx])
 
-            # Train / Val-Split
-            Xtr, Xte, ytr, yte = train_test_split(
-                X_known, y_idx, test_size=0.2, stratify=y_idx, random_state=42
-            )
-            n_val_samples = len(yte)
+# ═══════════════════ Modell-Blöcke ===============================
+class AttentionPool(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__(); self.w = nn.Linear(dim, 1, bias=False)
+    def forward(self, x):                # x : B × L × D
+        α = torch.softmax(self.w(x).squeeze(-1), 1)
+        return (α.unsqueeze(-1) * x).sum(1)
 
-            # Torch-Tensors
-            Xtr, Xte = map(torch.FloatTensor, (Xtr, Xte))
-            ytr, yte = map(torch.LongTensor, (ytr, yte))
-
-            # Einfaches MLP
-            model = nn.Sequential(
-                nn.Linear(Xtr.shape[1], 256),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(256, 128),
-                nn.ReLU(),
-                nn.Linear(128, len(unique_ids)),
-            )
-            opt = torch.optim.Adam(model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-            crit = nn.CrossEntropyLoss(weight=torch.tensor(class_weights))
-
-            loader = DataLoader(TensorDataset(Xtr, ytr),
-                                batch_size=self.batch_size, shuffle=True)
-
-            best_val, best_state, w_no_imp = np.inf, None, 0
-
-            # ------------------------- Training-Loop ------------------------
-            for ep in range(1, self.epochs + 1):
-                model.train()
-                tloss_sum = 0.0
-                for xb, yb in loader:
-                    opt.zero_grad()
-                    loss = crit(model(xb), yb)
-                    loss.backward()
-                    opt.step()
-                    tloss_sum += float(loss) * len(xb)
-                tloss = tloss_sum / len(Xtr)
-
-                # Validation
-                model.eval()
-                with torch.no_grad():
-                    vloss = crit(model(Xte), yte).item()
-
-                self.step.emit(ep, tloss, vloss)
-                self.progress.emit(int(ep / self.epochs * 100))
-
-                # Early-Stopping
-                if vloss < best_val - 1e-4:
-                    best_val, best_state, w_no_imp = vloss, model.state_dict(), 0
-                else:
-                    w_no_imp += 1
-                    if w_no_imp >= self.patience:
-                        self.log.emit(f"Early stopping (epoch {ep})")
-                        break
-
-            if best_state:
-                model.load_state_dict(best_state)
-
-            # ------------------------- Evaluation ---------------------------
-            model.eval()
-            with torch.no_grad():
-                probs = torch.softmax(model(Xte), dim=1)
-            conf, preds_idx = probs.max(1)
-
-            tau = _compute_oob_threshold(conf.numpy(), keep=self.keep_known)
-
-            y_true_ids = [unique_ids[int(i)] for i in yte]
-            y_pred_ids = [unique_ids[int(i)] for i in preds_idx]
-
-            rep_str = classification_report(
-                y_true_ids, y_pred_ids, zero_division=0
-            )
-            rep_dict = classification_report(
-                y_true_ids, y_pred_ids, zero_division=0, output_dict=True
-            )
-
-            cm = confusion_matrix(yte, preds_idx).astype(int)
-
-            # Signal „finished“
-            self.finished.emit(
-                rep_str, rep_dict, tau, cm, class_weights, idx_to_name,
-                n_train_samples, n_val_samples
-            )
-
-        except Exception as exc:   # Fehler → trotzdem senden
-            self.finished.emit(
-                f"Error: {exc}", {}, 0.0, np.zeros((1, 1), dtype=int),
-                np.zeros(1), {}, 0, 0
-            )
-
-
-# ════════════════════════════════════════════════════════════════
-# Matplotlib-Canvas für Live-Loss & Konfusionsmatrix
-# ════════════════════════════════════════════════════════════════
-class LiveLossCanvas(FigureCanvas):
-    """Dynamischer Train/Val-Loss-Plot."""
-
-    def __init__(self, parent=None):
-        fig, self.ax = plt.subplots()
-        super().__init__(fig)
-        self.setParent(parent)
-        self.ax.set_xlabel("Epoch")
-        self.ax.set_ylabel("Loss")
-        self.tr_line, = self.ax.plot([], [], label="Train")
-        self.val_line, = self.ax.plot([], [], label="Val")
-        self.ax.legend()
-        self.tr_vals: List[float] = []
-        self.val_vals: List[float] = []
-
-    # ------------------------------------------------------------------
-    def update(self, epoch: int, train: float, val: float):
-        self.tr_vals.append(train)
-        self.val_vals.append(val)
-        self.tr_line.set_data(range(1, len(self.tr_vals) + 1), self.tr_vals)
-        self.val_line.set_data(range(1, len(self.val_vals) + 1), self.val_vals)
-        self.ax.relim()
-        self.ax.autoscale_view()
-        self.draw_idle()
-
-
-class ConfMatCanvas(FigureCanvas):
-    """Heatmap der Konfusionsmatrix (inkl. Colorbar)."""
-
-    def __init__(self, cm: np.ndarray, idx_to_name: Dict[int, str], parent=None):
-        fig, ax = plt.subplots(figsize=(4, 4))
-        super().__init__(fig)
-        self.setParent(parent)
-
-        im = ax.imshow(cm, cmap="Blues")
-        fig.colorbar(im, ax=ax, fraction=0.046)
-
-        ax.set_title("Confusion Matrix (val)")
-        ticks = np.arange(len(idx_to_name))
-        ax.set_xticks(ticks)
-        ax.set_yticks(ticks)
-        ax.set_xticklabels(
-            [idx_to_name[i][:8] for i in ticks], rotation=45, ha="right"
+class ConvStem(nn.Module):
+    def __init__(self, c_in: int, c_out: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(c_in, c_out, 7, padding=3, bias=False),
+            nn.BatchNorm1d(c_out), nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),                     # L / 2
         )
-        ax.set_yticklabels([idx_to_name[i][:8] for i in ticks])
+    def forward(self, x): return self.net(x)
 
-        thresh = cm.max() / 2.0
+class HybridNet(nn.Module):
+    def __init__(self, c_in: int, n_cls: int,
+                 hidden: int = 128, layers: int = 2, drop: float = .5):
+        super().__init__()
+        self.in_channels = c_in
+        self.stem = ConvStem(c_in)
+        self.lstm = nn.LSTM(
+            input_size=64, hidden_size=hidden, num_layers=layers,
+            batch_first=True, bidirectional=True,
+            dropout=drop if layers > 1 else 0.)
+        self.att = AttentionPool(hidden*2)
+        self.dropout = nn.Dropout(drop)
+        self.fc = nn.Linear(hidden*2, n_cls)
+    def forward(self, x):                # x : B × C × L
+        x = self.stem(x)                 # B × 64 × L/2
+        x = x.transpose(1, 2)            # B × L/2 × 64
+        out, _ = self.lstm(x)
+        rep = self.dropout(self.att(out))
+        return self.fc(rep)
+
+# ═══════════════════ Verlust & Metriken ==========================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: torch.Tensor,
+                 gamma: float = 1.0, smooth: float = .05):
+        super().__init__(); self.register_buffer("a", alpha)
+        self.g, self.s = gamma, smooth
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, reduction="none")
+        at = self.a[targets] if self.a.numel() > 1 else 1.
+        pt = torch.exp(-ce)
+        fl = at * (1-pt)**self.g * ce
+        return (1-self.s)*fl.mean() + self.s*ce.mean()
+
+def pr_curves(y_true, y_prob, n_cls):
+    curves = {}
+    for i in range(n_cls):
+        p, r, _ = precision_recall_curve(y_true == i, y_prob[:, i])
+        curves[i] = (p, r, auc(r, p))
+    return curves
+
+def _oob_threshold(max_probs: np.ndarray, keep: float = .95) -> float:
+    return float(np.quantile(max_probs, 1-keep))
+
+# ═══════════════════ Matplotlib-Canvas -- Loss ===================
+class LossCanvas(FigureCanvas):
+    def __init__(self, parent=None):
+        fig, self.ax = plt.subplots(figsize=(6, 2))
+        super().__init__(fig); self.setParent(parent)
+        self.ax.set(title="Loss-Verlauf", xlabel="Epoch",
+                    ylabel="Loss", yscale="log")
+        (self.tr_line,) = self.ax.plot([], [], "-o", ms=3, label="Train")
+        (self.va_line,) = self.ax.plot([], [], "-o", ms=3, label="Val")
+        self.ax.legend(); self.tr_vals, self.va_vals = [], []
+    def reset(self):
+        self.tr_vals.clear(); self.va_vals.clear()
+        self.tr_line.set_data([], []); self.va_line.set_data([], [])
+        self.ax.relim(); self.ax.autoscale_view(); self.draw_idle()
+    def add_step(self, ep, tr, va):
+        self.tr_vals.append(tr); self.va_vals.append(va)
+        self.tr_line.set_data(range(1, len(self.tr_vals)+1), self.tr_vals)
+        self.va_line.set_data(range(1, len(self.va_vals)+1), self.va_vals)
+        self.ax.relim(); self.ax.autoscale_view(); self.draw_idle()
+
+# ═══════════════════ Matplotlib-Canvas -- Confusion ==============
+class ConfMatCanvas(FigureCanvas):
+    clicked = pyqtSignal(int, int)
+    def __init__(self, cm: np.ndarray, idx2name: Dict[int, str], parent=None):
+        fig, ax = plt.subplots(figsize=(6, 6))
+        super().__init__(fig); self.setParent(parent)
+        cm_pct = cm / cm.sum(axis=1, keepdims=True).clip(min=1) * 100
+        im = ax.imshow(cm_pct, cmap="Blues")
+        cbar = fig.colorbar(im, ax=ax, fraction=.046, pad=.04)
+        cbar.ax.set_ylabel("%", rotation=0, labelpad=15, weight="bold")
+        ticks = np.arange(len(idx2name))
+        ax.set_xticks(ticks); ax.set_yticks(ticks)
+        ax.set_xticklabels([idx2name[i] for i in ticks], rotation=45, ha="right")
+        ax.set_yticklabels([idx2name[i] for i in ticks])
+        ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+        ax.set_title("Confusion Matrix", fontweight="bold", pad=12)
+        thresh = cm_pct.max()/2
         for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
-            ax.text(
-                j, i,
-                cm[i, j],
-                ha="center", va="center",
-                color="white" if cm[i, j] > thresh else "black",
-            )
+            txt = f"{cm[i, j]}\n{cm_pct[i, j]:.0f}%"
+            ax.text(j, i, txt,
+                    ha="center", va="center",
+                    color="white" if cm_pct[i, j] > thresh else "black",
+                    fontsize=8, weight="bold")
+        fig.tight_layout(); self.ax = ax
+        self.mpl_connect("button_press_event", self._on_click)
+    def _on_click(self, ev):
+        if ev.inaxes != self.ax: return
+        self.clicked.emit(int(round(ev.ydata)), int(round(ev.xdata)))
+    def sizeHint(self): w, h = self.figure.get_size_inches()*self.figure.dpi
+    # -------------------------------------------------------------------------
 
-        fig.tight_layout()
+# ═══════════════════ Matplotlib-Canvas -- PR-Kurven ===============
+class PRCanvas(FigureCanvas):
+    def __init__(self, curves: Dict[int, Tuple[np.ndarray, np.ndarray, float]],
+                 idx2name: Dict[int, str], parent=None):
+        fig, ax = plt.subplots(figsize=(4, 3))
+        super().__init__(fig); self.setParent(parent)
+        for i, (p, r, au) in curves.items():
+            ax.plot(r, p, label=f"{idx2name[i]} AUC={au:.2f}")
+        ax.set(xlabel="Recall", ylabel="Precision", title="PR-Kurven")
+        ax.legend(); fig.tight_layout()
+    def sizeHint(self): w, h = self.figure.get_size_inches()*self.figure.dpi
 
+# ═══════════════════ Training-Thread ==============================
+class TrainWorker(QThread):
+    progress = pyqtSignal(int)
+    step     = pyqtSignal(int, float, float)
+    finished = pyqtSignal(dict, np.ndarray, dict, float, int, int, object, dict)
+    log      = pyqtSignal(str)
 
-# ════════════════════════════════════════════════════════════════
-# Haupt-GUI-Klasse
-# ════════════════════════════════════════════════════════════════
+    def __init__(self, folder: Path, label_map: Dict[str, int],
+                 unknown_id: int, cfg: dict):
+        super().__init__()
+        self.folder, self.map = folder, label_map
+        self.unk, self.cfg = unknown_id, cfg
+
+    def _csvs(self): return [p for p in self.folder.rglob("*.csv")
+                             if not p.name.endswith("_track.csv")]
+
+    # --------------------------------------------------------------
+    def run(self):                                     # noqa: C901
+        try:
+            csvs = self._csvs()
+            if not csvs: raise RuntimeError("Keine CSV-Dateien gefunden.")
+
+            ds_all = IMUWindowDataset(
+                csvs, label_map=self.map, window=self.cfg["window"],
+                stride=self.cfg["stride"], majority_thr=self.cfg["majority"],
+                add_speed=self.cfg["add_speed"], fft_bins=self.cfg["fft_bins"],
+                unknown_id=self.unk, augment=False)
+
+            stats = {k: int((ds_all.y == v).sum()) for k, v in self.map.items()}
+            self.log.emit("STAT|" + "|".join(f"{k}:{v}" for k, v in stats.items()))
+
+            C_tot = ds_all.X.shape[1]
+            uids  = sorted(set(ds_all.y.tolist()))
+            id2idx = {u: i for i, u in enumerate(uids)}
+            idx2name = {i: next(k for k, v in self.map.items() if v == u)
+                        for i, u in enumerate(uids)}
+
+            groups = ds_all.grp
+            gkf = GroupKFold(n_splits=5)
+            cm_total = np.zeros((len(uids), len(uids)), int)
+            rep_acc, curves_fold = None, {}
+            fold = 0
+
+            for tr_idx, va_idx in gkf.split(ds_all.X, ds_all.y, groups):
+                fold += 1
+
+                # -------- Training-Fold vorbereiten ----------------
+                X_tr, y_tr = ds_all.X[tr_idx], ds_all.y[tr_idx]
+                if self.cfg["augment"]:
+                    X_tr = np.stack([sign_flip(add_gauss(x)) for x in X_tr])
+                y_tr_i = np.array([id2idx[v] for v in y_tr])
+
+                ros = RandomOverSampler(
+                    sampling_strategy="not majority",   # ← jetzt als Keyword
+                    random_state=42
+                )
+                X_tr_r, y_tr_i_r = ros.fit_resample(X_tr.reshape(len(X_tr), -1),
+                                                    y_tr_i)
+                X_tr_r = X_tr_r.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
+
+                X_va, y_va = ds_all.X[va_idx], ds_all.y[va_idx]
+                y_va_i = np.array([id2idx[v] for v in y_va])
+
+                dl_tr = DataLoader(
+                    TensorDataset(torch.from_numpy(X_tr_r),
+                                  torch.from_numpy(y_tr_i_r)),
+                    batch_size=self.cfg["batch"], shuffle=True)
+                dl_va = DataLoader(
+                    TensorDataset(torch.from_numpy(X_va),
+                                  torch.from_numpy(y_va_i)),
+                    batch_size=self.cfg["batch"])
+
+                model = HybridNet(C_tot, len(uids),
+                                  hidden=self.cfg["base"],
+                                  layers=self.cfg["layers"],
+                                  drop=self.cfg["drop"])
+
+                alpha = torch.tensor(compute_class_weight(
+                    "balanced", classes=np.arange(len(uids)), y=y_tr_i_r)).float()
+                crit = FocalLoss(alpha, gamma=1.0,
+                                 smooth=max(.05, self.cfg["smooth"]))
+                opt  = torch.optim.AdamW(model.parameters(),
+                                         lr=self.cfg["lr"], weight_decay=self.cfg["wd"])
+                sched = OneCycleLR(opt, max_lr=self.cfg["lr"],
+                                   steps_per_epoch=len(dl_tr),
+                                   epochs=self.cfg["epochs"])
+
+                best_val, best_state, bad = float("inf"), None, 0
+                for ep in range(1, self.cfg["epochs"]+1):
+                    model.train(); tr_loss = 0.
+                    for xb, yb in dl_tr:
+                        opt.zero_grad(); logits = model(xb)
+                        loss = crit(logits, yb); loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+                        opt.step(); sched.step()
+                        tr_loss += loss.item()*len(xb)
+                    tr_loss /= len(dl_tr.dataset)
+
+                    model.eval(); val_loss, probs = 0., []
+                    with torch.no_grad():
+                        for xb, yb in dl_va:
+                            lg = model(xb)
+                            val_loss += crit(lg, yb).item()*len(xb)
+                            probs.append(torch.softmax(lg, 1))
+                    val_loss /= len(dl_va.dataset)
+                    probs = torch.cat(probs).numpy()
+                    self.step.emit(ep, tr_loss, val_loss)
+
+                    if val_loss < best_val - 1e-4:
+                        best_val, best_state, bad = val_loss, model.state_dict(), 0
+                    else:
+                        bad += 1
+                        if bad >= self.cfg["patience"]:
+                            break
+                    self.progress.emit(int((fold-1+ep/self.cfg["epochs"])/5*100))
+
+                model.load_state_dict(best_state)
+                with torch.no_grad():
+                    prob_va = torch.softmax(model(torch.from_numpy(X_va)), 1).numpy()
+                preds = prob_va.argmax(1)
+                cm_total += confusion_matrix(y_va_i, preds,
+                                             labels=range(len(uids)))
+
+                rep_fold = classification_report(
+                    y_va_i, preds,
+                    target_names=[idx2name[i] for i in range(len(uids))],
+                    zero_division=0, output_dict=True)
+
+                if rep_acc is None:
+                    rep_acc = {k:(v.copy() if isinstance(v, dict) else v)
+                               for k, v in rep_fold.items()}
+                else:
+                    for k, v in rep_fold.items():
+                        if isinstance(v, dict):
+                            for m in v:
+                                rep_acc[k][m] += v[m]
+                        else:
+                            rep_acc[k] += v
+                curves_fold[fold] = pr_curves(y_va_i, prob_va, len(uids))
+
+            # Durchschnitt der Reports
+            for k, v in rep_acc.items():
+                if isinstance(v, dict):
+                    for m in v: rep_acc[k][m] /= 5
+                else: rep_acc[k] /= 5
+            τ = _oob_threshold(cm_total.max(1), .95)
+
+            self.finished.emit(rep_acc, cm_total, idx2name, τ,
+                               len(ds_all), len(ds_all)//5,
+                               model, curves_fold)
+
+        except Exception as e:
+            self.log.emit(f"Fehler im Training: {e}")
+
+# ═══════════════════ Qt-GUI ======================================
 class TrainingTab(QWidget):
-    def __init__(
-        self, label_map: Dict[str, int], unknown_id: int, parent=None
-    ) -> None:
-        super().__init__(parent)
-        self.label_map, self.unknown_id = label_map, unknown_id
+    def __init__(self, label_map: Dict[str, int], unknown_id: int,
+                 start_folder: Path | None = None):
+        super().__init__()
+        self.label_map = label_map
+        self.unknown_id = unknown_id
+        self.folder = start_folder or Path.cwd()
+        self.idx2name: dict[int, str] = {}
+        self._trained_model: nn.Module | None = None
+        self._init_ui()
 
-        # Default-Ordner
-        default = Path.home() / "Desktop/anomaly-data-hs-merseburg"
-        self.folder = default if default.exists() else Path.cwd()
+    # --------------------------------------------------------------
+    def _init_ui(self):
+        self.setWindowTitle("Road-Anomaly Trainer (HybridNet)")
 
-        # Splitter (L: Einstellungen / Dateien, R: Plots & Ergebnisse)
-        splitter = QSplitter(Qt.Horizontal, self)
-        left, right = QWidget(), QWidget()
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(1, 2)
+        pal = self.palette(); pal.setColor(QPalette.Window, QColor("#f7f7f7"))
+        self.setPalette(pal)
 
-        main = QVBoxLayout(self)
-        main.addWidget(splitter)
+        splitter = QSplitter(Qt.Horizontal)
+        self._build_left(splitter)
+        self._build_right(splitter)
 
-        # ───────────────────────── LEFT PANE ──────────────────────────────
-        lv = QVBoxLayout(left)
+        lay = QVBoxLayout(self); lay.addWidget(splitter)
+
+    # -------- LEFT ------------------------------------------------
+    def _build_left(self, splitter):
+        left = QWidget(); lv = QVBoxLayout(left)
 
         # Ordner-Zeile
-        hl = QHBoxLayout()
-        hl.addWidget(QLabel("Folder:"))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("CSV-Ordner:"))
         self.lbl_folder = QLabel(str(self.folder))
         self.lbl_folder.setFrameStyle(QFrame.Panel | QFrame.Sunken)
-        hl.addWidget(self.lbl_folder, 1)
-        btn_browse = QPushButton("Browse…")
-        btn_browse.clicked.connect(self._browse)
-        hl.addWidget(btn_browse)
-        lv.addLayout(hl)
+        row.addWidget(self.lbl_folder, 1)
+        btn = QPushButton("Browse…"); btn.clicked.connect(self._browse)
+        row.addWidget(btn); lv.addLayout(row)
 
-        # Dateiliste
-        self.list_files = QListWidget()
-        lv.addWidget(self.list_files, 2)
-        self._update_file_list()
+        # Stat-Tabelle
+        self.tbl_stats = QTableWidget()
+        self.tbl_stats.setColumnCount(2)
+        self.tbl_stats.setHorizontalHeaderLabels(["Class", "Points"])
+        self.tbl_stats.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        lv.addWidget(self.tbl_stats, 2)
 
-        # Hyperparameter-Form
-        param_box = QFormLayout()
+        # Parameter-Form
+        form = QFormLayout()
+        self.sp_epochs = QSpinBox(minimum=1, maximum=300, value=50)
+        self.sp_lr = QDoubleSpinBox(decimals=6, minimum=1e-6,
+                                    maximum=1.0, value=5e-4); self.sp_lr.setSingleStep(1e-5)
+        self.sp_batch = QSpinBox(minimum=32, maximum=2048, value=256)
+        self.sp_wd = QDoubleSpinBox(decimals=6, minimum=0., maximum=.1, value=1e-4)
+        self.sp_pat = QSpinBox(minimum=1, maximum=20, value=10)
+        self.sp_win = QSpinBox(minimum=64, maximum=1024, value=256)
+        self.sp_stride = QSpinBox(minimum=32, maximum=1024, value=128)
+        self.sp_major = QDoubleSpinBox(decimals=2, minimum=.5, maximum=1., value=.7)
+        self.sp_layers = QSpinBox(minimum=1, maximum=6, value=2)
+        self.sp_base = QSpinBox(minimum=16, maximum=512, value=128)
+        self.sp_drop = QDoubleSpinBox(decimals=2, minimum=0., maximum=.8, value=.5)
+        self.cb_speed = QCheckBox("Speed-Kanal"); self.cb_speed.setChecked(True)
+        self.cb_fft = QCheckBox("FFT-Spektrum"); self.cb_fft.setChecked(False)
+        self.sp_fft = QSpinBox(minimum=8, maximum=128, value=40)
+        self.sp_fft.setEnabled(False); self.cb_fft.toggled.connect(self.sp_fft.setEnabled)
+        self.cb_aug = QCheckBox("Augmentation"); self.cb_aug.setChecked(False)
+        self.sp_gamma = QDoubleSpinBox(decimals=1, minimum=1, maximum=5, value=1.)
+        self.sp_smooth = QDoubleSpinBox(decimals=2, minimum=0., maximum=.2, value=.05)
 
-        self.sp_epochs = QSpinBox(); self.sp_epochs.setRange(1, 500); self.sp_epochs.setValue(50)
-        param_box.addRow("Epochs", self.sp_epochs)
+        widgets = [
+            ("Epochs", self.sp_epochs),
+            ("Learning Rate", self.sp_lr),
+            ("Batch Size", self.sp_batch),
+            ("Weight Decay", self.sp_wd),
+            ("Patience", self.sp_pat),
+            ("Window", self.sp_win),
+            ("Stride", self.sp_stride),
+            ("Majority ≥", self.sp_major),
+            ("LSTM-Layers", self.sp_layers),
+            ("Hidden Size", self.sp_base),
+            ("Dropout", self.sp_drop),
+            ("", self.cb_speed),
+            ("", self.cb_fft),
+            ("FFT-Bins", self.sp_fft),
+            ("Augment.", self.cb_aug),
+            ("Label-Smooth", self.sp_smooth),
+        ]
+        for lbl, w in widgets: form.addRow(lbl, w)
+        lv.addLayout(form)
 
-        self.sp_lr = QDoubleSpinBox(); self.sp_lr.setDecimals(5); self.sp_lr.setRange(1e-5, 1.0); self.sp_lr.setValue(1e-3)
-        param_box.addRow("Learning Rate", self.sp_lr)
+        # Train-Button + ProgressBar
+        self.btn_train = QPushButton("Train model"); self.btn_train.clicked.connect(self._start)
+        lv.addWidget(self.btn_train); self.progress = QProgressBar(); lv.addWidget(self.progress)
+        splitter.addWidget(left); splitter.setStretchFactor(0, 1)
 
-        self.sp_batch = QSpinBox(); self.sp_batch.setRange(32, 4096); self.sp_batch.setValue(256)
-        param_box.addRow("Batch Size", self.sp_batch)
+    # -------- RIGHT -----------------------------------------------
+    def _build_right(self, splitter):
+        right = QWidget(); rv = QVBoxLayout(right)
+        self.tabs = QTabWidget(); rv.addWidget(self.tabs, 1)
 
-        self.sp_wd = QDoubleSpinBox(); self.sp_wd.setDecimals(6); self.sp_wd.setRange(0.0, 0.1); self.sp_wd.setValue(1e-5)
-        param_box.addRow("Weight Decay", self.sp_wd)
+        # Loss
+        loss_tab = QWidget(); lt = QVBoxLayout(loss_tab)
+        self.loss_canvas = LossCanvas(); lt.addWidget(self.loss_canvas)
+        self.tabs.addTab(loss_tab, "Loss")
 
-        self.sp_pat = QSpinBox(); self.sp_pat.setRange(1, 20); self.sp_pat.setValue(5)
-        param_box.addRow("Early-Stop Patience", self.sp_pat)
+        # Confusion
+        self.cm_tab = QWidget(); ct = QVBoxLayout(self.cm_tab)
+        self.cm_placeholder = QLabel("Confusion-Matrix erscheint\nnach dem Training",
+                                     alignment=Qt.AlignCenter)
+        ct.addWidget(self.cm_placeholder, 1)
+        self.tabs.addTab(self.cm_tab, "Confusion")
 
-        # NEU: Slider für Tabellen-Schriftgröße
-        self.sl_font = QSlider(Qt.Horizontal); self.sl_font.setRange(8, 18); self.sl_font.setValue(11)
-        self.sl_font.valueChanged.connect(self._set_table_font)
-        param_box.addRow("Table Font Size", self.sl_font)
+        # PR
+        self.pr_tab = QWidget(); pt = QVBoxLayout(self.pr_tab)
+        self.pr_placeholder = QLabel("PR-Kurven erscheinen\nnach dem Training",
+                                     alignment=Qt.AlignCenter)
+        pt.addWidget(self.pr_placeholder, 1)
+        self.tabs.addTab(self.pr_tab, "PR-Curves")
 
-        lv.addLayout(param_box)
-
-        # Train-Button & Progress
-        self.btn_train = QPushButton("Train model")
-        self.btn_train.clicked.connect(self._train)
-        lv.addWidget(self.btn_train)
-
-        self.progress = QProgressBar()
-        lv.addWidget(self.progress)
-
-        # ───────────────────────── RIGHT PANE ─────────────────────────────
-        rv = QVBoxLayout(right)
-
-        # Val-Klassenverteilung (Balken)
-        self.dist_canvas = FigureCanvas(plt.figure(figsize=(4, 2)))
-        rv.addWidget(self.dist_canvas, 1)
-
-        # Live-Loss
-        self.live_canvas = LiveLossCanvas()
-        rv.addWidget(self.live_canvas, 2)
-
-        # Platz für Konfusionsmatrix
-        self.cm_container = QVBoxLayout()
-        rv.addLayout(self.cm_container, 2)
-
-        # Ergebnis-Tabelle
-        self.table = QTableWidget()
-        self.table.setFont(QFont("DejaVu Sans Mono", 11))
-        self.table.verticalHeader().setDefaultSectionSize(24)
+        # Metrics
+        self.met_tab = QWidget(); mt = QVBoxLayout(self.met_tab)
+        self.table = QTableWidget(); self.table.setFont(QFont("DejaVu Sans Mono", 9))
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setAlternatingRowColors(True)
-        rv.addWidget(self.table, 2)
+        mt.addWidget(self.table, 2)
+        self.txt_report = QTextBrowser(); mt.addWidget(self.txt_report, 1)
+        self.btn_save = QPushButton("Save Model"); self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self._save_model)
+        self.btn_export = QPushButton("Export ONNX"); self.btn_export.clicked.connect(self._export_onnx)
+        hb = QHBoxLayout(); hb.addWidget(self.btn_save); hb.addWidget(self.btn_export)
+        mt.addLayout(hb)
+        self.tabs.addTab(self.met_tab, "Metrics")
 
-        # Status-Label (aktive Klassen, Samples, τ)
-        self.lbl_stats = QLabel()
-        self.lbl_stats.setStyleSheet("font-weight:bold;")
-        rv.addWidget(self.lbl_stats)
+        splitter.addWidget(right); splitter.setStretchFactor(1, 2)
 
-        # Log-Fenster
-        self.txt = QTextBrowser()
-        rv.addWidget(self.txt, 1)
+    # --------------------------------------------------------------
+    def _browse(self):
+        path = QFileDialog.getExistingDirectory(self, "CSV-Ordner wählen", str(self.folder))
+        if path: self.folder = Path(path); self.lbl_folder.setText(path)
 
-    # ────────────────────────── Helper Slots ─────────────────────────────
-    def _browse(self) -> None:
-        path = QFileDialog.getExistingDirectory(
-            self, "Select CSV Folder", str(self.folder)
+    def _get_cfg(self) -> dict:
+        return dict(
+            epochs=self.sp_epochs.value(), lr=self.sp_lr.value(),
+            batch=self.sp_batch.value(), wd=self.sp_wd.value(),
+            patience=self.sp_pat.value(), window=self.sp_win.value(),
+            stride=self.sp_stride.value(), majority=self.sp_major.value(),
+            layers=self.sp_layers.value(), base=self.sp_base.value(),
+            drop=self.sp_drop.value(), add_speed=self.cb_speed.isChecked(),
+            fft_bins=self.sp_fft.value() if self.cb_fft.isChecked() else 0,
+            augment=self.cb_aug.isChecked(), smooth=self.sp_smooth.value(),
         )
-        if path:
-            self.folder = Path(path)
-            self.lbl_folder.setText(path)
-            self._update_file_list()
 
-    def _update_file_list(self) -> None:
-        self.list_files.clear()
-        if not self.folder.exists():
-            return
-        for ext in ("*.csv", "*.json"):
-            for f in sorted(self.folder.rglob(ext)):
-                try:
-                    self.list_files.addItem(str(f.relative_to(self.folder)))
-                except ValueError:
-                    self.list_files.addItem(f.name)
+    # --------------------------------------------------------------
+    def _start(self):
+        self.btn_train.setEnabled(False); self.progress.reset(); self.loss_canvas.reset()
+        if hasattr(self, "cm_scroll"): self.cm_scroll.deleteLater()
+        self.cm_placeholder.setText("Training läuft …"); self.cm_placeholder.show()
+        if hasattr(self, "pr_scroll"): self.pr_scroll.deleteLater()
+        self.pr_placeholder.show(); self.table.clear(); self.txt_report.clear()
+        self.btn_save.setEnabled(False)
 
-    # ────────────────────────── Training Start ───────────────────────────
-    def _train(self) -> None:
-        self.btn_train.setEnabled(False)
-        self.progress.reset()
-
-        # Visuals zurücksetzen
-        self.live_canvas.tr_vals.clear()
-        self.live_canvas.val_vals.clear()
-        self.live_canvas.ax.cla()
-        self.live_canvas.ax.set_xlabel("Epoch")
-        self.live_canvas.ax.set_ylabel("Loss")
-        self.live_canvas.tr_line, = self.live_canvas.ax.plot([], [], label="Train")
-        self.live_canvas.val_line, = self.live_canvas.ax.plot([], [], label="Val")
-        self.live_canvas.ax.legend()
-        self.live_canvas.draw_idle()
-
-        while self.cm_container.count():
-            w = self.cm_container.takeAt(0).widget()
-            if w is not None:
-                w.setParent(None)
-
-        self.lbl_stats.clear()
-        self.txt.clear()
-        self.table.clear()
-
-        # Worker-Thread
-        self.worker = TrainWorker(
-            self.folder,
-            self.label_map,
-            self.unknown_id,
-            epochs=self.sp_epochs.value(),
-            lr=self.sp_lr.value(),
-            batch_size=self.sp_batch.value(),
-            weight_decay=self.sp_wd.value(),
-            patience=self.sp_pat.value(),
-        )
+        cfg = self._get_cfg()
+        self.worker = TrainWorker(self.folder, self.label_map, self.unknown_id, cfg)
         self.worker.progress.connect(self.progress.setValue)
-        self.worker.log.connect(self._append)
-        self.worker.step.connect(self._update_loss_plot)
+        self.worker.step.connect(self.loss_canvas.add_step)
+        self.worker.log.connect(self._log_from_worker)
         self.worker.finished.connect(self._done)
         self.worker.start()
 
-        self._append(
-            f"Training started with epochs={self.sp_epochs.value()}  "
-            f"lr={self.sp_lr.value():.5f}  batch={self.sp_batch.value()}  "
-            f"wd={self.sp_wd.value():.6f}"
-        )
+    # --------------------------------------------------------------
+    def _log_from_worker(self, msg: str):
+        if msg.startswith("STAT|"):
+            parts = msg[5:].split("|"); self.tbl_stats.setRowCount(len(parts))
+            for r, p in enumerate(parts):
+                cls, pts = p.split(":")
+                it_cls = QTableWidgetItem(cls); it_pts = QTableWidgetItem(_nice(int(pts)))
+                it_cls.setTextAlignment(Qt.AlignCenter); it_pts.setTextAlignment(Qt.AlignCenter)
+                self.tbl_stats.setItem(r, 0, it_cls); self.tbl_stats.setItem(r, 1, it_pts)
+        else:
+            self.txt_report.append(msg)
 
-    # ------------------------------------------------------------------
-    def _update_loss_plot(self, ep: int, train: float, val: float):
-        self.live_canvas.update(ep, train, val)
+    # --------------------------------------------------------------
+    def _done(self, rep_dict, cm, idx2name, τ, n_total, n_val,
+              model, curves_fold):
+        self.idx2name = idx2name
 
-    # ------------------------------------------------------------------
-    def _done(
-        self,
-        rep_str: str,
-        rep_dict: dict,
-        tau: float,
-        cm: np.ndarray,
-        class_w: np.ndarray,
-        idx_to_name: Dict[int, str],
-        n_train: int,
-        n_val: int,
-    ):
-        self.progress.setValue(100)
-        self._append(rep_str)
-        self._populate_table(rep_dict)
+        # Confusion-Matrix
+        self.cm_placeholder.hide()
+        self.cm_scroll = QScrollArea()
+        self.cm_scroll.setWidget(ConfMatCanvas(cm, idx2name))
+        self.cm_scroll.setWidgetResizable(True)
+        self.cm_tab.layout().addWidget(self.cm_scroll, 1)
 
-        self.lbl_stats.setText(
-            f"Active classes: {len(idx_to_name)}   "
-            f"Train: {_nice_number(n_train)}   "
-            f"Val: {_nice_number(n_val)}   "
-            f"τ = {tau:.3f}"
-        )
+        # PR-Curves
+        self.pr_placeholder.hide()
+        curves_avg: dict[int, list[tuple[np.ndarray, np.ndarray, float]]] = {}
+        for fold, curves in curves_fold.items():
+            for i, cur in curves.items():
+                curves_avg.setdefault(i, []).append(cur)
+        curves_final = {
+            i: (curves_avg[i][0][0], curves_avg[i][0][1],
+                np.mean([c[2] for c in curves_avg[i]]))
+            for i in curves_avg
+        }
+        self.pr_scroll = QScrollArea()
+        self.pr_scroll.setWidget(PRCanvas(curves_final, idx2name))
+        self.pr_scroll.setWidgetResizable(True)
+        self.pr_tab.layout().addWidget(self.pr_scroll, 1)
 
-        # Konfusionsmatrix
-        cm_canvas = ConfMatCanvas(cm, idx_to_name)
-        self.cm_container.addWidget(cm_canvas)
-        cm_canvas.draw()
+        # Metrics-Tabelle
+        classes = list(idx2name.values())
+        avg_rows = [
+            ("Macro Avg", rep_dict["macro avg"]),
+            ("Weighted Avg", rep_dict["weighted avg"]),
+            ("Accuracy", {
+                "precision": rep_dict["accuracy"],
+                "recall": rep_dict["accuracy"],
+                "f1-score": rep_dict["accuracy"],
+                "support": n_val,
+            }),
+        ]
+        headers = ["Class", "Prec [%]", "Recall [%]", "F1 [%]", "Support"]
+        self.table.setColumnCount(len(headers))
+        self.table.setRowCount(len(classes)+len(avg_rows))
+        self.table.setHorizontalHeaderLabels(headers)
 
-        # Val-Verteilung
-        counts = cm.sum(axis=1)
-        ax = self.dist_canvas.figure.clf().add_subplot(111)
-        classes = [idx_to_name[i] for i in range(len(idx_to_name))]
-        ax.bar(classes, counts)
-        ax.set_title("Validation sample count per class")
-        ax.set_xticklabels(classes, rotation=45, ha="right")
-        self.dist_canvas.draw_idle()
+        for r, cls in enumerate(classes):
+            d = rep_dict[cls]; row = [
+                cls, f"{d['precision']*100:.1f}", f"{d['recall']*100:.1f}",
+                f"{d['f1-score']*100:.1f}", _nice(int(d['support']))]
+            for c, v in enumerate(row):
+                it = QTableWidgetItem(v); it.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(r, c, it)
 
+        for i, (name, d) in enumerate(avg_rows, start=len(classes)):
+            row = [
+                name, f"{d['precision']*100:.1f}", f"{d['recall']*100:.1f}",
+                f"{d['f1-score']*100:.1f}", _nice(int(d['support']))]
+            for c, v in enumerate(row):
+                it = QTableWidgetItem(v); it.setTextAlignment(Qt.AlignCenter)
+                it.setBackground(QColor("#e8e8e8"))
+                self.table.setItem(i, c, it)
+
+        self.txt_report.append(f"τ = {τ:.3f}   Samples = {_nice(n_total)}")
+        self.txt_report.append(
+            f"Accuracy: {rep_dict['accuracy']*100:.2f}%   "
+            f"Macro-F1: {rep_dict['macro avg']['f1-score']*100:.2f}%   "
+            f"Weighted-F1: {rep_dict['weighted avg']['f1-score']*100:.2f}%")
+
+        self._trained_model = model; self.btn_save.setEnabled(True)
         self.btn_train.setEnabled(True)
 
-        # Hyperparameter-Summary
-        self._append(
-            "Hyperparameters:\n"
-            f"epochs={self.sp_epochs.value()}  lr={self.sp_lr.value():.5f}  "
-            f"batch={self.sp_batch.value()}  wd={self.sp_wd.value():.6f}  "
-            f"class_weights={class_w.round(2).tolist()}"
-        )
+    # --------------------------------------------------------------
+    def _save_model(self):
+        if not self._trained_model: return
+        path, _ = QFileDialog.getSaveFileName(self, "Modell speichern",
+                                              "", "PyTorch (*.pt *.pth)")
+        if path:
+            torch.save(self._trained_model.state_dict(), path)
+            self.txt_report.append(f"Model saved → {path}")
 
-    # ------------------------------------------------------------------
-    def _append(self, text: str):
-        """Text ins Log."""
-        self.txt.append(text)
-
-    # ------------------------------------------------------------------
-    def _populate_table(self, rep: dict):
-        if not rep:
+    def _export_onnx(self):
+        if not self._trained_model:
+            QMessageBox.warning(self, "Kein Modell", "Trainiere zuerst ein Modell!")
             return
-        headers = ["Class", "Prec", "Recall", "F1", "Support"]
-        rows = [k for k in rep.keys() if isinstance(rep[k], dict)]
+        path, _ = QFileDialog.getSaveFileName(self, "ONNX-Export", "", "ONNX (*.onnx)")
+        if not path: return
+        dummy = torch.randn(1, self._trained_model.in_channels, self.sp_win.value())
+        torch.onnx.export(self._trained_model, dummy, path,
+                          opset_version=16,
+                          input_names=["imu"], output_names=["logits"])
+        QMessageBox.information(self, "ONNX-Export", "Modell erfolgreich exportiert.")
 
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(len(rows))
-
-        for r, cls in enumerate(rows):
-            d = rep[cls]
-            vals = [
-                str(cls),
-                f"{d['precision']:.2f}",
-                f"{d['recall']:.2f}",
-                f"{d['f1-score']:.2f}",
-                _nice_number(int(d['support'])),
-            ]
-            for c, val in enumerate(vals):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignCenter)
-                self.table.setItem(r, c, item)
-
-        self.table.resizeColumnsToContents()
-
-    # ------------------------------------------------------------------
-    def _set_table_font(self, size: int):
-        font = QFont("DejaVu Sans Mono", size)
-        self.table.setFont(font)
-        self.table.verticalHeader().setDefaultSectionSize(int(size * 2.2))
-
-
-# ════════════════════════════════════════════════════════════════
-# Entry-Point
-# ════════════════════════════════════════════════════════════════
+# ═══════════════════ main() ======================================
 if __name__ == "__main__":
-    import sys
-
-    # Beispiel-Label-Mapping (anpassen / laden wie benötigt)
-    dummy_labels = {
-        "normal": 1,
-        "depressed": 2,
-        "cover": 3,
-        "cobble": 4,
-        "transverse": 5,
-        "gravel": 6,
-        "cracked": 7,
-        "bump": 8,
-        "uneven": 9,
-        "damaged": 10,
+    label_map = {
+        "normal": 1, "depression": 2, "cover": 3, "cobble": 4,
+        "transverse": 5, "gravel": 6, "cracked": 7,
+        "bump": 8, "uneven": 9,
     }
-    unknown_id = 0
-
     app = QApplication(sys.argv)
-    win = TrainingTab(dummy_labels, unknown_id)
-    win.setWindowTitle("Multisensory Road Condition Analysis – Training")
-    win.resize(1200, 700)
-    win.show()
-    sys.exit(app.exec_())
+    win = TrainingTab(label_map, unknown_id=99, start_folder=Path.home())
+    win.resize(1400, 850); win.show()
+    sys.exit(app.exec())
