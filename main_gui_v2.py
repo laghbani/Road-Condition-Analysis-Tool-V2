@@ -19,11 +19,19 @@ from typing import Dict, List, Tuple, cast
 from concurrent.futures import ProcessPoolExecutor
 from enum import Enum, auto
 import logging
+import torch
+from torch.utils.data import Dataset, DataLoader
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
 
 import numpy as np
 import pandas as pd
 import json
 import os
+from sklearn.preprocessing import StandardScaler
+from numpy.fft import rfft
 os.environ["TORIO_FFMPEG_OFF"] = "1"
 logging.basicConfig(
     level=logging.DEBUG,
@@ -87,7 +95,7 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand
+        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox
     )
     try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -102,7 +110,7 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand
+        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox
     )
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -134,7 +142,7 @@ try:
     from progress_ui import ProgressWindow
     from videopc_widget import VideoPointCloudTab
     from stats_tab import StatsTab
-    from training_tab import TrainingTab
+    from training_tab import TrainingTab, HybridNet
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -735,6 +743,126 @@ class PeakExportDialog(QDialog):
         return res, self.min_gap
 
 
+class AIParamDialog(QDialog):
+    """Dialog to adjust AI model parameters."""
+
+    def __init__(self, params: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI Parameters")
+        self.resize(300, 200)
+
+        v = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.sb_win = QSpinBox()
+        self.sb_win.setRange(32, 1024)
+        self.sb_win.setValue(params.get("window", 256))
+        form.addRow("Window", self.sb_win)
+
+        self.sb_stride = QSpinBox()
+        self.sb_stride.setRange(1, 512)
+        self.sb_stride.setValue(params.get("stride", 128))
+        form.addRow("Stride", self.sb_stride)
+
+        self.sb_thr = QDoubleSpinBox()
+        self.sb_thr.setRange(0.0, 1.0)
+        self.sb_thr.setSingleStep(0.01)
+        self.sb_thr.setValue(params.get("threshold", 0.9))
+        form.addRow("Confidence", self.sb_thr)
+
+        v.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        v.addWidget(btns)
+
+    def result(self) -> dict:
+        return {
+            "window": self.sb_win.value(),
+            "stride": self.sb_stride.value(),
+            "threshold": self.sb_thr.value(),
+        }
+
+
+class _AIDataset(Dataset):
+    """Simple dataset for auto labeling."""
+
+    EXTRA_CANDS = [
+        ("gyro_x", "gyro_y", "gyro_z"),
+        ("|a|_raw",), ("|ω|_raw",),
+    ]
+
+    def __init__(self, df: pd.DataFrame, *, window: int, stride: int,
+                 add_speed: bool = True, fft_bins: int = 0, speed_max: float = 6,
+                 min_channels: int = 0):
+        super().__init__()
+        self.X: list[np.ndarray] = []
+        L = window
+
+        if {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(df.columns):
+            base = ["accel_veh_x", "accel_veh_y", "accel_veh_z"]
+        elif {"accel_corr_x", "accel_corr_y", "accel_corr_z"}.issubset(df.columns):
+            base = ["accel_corr_x", "accel_corr_y", "accel_corr_z"]
+        else:
+            base = ["accel_x", "accel_y", "accel_z"]
+        cols: list[str] = list(base)
+        for cand in self.EXTRA_CANDS:
+            if set(cand).issubset(df.columns):
+                cols.extend(cand)
+        if add_speed and "speed_mps" in df.columns:
+            cols.append("speed_mps")
+
+        arr = df[cols].to_numpy(np.float32)
+
+        # add derived magnitude columns if missing
+        if "|a|_raw" not in df.columns:
+            mag_a = np.linalg.norm(df[list(base)].to_numpy(np.float32), axis=1)
+            arr = np.column_stack([arr, mag_a])
+            cols.append("|a|_raw")
+        if {"gyro_x", "gyro_y", "gyro_z"}.issubset(df.columns) and "|ω|_raw" not in df.columns:
+            mag_g = np.linalg.norm(df[["gyro_x", "gyro_y", "gyro_z"]].to_numpy(np.float32), axis=1)
+            arr = np.column_stack([arr, mag_g])
+            cols.append("|ω|_raw")
+
+        if add_speed and "speed_mps" in df.columns:
+            idx_speed = cols.index("speed_mps")
+            arr[:, idx_speed] = np.clip(arr[:, idx_speed] / speed_max, 0, 1)
+
+        for s in range(0, len(df) - L + 1, stride):
+            win = arr[s:s+L].T
+            if fft_bins:
+                specs = []
+                for c in range(3):
+                    mag = np.abs(rfft(win[c]))[:fft_bins].astype(np.float32)
+                    specs.append(np.repeat(mag[:, None], L, axis=1))
+                win = np.concatenate([win, *specs], 0)
+            self.X.append(win)
+
+        if not self.X:
+            self.X = [np.zeros((len(cols), L), np.float32)]
+
+        self.X = np.stack(self.X).astype(np.float32)
+
+        if min_channels and self.X.shape[1] < min_channels:
+            pad = np.zeros(
+                (self.X.shape[0], min_channels - self.X.shape[1], L),
+                dtype=np.float32,
+            )
+            self.X = np.concatenate([self.X, pad], axis=1)
+
+        C = self.X.shape[1]
+        flat = self.X.transpose(0, 2, 1).reshape(-1, C)
+        flat = StandardScaler().fit_transform(flat)
+        self.X = flat.reshape(-1, self.X.shape[2], C).transpose(0, 2, 1)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.X[idx])
+
+
 # ===========================================================================
 # Undo/Redo Commands
 # ===========================================================================
@@ -883,6 +1011,14 @@ class MainWindow(QMainWindow):
         self.video_times_by_topic: dict[str, list[float]] = {}
         self.pc_frames_by_topic: dict[str, list] = {}
         self.pc_times_by_topic: dict[str, list[float]] = {}
+
+        # AI model handling
+        self.ai_model_path: str | None = None
+        self.ai_model: torch.nn.Module | None = None
+        self.ai_session: "ort.InferenceSession | None" = None
+        self.ai_in_channels: int = 0
+        self.ai_params: dict = {"window": 256, "stride": 128, "threshold": 0.9}
+        self.auto_label_active: bool = False
 
         self._build_menu()
         self._build_ui()
@@ -1114,6 +1250,21 @@ class MainWindow(QMainWindow):
         act_check.triggered.connect(self._check_export_status)
         m_view.addAction(act_check)
         self.act_check = act_check
+
+        # AI menu
+        m_ai = mb.addMenu("&AI")
+        act_model = QAction("Select model …", self)
+        act_model.triggered.connect(self._select_ai_model)
+        m_ai.addAction(act_model)
+
+        act_params = QAction("Model parameters …", self)
+        act_params.triggered.connect(self._open_ai_params)
+        m_ai.addAction(act_params)
+
+        self.act_auto_ai = QAction("Auto labeling", self, checkable=True)
+        self.act_auto_ai.setChecked(False)
+        self.act_auto_ai.toggled.connect(self._toggle_auto_label)
+        m_ai.addAction(self.act_auto_ai)
 
         # Help menu
         m_help = mb.addMenu("&Help")
@@ -1968,6 +2119,100 @@ class MainWindow(QMainWindow):
         vbox.addWidget(btns)
         dlg.resize(600, 500)
         dlg.exec()
+
+    # -------------------------------------------------------------- AI actions
+    def _select_ai_model(self) -> None:
+        start = "/home/afius/Desktop/anomaly-data-hs-merseburg/"
+        filt = "Model (*.pt *.pth *.onnx);;PyTorch Model (*.pt *.pth);;ONNX Model (*.onnx);;All Files (*)"
+        path, _ = QFileDialog.getOpenFileName(self, "Select AI model", start, filt)
+        if not path:
+            return
+        try:
+            ext = pathlib.Path(path).suffix.lower()
+            self.ai_model_path = path
+            self.ai_model = None
+            self.ai_session = None
+            self.ai_in_channels = 0
+            if ext == ".onnx":
+                if ort is None:
+                    raise RuntimeError("onnxruntime not available")
+                self.ai_session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+                inp = self.ai_session.get_inputs()[0]
+                if len(inp.shape) >= 3 and inp.shape[1] is not None:
+                    self.ai_in_channels = int(inp.shape[1])
+            else:
+                state = torch.load(path, map_location="cpu")
+                key = next(k for k in state if k.endswith("weight"))
+                c_in = state[key].shape[1]
+                self.ai_in_channels = int(c_in)
+                self.ai_model = HybridNet(c_in, len(self.LABEL_IDS))
+                self.ai_model.load_state_dict(state)
+                self.ai_model.eval()
+        except Exception as exc:
+            QMessageBox.warning(self, "Model load", f"Failed to load model: {exc}")
+
+    def _open_ai_params(self) -> None:
+        dlg = AIParamDialog(self.ai_params, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.ai_params = dlg.result()
+        if self.auto_label_active:
+            self._apply_model()
+
+    def _toggle_auto_label(self, chk: bool) -> None:
+        self.auto_label_active = chk
+        if chk:
+            self._apply_model()
+
+    def _apply_model(self) -> None:
+        if self.ai_model is None and self.ai_session is None:
+            QMessageBox.information(self, "AI", "Load a model first.")
+            self.act_auto_ai.setChecked(False)
+            return
+        for topic, df in self.dfs.items():
+            ds = _AIDataset(
+                df,
+                window=self.ai_params["window"],
+                stride=self.ai_params["stride"],
+                add_speed=True,
+                min_channels=self.ai_in_channels,
+            )
+            dl = DataLoader(ds, batch_size=64)
+            preds: list[Tuple[int, float]] = []
+            inp_name = None
+            if self.ai_session is not None:
+                inp_name = self.ai_session.get_inputs()[0].name
+            for xb in dl:
+                if self.ai_session is not None:
+                    logits = self.ai_session.run(None, {inp_name: xb.numpy()})[0]
+                    prob = torch.softmax(torch.from_numpy(logits), 1)
+                else:
+                    with torch.no_grad():
+                        logits = self.ai_model(xb)
+                        prob = torch.softmax(logits, 1)
+                mx, cls = torch.max(prob, 1)
+                for c, m in zip(cls, mx):
+                    preds.append((int(c), float(m)))
+
+            labels = np.full(len(df), UNKNOWN_ID, int)
+            conf = np.zeros(len(df), float)
+            w = self.ai_params["window"]
+            s = self.ai_params["stride"]
+            thr = self.ai_params.get("threshold", 0.9)
+            for i, (cls, prob) in enumerate(preds):
+                if prob < thr:
+                    continue
+                start = i * s
+                end = start + w
+                if end > len(df):
+                    break
+                mask = prob > conf[start:end]
+                labels[start:end][mask] = cls + 1
+                conf[start:end][mask] = prob
+            names = {i: n for n, i in self.LABEL_IDS.items()}
+            df["label_id"] = labels
+            df["label_name"] = [names.get(int(i), UNKNOWN_NAME) for i in labels]
+        self._draw_plots()
 
 
 
