@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import json
 import os
-
+os.environ["TORIO_FFMPEG_OFF"] = "1"
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
