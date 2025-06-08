@@ -2198,7 +2198,10 @@ class MainWindow(QMainWindow):
             conf = np.zeros(len(df), float)
             w = self.ai_params["window"]
             s = self.ai_params["stride"]
+            thr = self.ai_params.get("threshold", 0.9)
             for i, (cls, prob) in enumerate(preds):
+                if prob < thr:
+                    continue
                 start = i * s
                 end = start + w
                 if end > len(df):
