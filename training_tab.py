@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-road_anomaly_trainer_hybrid.py
-==============================
+road_anomaly_trainer_hybrid_gpu_safe.py
+=======================================
 
 • GroupKFold pro CSV-Datei (kein Daten-Leakage)
 • RandomOverSampler ("not majority") gleicht Klassen aus
 • HybridNet: ConvStem → BiLSTM → Attention-Pooling
 • Focal-Loss (γ = 1, Label-Smooth = 0.05), Gradient-Clipping
-• Log-Loss-Plot, frei wählbarer Dropout (GUI)
-• Vollständiges Qt-GUI mit Confusion-Matrix, PR-Kurven, ONNX-Export
+• Automatic Mixed Precision (AMP) + Pin-Memory
+• CUDNN-Benchmarking und – falls GPU-VRAM voll läuft – automatischer
+  Fallback auf CPU ohne Abbruch des Trainings
+• Vollständiges Qt-GUI (Loss-Plot, Confusion-Matrix, PR-Kurven,
+  Paket-Export: Gewichte + PDF-Bericht)
 """
 
 # ──────────────────── BASIS-IMPORTS & LOGGING ────────────────────
 from __future__ import annotations
-import os, sys, itertools, logging
+import os, sys, itertools, logging, contextlib
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Tuple
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -32,13 +36,15 @@ from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 
-from imblearn.over_sampling import RandomOverSampler   # Oversampling
+from imblearn.over_sampling import RandomOverSampler
 
-# ───────── Optionales Time-Warp (nur wenn torio+torchaudio da sind) ─────────
-HAVE_AUDIO = False
+from matplotlib.backends.backend_pdf import PdfPages
 
-# ─────────────────── PyQt- & Matplotlib-Setup ────────────────────
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+# ───────── Optionales Time-Warp (nur wenn torchaudio vorhanden) ──
+HAVE_AUDIO = False            # kann bei Bedarf aktiviert werden
+
+# ──────────────────── GUI- & MPL-Setup ───────────────────────────
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QSplitter, QFileDialog, QLabel, QPushButton,
@@ -50,16 +56,23 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.pyplot as plt
 from numpy.fft import rfft
 
+# ──────────────────── GPU-SETUP ──────────────────────────────────
+USE_CUDA = torch.cuda.is_available()
+if USE_CUDA:
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = True
+INIT_DEVICE = torch.device("cuda" if USE_CUDA else "cpu")
 logging.getLogger().setLevel(logging.INFO)
-logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logging.info(f"Start on {INIT_DEVICE}")
+
 plt.rcParams.update({
     "toolbar": "None", "figure.dpi": 120,
     "axes.facecolor": "#fafafa", "axes.grid": True, "grid.alpha": .25,
     "font.size": 9,
 })
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"   # Intel-MKL Workaround
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"        # Intel-MKL Workaround
 
-# ═══════════════════ Hilfs-Funktionen + Augment ==================
+# ═══════════════════ Hilfs-Funktionen & Augment ==================
 def _nice(n: int) -> str: return f"{n:,}".replace(",", " ")
 
 def add_gauss(x: np.ndarray, snr_db: float = 25) -> np.ndarray:
@@ -73,6 +86,7 @@ def sign_flip(x: np.ndarray, p: float = .5) -> np.ndarray:
 
 def time_warp(x: np.ndarray, factor: float = .1) -> np.ndarray:
     if not HAVE_AUDIO: return x
+    import torchaudio
     rate = 1 + np.random.uniform(-factor, factor)
     ten = torch.from_numpy(x.copy()).unsqueeze(0)
     warpd, _ = torchaudio.functional.time_stretch(ten, rate, n_freq=1)
@@ -89,9 +103,7 @@ class IMUWindowDataset(Dataset):
                  add_speed: bool = True, fft_bins: int = 0, speed_max: float = 6,
                  unknown_id: int = 99, augment: bool = False):
         super().__init__()
-        self.X: list[np.ndarray] = []
-        self.y: list[int] = []
-        self.grp: list[str]     = []                  # Gruppen-ID → CSV-Name
+        self.X, self.y, self.grp = [], [], []
         L = window
 
         for csv in csvs:
@@ -102,7 +114,7 @@ class IMUWindowDataset(Dataset):
             if "label_id" not in df.columns:
                 continue
 
-            # Basis-Kanäle wählen
+            # Basis-Kanäle
             if {"accel_veh_x", "accel_veh_y", "accel_veh_z"}.issubset(df.columns):
                 base = ["accel_veh_x", "accel_veh_y", "accel_veh_z"]
             elif {"accel_corr_x", "accel_corr_y", "accel_corr_z"}.issubset(df.columns):
@@ -128,7 +140,7 @@ class IMUWindowDataset(Dataset):
                 maj = np.bincount(win_lbl).argmax()
                 if maj == unknown_id or (win_lbl == maj).mean() < majority_thr:
                     continue
-                win = arr[s:s+L].T                     # C × L
+                win = arr[s:s+L].T      # C × L
                 if fft_bins:
                     specs = []
                     for c in range(3):
@@ -159,7 +171,7 @@ class IMUWindowDataset(Dataset):
 class AttentionPool(nn.Module):
     def __init__(self, dim: int):
         super().__init__(); self.w = nn.Linear(dim, 1, bias=False)
-    def forward(self, x):                # x : B × L × D
+    def forward(self, x):               # x : B × L × D
         α = torch.softmax(self.w(x).squeeze(-1), 1)
         return (α.unsqueeze(-1) * x).sum(1)
 
@@ -169,7 +181,7 @@ class ConvStem(nn.Module):
         self.net = nn.Sequential(
             nn.Conv1d(c_in, c_out, 7, padding=3, bias=False),
             nn.BatchNorm1d(c_out), nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),                     # L / 2
+            nn.MaxPool1d(2),     # L / 2
         )
     def forward(self, x): return self.net(x)
 
@@ -186,14 +198,14 @@ class HybridNet(nn.Module):
         self.att = AttentionPool(hidden*2)
         self.dropout = nn.Dropout(drop)
         self.fc = nn.Linear(hidden*2, n_cls)
-    def forward(self, x):                # x : B × C × L
-        x = self.stem(x)                 # B × 64 × L/2
-        x = x.transpose(1, 2)            # B × L/2 × 64
+    def forward(self, x):               # x : B × C × L
+        x = self.stem(x)                # B × 64 × L/2
+        x = x.transpose(1, 2)           # B × L/2 × 64
         out, _ = self.lstm(x)
         rep = self.dropout(self.att(out))
         return self.fc(rep)
 
-# ═══════════════════ Verlust & Metriken ==========================
+# ═══════════════════ Focal-Loss & Metriken =======================
 class FocalLoss(nn.Module):
     def __init__(self, alpha: torch.Tensor,
                  gamma: float = 1.0, smooth: float = .05):
@@ -216,7 +228,7 @@ def pr_curves(y_true, y_prob, n_cls):
 def _oob_threshold(max_probs: np.ndarray, keep: float = .95) -> float:
     return float(np.quantile(max_probs, 1-keep))
 
-# ═══════════════════ Matplotlib-Canvas -- Loss ===================
+# ═══════════════════ Matplotlib-Canvas – Loss ====================
 class LossCanvas(FigureCanvas):
     def __init__(self, parent=None):
         fig, self.ax = plt.subplots(figsize=(6, 2))
@@ -236,7 +248,7 @@ class LossCanvas(FigureCanvas):
         self.va_line.set_data(range(1, len(self.va_vals)+1), self.va_vals)
         self.ax.relim(); self.ax.autoscale_view(); self.draw_idle()
 
-# ═══════════════════ Matplotlib-Canvas -- Confusion ==============
+# ═══════════════════ Matplotlib-Canvas – Confusion ===============
 class ConfMatCanvas(FigureCanvas):
     clicked = pyqtSignal(int, int)
     def __init__(self, cm: np.ndarray, idx2name: Dict[int, str], parent=None):
@@ -251,11 +263,10 @@ class ConfMatCanvas(FigureCanvas):
         ax.set_xticklabels([idx2name[i] for i in ticks], rotation=45, ha="right")
         ax.set_yticklabels([idx2name[i] for i in ticks])
         ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-        ax.set_title("Confusion Matrix", fontweight="bold", pad=12)
+        ax.set_title("Confusion-Matrix", fontweight="bold", pad=12)
         thresh = cm_pct.max()/2
         for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
-            txt = f"{cm[i, j]}\n{cm_pct[i, j]:.0f}%"
-            ax.text(j, i, txt,
+            ax.text(j, i, f"{cm[i, j]}\n{cm_pct[i, j]:.0f}%",
                     ha="center", va="center",
                     color="white" if cm_pct[i, j] > thresh else "black",
                     fontsize=8, weight="bold")
@@ -264,10 +275,8 @@ class ConfMatCanvas(FigureCanvas):
     def _on_click(self, ev):
         if ev.inaxes != self.ax: return
         self.clicked.emit(int(round(ev.ydata)), int(round(ev.xdata)))
-    def sizeHint(self): w, h = self.figure.get_size_inches()*self.figure.dpi
-    # -------------------------------------------------------------------------
 
-# ═══════════════════ Matplotlib-Canvas -- PR-Kurven ===============
+# ═══════════════════ Matplotlib-Canvas – PR-Kurven ===============
 class PRCanvas(FigureCanvas):
     def __init__(self, curves: Dict[int, Tuple[np.ndarray, np.ndarray, float]],
                  idx2name: Dict[int, str], parent=None):
@@ -277,9 +286,8 @@ class PRCanvas(FigureCanvas):
             ax.plot(r, p, label=f"{idx2name[i]} AUC={au:.2f}")
         ax.set(xlabel="Recall", ylabel="Precision", title="PR-Kurven")
         ax.legend(); fig.tight_layout()
-    def sizeHint(self): w, h = self.figure.get_size_inches()*self.figure.dpi
 
-# ═══════════════════ Training-Thread ==============================
+# ═══════════════════ Training-Thread =============================
 class TrainWorker(QThread):
     progress = pyqtSignal(int)
     step     = pyqtSignal(int, float, float)
@@ -296,10 +304,11 @@ class TrainWorker(QThread):
                              if not p.name.endswith("_track.csv")]
 
     # --------------------------------------------------------------
-    def run(self):                                     # noqa: C901
+    def run(self):                       # noqa: C901
         try:
             csvs = self._csvs()
-            if not csvs: raise RuntimeError("Keine CSV-Dateien gefunden.")
+            if not csvs:
+                raise RuntimeError("Keine CSV-Dateien gefunden.")
 
             ds_all = IMUWindowDataset(
                 csvs, label_map=self.map, window=self.cfg["window"],
@@ -318,108 +327,47 @@ class TrainWorker(QThread):
 
             groups = ds_all.grp
             gkf = GroupKFold(n_splits=5)
+
             cm_total = np.zeros((len(uids), len(uids)), int)
             rep_acc, curves_fold = None, {}
             fold = 0
 
             for tr_idx, va_idx in gkf.split(ds_all.X, ds_all.y, groups):
                 fold += 1
+                self.log.emit(f"Fold {fold}/5 startet …")
 
-                # -------- Training-Fold vorbereiten ----------------
-                X_tr, y_tr = ds_all.X[tr_idx], ds_all.y[tr_idx]
-                if self.cfg["augment"]:
-                    X_tr = np.stack([sign_flip(add_gauss(x)) for x in X_tr])
-                y_tr_i = np.array([id2idx[v] for v in y_tr])
-
-                ros = RandomOverSampler(
-                    sampling_strategy="not majority",   # ← jetzt als Keyword
-                    random_state=42
-                )
-                X_tr_r, y_tr_i_r = ros.fit_resample(X_tr.reshape(len(X_tr), -1),
-                                                    y_tr_i)
-                X_tr_r = X_tr_r.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
-
-                X_va, y_va = ds_all.X[va_idx], ds_all.y[va_idx]
-                y_va_i = np.array([id2idx[v] for v in y_va])
-
-                dl_tr = DataLoader(
-                    TensorDataset(torch.from_numpy(X_tr_r),
-                                  torch.from_numpy(y_tr_i_r)),
-                    batch_size=self.cfg["batch"], shuffle=True)
-                dl_va = DataLoader(
-                    TensorDataset(torch.from_numpy(X_va),
-                                  torch.from_numpy(y_va_i)),
-                    batch_size=self.cfg["batch"])
-
-                model = HybridNet(C_tot, len(uids),
-                                  hidden=self.cfg["base"],
-                                  layers=self.cfg["layers"],
-                                  drop=self.cfg["drop"])
-
-                alpha = torch.tensor(compute_class_weight(
-                    "balanced", classes=np.arange(len(uids)), y=y_tr_i_r)).float()
-                crit = FocalLoss(alpha, gamma=1.0,
-                                 smooth=max(.05, self.cfg["smooth"]))
-                opt  = torch.optim.AdamW(model.parameters(),
-                                         lr=self.cfg["lr"], weight_decay=self.cfg["wd"])
-                sched = OneCycleLR(opt, max_lr=self.cfg["lr"],
-                                   steps_per_epoch=len(dl_tr),
-                                   epochs=self.cfg["epochs"])
-
-                best_val, best_state, bad = float("inf"), None, 0
-                for ep in range(1, self.cfg["epochs"]+1):
-                    model.train(); tr_loss = 0.
-                    for xb, yb in dl_tr:
-                        opt.zero_grad(); logits = model(xb)
-                        loss = crit(logits, yb); loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
-                        opt.step(); sched.step()
-                        tr_loss += loss.item()*len(xb)
-                    tr_loss /= len(dl_tr.dataset)
-
-                    model.eval(); val_loss, probs = 0., []
-                    with torch.no_grad():
-                        for xb, yb in dl_va:
-                            lg = model(xb)
-                            val_loss += crit(lg, yb).item()*len(xb)
-                            probs.append(torch.softmax(lg, 1))
-                    val_loss /= len(dl_va.dataset)
-                    probs = torch.cat(probs).numpy()
-                    self.step.emit(ep, tr_loss, val_loss)
-
-                    if val_loss < best_val - 1e-4:
-                        best_val, best_state, bad = val_loss, model.state_dict(), 0
-                    else:
-                        bad += 1
-                        if bad >= self.cfg["patience"]:
-                            break
-                    self.progress.emit(int((fold-1+ep/self.cfg["epochs"])/5*100))
-
-                model.load_state_dict(best_state)
-                with torch.no_grad():
-                    prob_va = torch.softmax(model(torch.from_numpy(X_va)), 1).numpy()
-                preds = prob_va.argmax(1)
-                cm_total += confusion_matrix(y_va_i, preds,
-                                             labels=range(len(uids)))
-
-                rep_fold = classification_report(
-                    y_va_i, preds,
-                    target_names=[idx2name[i] for i in range(len(uids))],
-                    zero_division=0, output_dict=True)
-
-                if rep_acc is None:
-                    rep_acc = {k:(v.copy() if isinstance(v, dict) else v)
-                               for k, v in rep_fold.items()}
-                else:
-                    for k, v in rep_fold.items():
-                        if isinstance(v, dict):
-                            for m in v:
-                                rep_acc[k][m] += v[m]
+                # zuerst GPU, dann evtl. CPU
+                for attempt in (0, 1):
+                    device = (torch.device("cuda")
+                              if attempt == 0 and torch.cuda.is_available()
+                              else torch.device("cpu"))
+                    use_amp = device.type == "cuda"
+                    try:
+                        cm_fold, rep_fold, curves = self._train_fold(
+                            fold, tr_idx, va_idx, ds_all,
+                            id2idx, idx2name, C_tot, device, use_amp)
+                        cm_total += cm_fold
+                        if rep_acc is None:
+                            rep_acc = {k:(v.copy() if isinstance(v, dict) else v)
+                                       for k, v in rep_fold.items()}
                         else:
-                            rep_acc[k] += v
-                curves_fold[fold] = pr_curves(y_va_i, prob_va, len(uids))
+                            for k, v in rep_fold.items():
+                                if isinstance(v, dict):
+                                    for m in v: rep_acc[k][m] += v[m]
+                                else: rep_acc[k] += v
+                        curves_fold[fold] = curves
+                        break
+                    except RuntimeError as e:
+                        if ("out of memory" in str(e).lower()
+                                and device.type == "cuda"):
+                            self.log.emit("⚠️ GPU-OOM → Fallback auf CPU")
+                            torch.cuda.empty_cache()
+                            continue
+                        raise
 
-            # Durchschnitt der Reports
+                self.progress.emit(int(fold/5*100))
+
+            # Durchschnitts-Report
             for k, v in rep_acc.items():
                 if isinstance(v, dict):
                     for m in v: rep_acc[k][m] /= 5
@@ -428,10 +376,110 @@ class TrainWorker(QThread):
 
             self.finished.emit(rep_acc, cm_total, idx2name, τ,
                                len(ds_all), len(ds_all)//5,
-                               model, curves_fold)
+                               self.last_model_cpu, curves_fold)
 
         except Exception as e:
             self.log.emit(f"Fehler im Training: {e}")
+
+    # --------------------------------------------------------------
+    def _train_fold(self, fold: int,
+                    tr_idx, va_idx, ds_all: IMUWindowDataset,
+                    id2idx: Dict[int, int], idx2name: Dict[int, str],
+                    C_tot: int, device: torch.device, use_amp: bool):
+
+        X_tr, y_tr = ds_all.X[tr_idx], ds_all.y[tr_idx]
+        if self.cfg["augment"]:
+            X_tr = np.stack([sign_flip(add_gauss(x)) for x in X_tr])
+        y_tr_i = np.array([id2idx[v] for v in y_tr])
+
+        ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
+        X_tr_r, y_tr_i_r = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
+        X_tr_r = X_tr_r.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
+
+        X_va, y_va = ds_all.X[va_idx], ds_all.y[va_idx]
+        y_va_i = np.array([id2idx[v] for v in y_va])
+
+        dl_tr = DataLoader(
+            TensorDataset(torch.from_numpy(X_tr_r),
+                          torch.from_numpy(y_tr_i_r)),
+            batch_size=self.cfg["batch"], shuffle=True,
+            pin_memory=(device.type == "cuda"),
+        )
+        dl_va = DataLoader(
+            TensorDataset(torch.from_numpy(X_va),
+                          torch.from_numpy(y_va_i)),
+            batch_size=self.cfg["batch"], pin_memory=(device.type == "cuda"))
+
+        model = HybridNet(C_tot, len(uids:=id2idx),
+                          hidden=self.cfg["base"],
+                          layers=self.cfg["layers"],
+                          drop=self.cfg["drop"]).to(device)
+
+        alpha = torch.tensor(compute_class_weight(
+            "balanced", classes=np.arange(len(uids)), y=y_tr_i_r)).float().to(device)
+        crit = FocalLoss(alpha, gamma=1.0,
+                         smooth=max(.05, self.cfg["smooth"]))
+
+        opt  = torch.optim.AdamW(model.parameters(),
+                                 lr=self.cfg["lr"], weight_decay=self.cfg["wd"])
+        sched = OneCycleLR(opt, max_lr=self.cfg["lr"],
+                           steps_per_epoch=len(dl_tr),
+                           epochs=self.cfg["epochs"])
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+        best_val, best_state, bad = float("inf"), None, 0
+        for ep in range(1, self.cfg["epochs"]+1):
+            model.train(); tr_loss = 0.
+            for xb, yb in dl_tr:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad()
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    logits = model(xb); loss = crit(logits, yb)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+                scaler.step(opt); scaler.update(); sched.step()
+                tr_loss += loss.item()*len(xb)
+            tr_loss /= len(dl_tr.dataset)
+
+            model.eval(); val_loss, probs = 0., []
+            with torch.no_grad():
+                for xb, yb in dl_va:
+                    xb = xb.to(device, non_blocking=True)
+                    yb = yb.to(device, non_blocking=True)
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        lg = model(xb); loss = crit(lg, yb)
+                    val_loss += loss.item()*len(xb)
+                    probs.append(torch.softmax(lg, 1).cpu())
+            val_loss /= len(dl_va.dataset)
+            probs = torch.cat(probs).numpy()
+
+            self.step.emit(ep, tr_loss, val_loss)
+            self.progress.emit(int((fold-1+ep/self.cfg["epochs"])/5*100))
+
+            if val_loss < best_val - 1e-4:
+                best_val, best_state, bad = val_loss, model.state_dict(), 0
+            else:
+                bad += 1
+                if bad >= self.cfg["patience"]:
+                    break
+
+        model.load_state_dict(best_state)
+        model.cpu(); self.last_model_cpu = model
+
+        with torch.no_grad():
+            prob_va = torch.softmax(model(torch.from_numpy(X_va)), 1).numpy()
+        preds = prob_va.argmax(1)
+        cm_fold = confusion_matrix(y_va_i, preds,
+                                   labels=range(len(uids)))
+        rep_fold = classification_report(
+            y_va_i, preds,
+            target_names=[idx2name[i] for i in range(len(uids))],
+            zero_division=0, output_dict=True)
+        curves = pr_curves(y_va_i, prob_va, len(uids))
+
+        return cm_fold, rep_fold, curves
 
 # ═══════════════════ Qt-GUI ======================================
 class TrainingTab(QWidget):
@@ -443,18 +491,17 @@ class TrainingTab(QWidget):
         self.folder = start_folder or Path.cwd()
         self.idx2name: dict[int, str] = {}
         self._trained_model: nn.Module | None = None
+        self._cfg: dict | None = None
+        self._train_info: dict | None = None
         self._init_ui()
 
-    # --------------------------------------------------------------
     def _init_ui(self):
         self.setWindowTitle("Road-Anomaly Trainer (HybridNet)")
-
         pal = self.palette(); pal.setColor(QPalette.Window, QColor("#f7f7f7"))
         self.setPalette(pal)
 
         splitter = QSplitter(Qt.Horizontal)
-        self._build_left(splitter)
-        self._build_right(splitter)
+        self._build_left(splitter); self._build_right(splitter)
 
         lay = QVBoxLayout(self); lay.addWidget(splitter)
 
@@ -462,7 +509,6 @@ class TrainingTab(QWidget):
     def _build_left(self, splitter):
         left = QWidget(); lv = QVBoxLayout(left)
 
-        # Ordner-Zeile
         row = QHBoxLayout()
         row.addWidget(QLabel("CSV-Ordner:"))
         self.lbl_folder = QLabel(str(self.folder))
@@ -471,14 +517,12 @@ class TrainingTab(QWidget):
         btn = QPushButton("Browse…"); btn.clicked.connect(self._browse)
         row.addWidget(btn); lv.addLayout(row)
 
-        # Stat-Tabelle
         self.tbl_stats = QTableWidget()
         self.tbl_stats.setColumnCount(2)
         self.tbl_stats.setHorizontalHeaderLabels(["Class", "Points"])
         self.tbl_stats.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         lv.addWidget(self.tbl_stats, 2)
 
-        # Parameter-Form
         form = QFormLayout()
         self.sp_epochs = QSpinBox(minimum=1, maximum=300, value=50)
         self.sp_lr = QDoubleSpinBox(decimals=6, minimum=1e-6,
@@ -497,7 +541,6 @@ class TrainingTab(QWidget):
         self.sp_fft = QSpinBox(minimum=8, maximum=128, value=40)
         self.sp_fft.setEnabled(False); self.cb_fft.toggled.connect(self.sp_fft.setEnabled)
         self.cb_aug = QCheckBox("Augmentation"); self.cb_aug.setChecked(False)
-        self.sp_gamma = QDoubleSpinBox(decimals=1, minimum=1, maximum=5, value=1.)
         self.sp_smooth = QDoubleSpinBox(decimals=2, minimum=0., maximum=.2, value=.05)
 
         widgets = [
@@ -521,9 +564,11 @@ class TrainingTab(QWidget):
         for lbl, w in widgets: form.addRow(lbl, w)
         lv.addLayout(form)
 
-        # Train-Button + ProgressBar
-        self.btn_train = QPushButton("Train model"); self.btn_train.clicked.connect(self._start)
-        lv.addWidget(self.btn_train); self.progress = QProgressBar(); lv.addWidget(self.progress)
+        self.btn_train = QPushButton("Train model")
+        self.btn_train.clicked.connect(self._start)
+        lv.addWidget(self.btn_train)
+        self.progress = QProgressBar(); lv.addWidget(self.progress)
+
         splitter.addWidget(left); splitter.setStretchFactor(0, 1)
 
     # -------- RIGHT -----------------------------------------------
@@ -531,34 +576,32 @@ class TrainingTab(QWidget):
         right = QWidget(); rv = QVBoxLayout(right)
         self.tabs = QTabWidget(); rv.addWidget(self.tabs, 1)
 
-        # Loss
         loss_tab = QWidget(); lt = QVBoxLayout(loss_tab)
         self.loss_canvas = LossCanvas(); lt.addWidget(self.loss_canvas)
         self.tabs.addTab(loss_tab, "Loss")
 
-        # Confusion
         self.cm_tab = QWidget(); ct = QVBoxLayout(self.cm_tab)
-        self.cm_placeholder = QLabel("Confusion-Matrix erscheint\nnach dem Training",
+        self.cm_placeholder = QLabel("Confusion-Matrix\nerscheint nach Training",
                                      alignment=Qt.AlignCenter)
         ct.addWidget(self.cm_placeholder, 1)
         self.tabs.addTab(self.cm_tab, "Confusion")
 
-        # PR
         self.pr_tab = QWidget(); pt = QVBoxLayout(self.pr_tab)
-        self.pr_placeholder = QLabel("PR-Kurven erscheinen\nnach dem Training",
+        self.pr_placeholder = QLabel("PR-Kurven\nerscheinen nach Training",
                                      alignment=Qt.AlignCenter)
         pt.addWidget(self.pr_placeholder, 1)
         self.tabs.addTab(self.pr_tab, "PR-Curves")
 
-        # Metrics
         self.met_tab = QWidget(); mt = QVBoxLayout(self.met_tab)
         self.table = QTableWidget(); self.table.setFont(QFont("DejaVu Sans Mono", 9))
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         mt.addWidget(self.table, 2)
         self.txt_report = QTextBrowser(); mt.addWidget(self.txt_report, 1)
-        self.btn_save = QPushButton("Save Model"); self.btn_save.setEnabled(False)
+        self.btn_save = QPushButton("Export Package")
+        self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._save_model)
-        self.btn_export = QPushButton("Export ONNX"); self.btn_export.clicked.connect(self._export_onnx)
+        self.btn_export = QPushButton("Export ONNX")
+        self.btn_export.clicked.connect(self._export_onnx)
         hb = QHBoxLayout(); hb.addWidget(self.btn_save); hb.addWidget(self.btn_export)
         mt.addLayout(hb)
         self.tabs.addTab(self.met_tab, "Metrics")
@@ -591,7 +634,7 @@ class TrainingTab(QWidget):
         self.pr_placeholder.show(); self.table.clear(); self.txt_report.clear()
         self.btn_save.setEnabled(False)
 
-        cfg = self._get_cfg()
+        cfg = self._get_cfg(); self._cfg = cfg
         self.worker = TrainWorker(self.folder, self.label_map, self.unknown_id, cfg)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.step.connect(self.loss_canvas.add_step)
@@ -616,17 +659,17 @@ class TrainingTab(QWidget):
               model, curves_fold):
         self.idx2name = idx2name
 
-        # Confusion-Matrix
+        # Confusion
         self.cm_placeholder.hide()
         self.cm_scroll = QScrollArea()
         self.cm_scroll.setWidget(ConfMatCanvas(cm, idx2name))
         self.cm_scroll.setWidgetResizable(True)
         self.cm_tab.layout().addWidget(self.cm_scroll, 1)
 
-        # PR-Curves
+        # PR-Kurven
         self.pr_placeholder.hide()
         curves_avg: dict[int, list[tuple[np.ndarray, np.ndarray, float]]] = {}
-        for fold, curves in curves_fold.items():
+        for curves in curves_fold.values():
             for i, cur in curves.items():
                 curves_avg.setdefault(i, []).append(cur)
         curves_final = {
@@ -679,29 +722,119 @@ class TrainingTab(QWidget):
             f"Macro-F1: {rep_dict['macro avg']['f1-score']*100:.2f}%   "
             f"Weighted-F1: {rep_dict['weighted avg']['f1-score']*100:.2f}%")
 
-        self._trained_model = model; self.btn_save.setEnabled(True)
-        self.btn_train.setEnabled(True)
+        self._train_info = dict(rep=rep_dict, cm=cm, curves=curves_final, τ=τ,
+                                n_total=n_total, n_val=n_val)
+        self._trained_model = model
+        self.btn_save.setEnabled(True); self.btn_train.setEnabled(True)
+
+    # --------------------------------------------------------------
+    def _create_pdf_report(self, pdf_path: Path):
+        if not self._train_info or not self._cfg: return
+        with PdfPages(pdf_path) as pdf:
+            fig, ax = plt.subplots(figsize=(8.27, 11.69))
+            ax.axis("off")
+            ax.set_title("Training-Parameter", fontsize=14, fontweight="bold", pad=20)
+            lines = [f"{k}: {v}" for k, v in self._cfg.items()]
+            ax.text(0.01, 0.98, "\n".join(lines), va="top", fontsize=10)
+            pdf.savefig(fig); plt.close(fig)
+
+            cm = self._train_info["cm"]; idx2name = self.idx2name
+            fig, ax = plt.subplots(figsize=(8, 8))
+            cm_pct = cm / cm.sum(axis=1, keepdims=True).clip(min=1) * 100
+            im = ax.imshow(cm_pct, cmap="Blues")
+            cbar = fig.colorbar(im, ax=ax, fraction=.046, pad=.04)
+            cbar.ax.set_ylabel("%", rotation=0, labelpad=15, weight="bold")
+            ticks = np.arange(len(idx2name))
+            ax.set_xticks(ticks); ax.set_yticks(ticks)
+            ax.set_xticklabels([idx2name[i] for i in ticks], rotation=45, ha="right")
+            ax.set_yticklabels([idx2name[i] for i in ticks])
+            ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+            ax.set_title("Confusion Matrix", fontweight="bold", pad=12)
+            thresh = cm_pct.max()/2
+            for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+                ax.text(j, i, f"{cm[i, j]}\n{cm_pct[i, j]:.0f}%",
+                        ha="center", va="center",
+                        color="white" if cm_pct[i, j] > thresh else "black",
+                        fontsize=7, weight="bold")
+            fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+
+            curves = self._train_info["curves"]
+            fig, ax = plt.subplots(figsize=(8, 6))
+            for i, (p, r, au) in curves.items():
+                ax.plot(r, p, label=f"{idx2name[i]} AUC={au:.2f}")
+            ax.set(xlabel="Recall", ylabel="Precision", title="PR-Kurven")
+            ax.legend(); fig.tight_layout(); pdf.savefig(fig); plt.close(fig)
+
+            rep = self._train_info["rep"]
+            classes = list(idx2name.values())
+            headers = ["Class", "Prec", "Recall", "F1", "Support"]
+            rows = [[cls,
+                     f"{rep[cls]['precision']*100:.1f}",
+                     f"{rep[cls]['recall']*100:.1f}",
+                     f"{rep[cls]['f1-score']*100:.1f}",
+                     rep[cls]['support']] for cls in classes]
+            for name in ["macro avg", "weighted avg"]:
+                d = rep[name]
+                rows.append([name.replace(" avg", " Avg"),
+                             f"{d['precision']*100:.1f}",
+                             f"{d['recall']*100:.1f}",
+                             f"{d['f1-score']*100:.1f}",
+                             d['support']])
+            rows.append(["Accuracy", "-", "-",
+                         f"{rep['accuracy']*100:.2f}", self._train_info['n_val']])
+
+            fig, ax = plt.subplots(figsize=(8.27, 11.69))
+            ax.axis('off')
+            ax.set_title("Metriken", fontsize=14, fontweight="bold", pad=20)
+            table = ax.table(cellText=rows, colLabels=headers, loc='center', cellLoc='center')
+            table.auto_set_font_size(False); table.set_fontsize(8); table.scale(1, 1.5)
+            pdf.savefig(fig); plt.close(fig)
+
+            fig, ax = plt.subplots(figsize=(8.27, 11.69))
+            ax.axis('off')
+            ax.set_title("Zusammenfassung", fontsize=14, fontweight="bold", pad=20)
+            lines = [
+                f"Erstellt: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Gesamte Samples: {_nice(self._train_info['n_total'])}",
+                f"Validierungs-Samples: {_nice(self._train_info['n_val'])}",
+                f"τ-Schwellwert (OOB): {self._train_info['τ']:.3f}",
+                f"Accuracy: {rep['accuracy']*100:.2f}%",
+                f"Macro-F1: {rep['macro avg']['f1-score']*100:.2f}%",
+            ]
+            ax.text(0.01, 0.98, "\n".join(lines), va='top', fontsize=11)
+            pdf.savefig(fig); plt.close(fig)
 
     # --------------------------------------------------------------
     def _save_model(self):
-        if not self._trained_model: return
-        path, _ = QFileDialog.getSaveFileName(self, "Modell speichern",
-                                              "", "PyTorch (*.pt *.pth)")
-        if path:
-            torch.save(self._trained_model.state_dict(), path)
-            self.txt_report.append(f"Model saved → {path}")
+        if not self._trained_model or not self._train_info:
+            QMessageBox.warning(self, "Kein Modell", "Trainiere zuerst ein Modell!")
+            return
+        base_dir = QFileDialog.getExistingDirectory(self, "Speicherort wählen", str(Path.home()))
+        if not base_dir: return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = f"HybridNet_{timestamp}"
+        folder = Path(base_dir) / model_name; folder.mkdir(parents=True, exist_ok=True)
 
+        torch.save(self._trained_model.state_dict(), folder/f"{model_name}.pt")
+        self._create_pdf_report(folder/f"{model_name}.pdf")
+        QMessageBox.information(self, "Export abgeschlossen",
+                                f"Modell + Bericht gespeichert in:\n{folder}")
+        self.txt_report.append(f"Package saved → {folder}")
+
+    # --------------------------------------------------------------
     def _export_onnx(self):
         if not self._trained_model:
             QMessageBox.warning(self, "Kein Modell", "Trainiere zuerst ein Modell!")
             return
         path, _ = QFileDialog.getSaveFileName(self, "ONNX-Export", "", "ONNX (*.onnx)")
         if not path: return
+        if not path.endswith(".onnx"): path += ".onnx"
         dummy = torch.randn(1, self._trained_model.in_channels, self.sp_win.value())
         torch.onnx.export(self._trained_model, dummy, path,
                           opset_version=16,
                           input_names=["imu"], output_names=["logits"])
-        QMessageBox.information(self, "ONNX-Export", "Modell erfolgreich exportiert.")
+        QMessageBox.information(self, "ONNX-Export",
+                                f"Modell erfolgreich exportiert:\n{path}")
 
 # ═══════════════════ main() ======================================
 if __name__ == "__main__":
