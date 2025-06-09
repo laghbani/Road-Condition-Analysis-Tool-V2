@@ -1255,7 +1255,10 @@ class MainWindow(QMainWindow):
         # AI menu
         m_ai = mb.addMenu("&AI")
         act_model = QAction("Select model …", self)
-        act_model.triggered.connect(self._select_ai_model)
+        # QAction.triggered sends a boolean "checked" argument which would
+        # otherwise be interpreted as the file path. Use a lambda to ignore it
+        # so that _select_ai_model() opens the file dialog correctly.
+        act_model.triggered.connect(lambda _: self._select_ai_model())
         m_ai.addAction(act_model)
 
         act_params = QAction("Model parameters …", self)
