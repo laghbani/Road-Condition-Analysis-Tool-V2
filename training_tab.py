@@ -20,7 +20,9 @@ from __future__ import annotations
 import os, sys, itertools, logging, contextlib
 from pathlib import Path
 from typing import Dict, List, Tuple
+import random
 from datetime import datetime
+import json
 
 import numpy as np
 import pandas as pd
@@ -32,7 +34,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix,
     precision_recall_curve, auc
 )
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -48,7 +50,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QSplitter, QFileDialog, QLabel, QPushButton,
-    QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget,
+    QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QTableWidget,
     QTableWidgetItem, QTextBrowser, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QFrame, QScrollArea, QHeaderView, QMessageBox
 )
@@ -83,6 +85,10 @@ def add_gauss(x: np.ndarray, snr_db: float = 25) -> np.ndarray:
 def sign_flip(x: np.ndarray, p: float = .5) -> np.ndarray:
     if np.random.rand() < p: x[:3] *= -1
     return x
+
+def scale_amplitude(x: np.ndarray, factor: float = 0.1) -> np.ndarray:
+    scale = np.random.uniform(1 - factor, 1 + factor)
+    return x * scale
 
 def time_warp(x: np.ndarray, factor: float = .1) -> np.ndarray:
     if not HAVE_AUDIO: return x
@@ -148,7 +154,7 @@ class IMUWindowDataset(Dataset):
                         specs.append(np.repeat(mag[:, None], L, axis=1))
                     win = np.concatenate([win, *specs], 0)
                 if augment:
-                    win = sign_flip(add_gauss(win))
+                    win = sign_flip(add_gauss(scale_amplitude(win)))
                 self.X.append(win); self.y.append(int(maj)); self.grp.append(csv.stem)
 
         if not self.X:
@@ -306,6 +312,10 @@ class TrainWorker(QThread):
     # --------------------------------------------------------------
     def run(self):                       # noqa: C901
         try:
+            seed = self.cfg.get("seed", 42)
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
             csvs = self._csvs()
             if not csvs:
                 raise RuntimeError("Keine CSV-Dateien gefunden.")
@@ -326,26 +336,38 @@ class TrainWorker(QThread):
                         for i, u in enumerate(uids)}
 
             groups = ds_all.grp
-            gkf = GroupKFold(n_splits=5)
+            if self.cfg["cv_folds"] > 1:
+                splitter = GroupKFold(n_splits=self.cfg["cv_folds"])
+                splits = list(splitter.split(ds_all.X, ds_all.y, groups))
+            else:
+                gss = GroupShuffleSplit(n_splits=1, test_size=self.cfg["split"], random_state=seed)
+                splits = list(gss.split(ds_all.X, ds_all.y, groups))
+            folds_total = len(splits)
 
             cm_total = np.zeros((len(uids), len(uids)), int)
             rep_acc, curves_fold = None, {}
             fold = 0
 
-            for tr_idx, va_idx in gkf.split(ds_all.X, ds_all.y, groups):
+            for tr_idx, va_idx in splits:
+                if self.isInterruptionRequested():
+                    return
                 fold += 1
-                self.log.emit(f"Fold {fold}/5 startet …")
+                self.log.emit(f"Fold {fold}/{folds_total} startet …")
 
                 # zuerst GPU, dann evtl. CPU
-                for attempt in (0, 1):
-                    device = (torch.device("cuda")
-                              if attempt == 0 and torch.cuda.is_available()
-                              else torch.device("cpu"))
+                devices = []
+                if self.cfg.get("use_gpu") and torch.cuda.is_available():
+                    devices.append(torch.device("cuda"))
+                devices.append(torch.device("cpu"))
+                for device in devices:
                     use_amp = device.type == "cuda"
                     try:
-                        cm_fold, rep_fold, curves = self._train_fold(
-                            fold, tr_idx, va_idx, ds_all,
+                        result = self._train_fold(
+                            fold, folds_total, tr_idx, va_idx, ds_all,
                             id2idx, idx2name, C_tot, device, use_amp)
+                        if result == (None, None, None):
+                            return
+                        cm_fold, rep_fold, curves = result
                         cm_total += cm_fold
                         if rep_acc is None:
                             rep_acc = {k:(v.copy() if isinstance(v, dict) else v)
@@ -365,31 +387,33 @@ class TrainWorker(QThread):
                             continue
                         raise
 
-                self.progress.emit(int(fold/5*100))
+                self.progress.emit(int(fold/folds_total*100))
 
             # Durchschnitts-Report
             for k, v in rep_acc.items():
                 if isinstance(v, dict):
-                    for m in v: rep_acc[k][m] /= 5
-                else: rep_acc[k] /= 5
+                    for m in v: rep_acc[k][m] /= folds_total
+                else: rep_acc[k] /= folds_total
             τ = _oob_threshold(cm_total.max(1), .95)
 
+            val_count = len(ds_all)//folds_total if folds_total > 1 else len(va_idx)
             self.finished.emit(rep_acc, cm_total, idx2name, τ,
-                               len(ds_all), len(ds_all)//5,
+                               len(ds_all), val_count,
                                self.last_model_cpu, curves_fold)
 
         except Exception as e:
             self.log.emit(f"Fehler im Training: {e}")
 
     # --------------------------------------------------------------
-    def _train_fold(self, fold: int,
+    def _train_fold(self, fold: int, folds_total: int,
                     tr_idx, va_idx, ds_all: IMUWindowDataset,
                     id2idx: Dict[int, int], idx2name: Dict[int, str],
                     C_tot: int, device: torch.device, use_amp: bool):
 
         X_tr, y_tr = ds_all.X[tr_idx], ds_all.y[tr_idx]
         if self.cfg["augment"]:
-            X_tr = np.stack([sign_flip(add_gauss(x)) for x in X_tr])
+            X_tr = np.stack([sign_flip(add_gauss(scale_amplitude(x)))
+                             for x in X_tr])
         y_tr_i = np.array([id2idx[v] for v in y_tr])
 
         ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
@@ -429,6 +453,8 @@ class TrainWorker(QThread):
 
         best_val, best_state, bad = float("inf"), None, 0
         for ep in range(1, self.cfg["epochs"]+1):
+            if self.isInterruptionRequested():
+                return None, None, None
             model.train(); tr_loss = 0.
             for xb, yb in dl_tr:
                 xb = xb.to(device, non_blocking=True)
@@ -456,7 +482,7 @@ class TrainWorker(QThread):
             probs = torch.cat(probs).numpy()
 
             self.step.emit(ep, tr_loss, val_loss)
-            self.progress.emit(int((fold-1+ep/self.cfg["epochs"])/5*100))
+            self.progress.emit(int((fold-1+ep/self.cfg["epochs"])/folds_total*100))
 
             if val_loss < best_val - 1e-4:
                 best_val, best_state, bad = val_loss, model.state_dict(), 0
@@ -542,6 +568,15 @@ class TrainingTab(QWidget):
         self.sp_fft.setEnabled(False); self.cb_fft.toggled.connect(self.sp_fft.setEnabled)
         self.cb_aug = QCheckBox("Augmentation"); self.cb_aug.setChecked(False)
         self.sp_smooth = QDoubleSpinBox(decimals=2, minimum=0., maximum=.2, value=.05)
+        self.cb_gpu = QCheckBox("Use GPU"); self.cb_gpu.setChecked(USE_CUDA)
+        self.cmb_cv = QComboBox(); self.cmb_cv.addItems(["Holdout", "5-Fold", "K-Fold"])
+        self.sp_kfold = QSpinBox(minimum=2, maximum=10, value=5); self.sp_kfold.setEnabled(False)
+        self.sp_split = QDoubleSpinBox(decimals=2, minimum=0.1, maximum=0.5, value=0.2)
+        self.sp_split.setEnabled(True)
+        self.cmb_cv.currentTextChanged.connect(lambda t: self.sp_kfold.setEnabled(t == "K-Fold"))
+        self.cmb_cv.currentTextChanged.connect(lambda t: self.sp_split.setEnabled(t == "Holdout"))
+        self.sp_seed = QSpinBox(minimum=0, maximum=999999, value=42)
+        self.cmb_arch = QComboBox(); self.cmb_arch.addItems(["HybridNet"])
 
         widgets = [
             ("Epochs", self.sp_epochs),
@@ -560,13 +595,23 @@ class TrainingTab(QWidget):
             ("FFT-Bins", self.sp_fft),
             ("Augment.", self.cb_aug),
             ("Label-Smooth", self.sp_smooth),
+            ("Use GPU", self.cb_gpu),
+            ("Cross-Validation", self.cmb_cv),
+            ("K", self.sp_kfold),
+            ("Split", self.sp_split),
+            ("Seed", self.sp_seed),
+            ("Architecture", self.cmb_arch),
         ]
         for lbl, w in widgets: form.addRow(lbl, w)
         lv.addLayout(form)
 
         self.btn_train = QPushButton("Train model")
         self.btn_train.clicked.connect(self._start)
-        lv.addWidget(self.btn_train)
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop)
+        row_btn = QHBoxLayout(); row_btn.addWidget(self.btn_train); row_btn.addWidget(self.btn_stop)
+        lv.addLayout(row_btn)
         self.progress = QProgressBar(); lv.addWidget(self.progress)
 
         splitter.addWidget(left); splitter.setStretchFactor(0, 1)
@@ -602,7 +647,9 @@ class TrainingTab(QWidget):
         self.btn_save.clicked.connect(self._save_model)
         self.btn_export = QPushButton("Export ONNX")
         self.btn_export.clicked.connect(self._export_onnx)
-        hb = QHBoxLayout(); hb.addWidget(self.btn_save); hb.addWidget(self.btn_export)
+        self.btn_load = QPushButton("Load Model")
+        self.btn_load.clicked.connect(self._load_model)
+        hb = QHBoxLayout(); hb.addWidget(self.btn_save); hb.addWidget(self.btn_export); hb.addWidget(self.btn_load)
         mt.addLayout(hb)
         self.tabs.addTab(self.met_tab, "Metrics")
 
@@ -623,6 +670,12 @@ class TrainingTab(QWidget):
             drop=self.sp_drop.value(), add_speed=self.cb_speed.isChecked(),
             fft_bins=self.sp_fft.value() if self.cb_fft.isChecked() else 0,
             augment=self.cb_aug.isChecked(), smooth=self.sp_smooth.value(),
+            use_gpu=self.cb_gpu.isChecked(),
+            cv_folds=(0 if self.cmb_cv.currentText()=="Holdout" else
+                      (5 if self.cmb_cv.currentText()=="5-Fold" else self.sp_kfold.value())),
+            split=self.sp_split.value(),
+            seed=self.sp_seed.value(),
+            arch=self.cmb_arch.currentText(),
         )
 
     # --------------------------------------------------------------
@@ -640,6 +693,7 @@ class TrainingTab(QWidget):
         self.worker.step.connect(self.loss_canvas.add_step)
         self.worker.log.connect(self._log_from_worker)
         self.worker.finished.connect(self._done)
+        self.btn_stop.setEnabled(True)
         self.worker.start()
 
     # --------------------------------------------------------------
@@ -653,6 +707,14 @@ class TrainingTab(QWidget):
                 self.tbl_stats.setItem(r, 0, it_cls); self.tbl_stats.setItem(r, 1, it_pts)
         else:
             self.txt_report.append(msg)
+
+    # --------------------------------------------------------------
+    def _stop(self):
+        if hasattr(self, "worker") and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait()
+        self.btn_stop.setEnabled(False)
+        self.btn_train.setEnabled(True)
 
     # --------------------------------------------------------------
     def _done(self, rep_dict, cm, idx2name, τ, n_total, n_val,
@@ -726,6 +788,7 @@ class TrainingTab(QWidget):
                                 n_total=n_total, n_val=n_val)
         self._trained_model = model
         self.btn_save.setEnabled(True); self.btn_train.setEnabled(True)
+        self.btn_stop.setEnabled(False)
 
     # --------------------------------------------------------------
     def _create_pdf_report(self, pdf_path: Path):
@@ -816,6 +879,11 @@ class TrainingTab(QWidget):
         folder = Path(base_dir) / model_name; folder.mkdir(parents=True, exist_ok=True)
 
         torch.save(self._trained_model.state_dict(), folder/f"{model_name}.pt")
+        cfg = dict(self._cfg)
+        cfg.update({"c_in": self._trained_model.in_channels,
+                    "n_cls": self._trained_model.fc.out_features})
+        with open(folder/"config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
         self._create_pdf_report(folder/f"{model_name}.pdf")
         QMessageBox.information(self, "Export abgeschlossen",
                                 f"Modell + Bericht gespeichert in:\n{folder}")
@@ -835,6 +903,26 @@ class TrainingTab(QWidget):
                           input_names=["imu"], output_names=["logits"])
         QMessageBox.information(self, "ONNX-Export",
                                 f"Modell erfolgreich exportiert:\n{path}")
+
+    # --------------------------------------------------------------
+    def _load_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Model", "", "Model (*.pt)")
+        if not path:
+            return
+        cfg_path = Path(path).with_name("config.json")
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        else:
+            cfg = self._get_cfg()
+        model = HybridNet(cfg.get("c_in", self.sp_base.value()), cfg.get("n_cls", len(self.label_map)),
+                          hidden=cfg.get("base", self.sp_base.value()),
+                          layers=cfg.get("layers", self.sp_layers.value()),
+                          drop=cfg.get("drop", self.sp_drop.value()))
+        state = torch.load(path, map_location="cpu")
+        model.load_state_dict(state)
+        self._trained_model = model
+        self.txt_report.append(f"Model loaded from {path}")
 
 # ═══════════════════ main() ======================================
 if __name__ == "__main__":
