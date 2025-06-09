@@ -437,7 +437,7 @@ class TrainWorker(QThread):
                         result = self._train_fold(
                             fold, total_steps, tr_idx, va_idx, ds_all,
                             id2idx, idx2name, C_tot, device, use_amp)
-                        if result == (None, None, None):
+                        if result is None:
                             return
                         cm_fold, rep_fold, curves = result
                         cm_total += cm_fold
@@ -555,7 +555,7 @@ class TrainWorker(QThread):
         best_val, best_state, bad = float("inf"), None, 0
         for ep in range(1, self.cfg["epochs"]+1):
             if self.isInterruptionRequested():
-                return None, None, None
+                return None
             model.train(); tr_loss = 0.
             for xb, yb in dl_tr:
                 xb = xb.to(device, non_blocking=True)
