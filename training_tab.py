@@ -20,7 +20,9 @@ from __future__ import annotations
 import os, sys, itertools, logging, contextlib
 from pathlib import Path
 from typing import Dict, List, Tuple
+import random
 from datetime import datetime
+import json
 
 import numpy as np
 import pandas as pd
@@ -32,7 +34,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix,
     precision_recall_curve, auc
 )
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -48,7 +50,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QSplitter, QFileDialog, QLabel, QPushButton,
-    QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget,
+    QProgressBar, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox, QTableWidget,
     QTableWidgetItem, QTextBrowser, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QFrame, QScrollArea, QHeaderView, QMessageBox
 )
@@ -82,6 +84,20 @@ def add_gauss(x: np.ndarray, snr_db: float = 25) -> np.ndarray:
 
 def sign_flip(x: np.ndarray, p: float = .5) -> np.ndarray:
     if np.random.rand() < p: x[:3] *= -1
+    return x
+
+def scale_amplitude(x: np.ndarray, factor: float = 0.1) -> np.ndarray:
+    scale = np.random.uniform(1 - factor, 1 + factor)
+    return x * scale
+
+def dropout_segment(x: np.ndarray, max_pct: float = 0.1) -> np.ndarray:
+    """Zero out a random short segment to simulate sensor dropout."""
+    if max_pct <= 0:
+        return x
+    L = x.shape[1]
+    span = max(1, int(L * max_pct))
+    start = np.random.randint(0, L - span + 1)
+    x[:, start:start + span] = 0
     return x
 
 def time_warp(x: np.ndarray, factor: float = .1) -> np.ndarray:
@@ -148,7 +164,7 @@ class IMUWindowDataset(Dataset):
                         specs.append(np.repeat(mag[:, None], L, axis=1))
                     win = np.concatenate([win, *specs], 0)
                 if augment:
-                    win = sign_flip(add_gauss(win))
+                    win = sign_flip(add_gauss(scale_amplitude(dropout_segment(win))))
                 self.X.append(win); self.y.append(int(maj)); self.grp.append(csv.stem)
 
         if not self.X:
@@ -204,6 +220,67 @@ class HybridNet(nn.Module):
         out, _ = self.lstm(x)
         rep = self.dropout(self.att(out))
         return self.fc(rep)
+
+class BasicBlock1D(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes: int, planes: int, stride: int = 1,
+                 downsample: nn.Module | None = None):
+        super().__init__()
+        self.conv1 = nn.Conv1d(inplanes, planes, 3, stride=stride,
+                               padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(planes, planes, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(planes)
+        self.downsample = downsample
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        out = self.relu(out)
+        return out
+
+class ResNet1D(nn.Module):
+    def __init__(self, c_in: int, n_cls: int, base: int = 64,
+                 layers: tuple[int, int, int, int] = (2, 2, 2, 2)):
+        super().__init__()
+        self.inplanes = base
+        self.conv1 = nn.Conv1d(c_in, base, 7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(base)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(3, stride=2, padding=1)
+        self.layer1 = self._make_layer(base, layers[0])
+        self.layer2 = self._make_layer(base*2, layers[1], stride=2)
+        self.layer3 = self._make_layer(base*4, layers[2], stride=2)
+        self.layer4 = self._make_layer(base*8, layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(base*8, n_cls)
+        self.in_channels = c_in
+    def _make_layer(self, planes: int, blocks: int, stride: int = 1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes:
+            downsample = nn.Sequential(
+                nn.Conv1d(self.inplanes, planes, 1, stride=stride, bias=False),
+                nn.BatchNorm1d(planes),
+            )
+        layers = [BasicBlock1D(self.inplanes, planes, stride, downsample)]
+        self.inplanes = planes
+        for _ in range(1, blocks):
+            layers.append(BasicBlock1D(self.inplanes, planes))
+        return nn.Sequential(*layers)
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return self.fc(x)
 
 # ═══════════════════ Focal-Loss & Metriken =======================
 class FocalLoss(nn.Module):
@@ -306,6 +383,10 @@ class TrainWorker(QThread):
     # --------------------------------------------------------------
     def run(self):                       # noqa: C901
         try:
+            seed = self.cfg.get("seed", 42)
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            random.seed(seed)
             csvs = self._csvs()
             if not csvs:
                 raise RuntimeError("Keine CSV-Dateien gefunden.")
@@ -326,26 +407,39 @@ class TrainWorker(QThread):
                         for i, u in enumerate(uids)}
 
             groups = ds_all.grp
-            gkf = GroupKFold(n_splits=5)
+            if self.cfg["cv_folds"] > 1:
+                splitter = GroupKFold(n_splits=self.cfg["cv_folds"])
+                splits = list(splitter.split(ds_all.X, ds_all.y, groups))
+            else:
+                gss = GroupShuffleSplit(n_splits=1, test_size=self.cfg["split"], random_state=seed)
+                splits = list(gss.split(ds_all.X, ds_all.y, groups))
+            folds_total = len(splits)
+            total_steps = folds_total + (1 if self.cfg.get("final_full") else 0)
 
             cm_total = np.zeros((len(uids), len(uids)), int)
             rep_acc, curves_fold = None, {}
             fold = 0
 
-            for tr_idx, va_idx in gkf.split(ds_all.X, ds_all.y, groups):
+            for tr_idx, va_idx in splits:
+                if self.isInterruptionRequested():
+                    return
                 fold += 1
-                self.log.emit(f"Fold {fold}/5 startet …")
+                self.log.emit(f"Fold {fold}/{folds_total} startet …")
 
                 # zuerst GPU, dann evtl. CPU
-                for attempt in (0, 1):
-                    device = (torch.device("cuda")
-                              if attempt == 0 and torch.cuda.is_available()
-                              else torch.device("cpu"))
+                devices = []
+                if self.cfg.get("use_gpu") and torch.cuda.is_available():
+                    devices.append(torch.device("cuda"))
+                devices.append(torch.device("cpu"))
+                for device in devices:
                     use_amp = device.type == "cuda"
                     try:
-                        cm_fold, rep_fold, curves = self._train_fold(
-                            fold, tr_idx, va_idx, ds_all,
+                        result = self._train_fold(
+                            fold, total_steps, tr_idx, va_idx, ds_all,
                             id2idx, idx2name, C_tot, device, use_amp)
+                        if result is None:
+                            return
+                        cm_fold, rep_fold, curves = result
                         cm_total += cm_fold
                         if rep_acc is None:
                             rep_acc = {k:(v.copy() if isinstance(v, dict) else v)
@@ -365,31 +459,65 @@ class TrainWorker(QThread):
                             continue
                         raise
 
-                self.progress.emit(int(fold/5*100))
+                self.progress.emit(int(fold/total_steps*100))
 
             # Durchschnitts-Report
             for k, v in rep_acc.items():
                 if isinstance(v, dict):
-                    for m in v: rep_acc[k][m] /= 5
-                else: rep_acc[k] /= 5
+                    for m in v: rep_acc[k][m] /= folds_total
+                else: rep_acc[k] /= folds_total
             τ = _oob_threshold(cm_total.max(1), .95)
 
+            if self.cfg.get("final_full"):
+                fold += 1
+                self.log.emit("Final training on all data …")
+                devices = []
+                if self.cfg.get("use_gpu") and torch.cuda.is_available():
+                    devices.append(torch.device("cuda"))
+                devices.append(torch.device("cpu"))
+                for device in devices:
+                    use_amp = device.type == "cuda"
+                    try:
+                        final_model = self._train_all(
+                            fold, total_steps, ds_all, id2idx, C_tot,
+                            device, use_amp)
+                        if final_model is not None:
+                            self.last_model_cpu = final_model
+                            break
+                    except RuntimeError as e:
+                        if ("out of memory" in str(e).lower() and device.type == "cuda"):
+                            self.log.emit("⚠️ GPU-OOM → Fallback auf CPU")
+                            torch.cuda.empty_cache()
+                            continue
+                        raise
+
+            val_count = len(ds_all)//folds_total if folds_total > 1 else len(va_idx)
             self.finished.emit(rep_acc, cm_total, idx2name, τ,
-                               len(ds_all), len(ds_all)//5,
+                               len(ds_all), val_count,
                                self.last_model_cpu, curves_fold)
 
         except Exception as e:
             self.log.emit(f"Fehler im Training: {e}")
 
+    def _create_model(self, c_in: int, n_cls: int) -> nn.Module:
+        arch = self.cfg.get("arch", "HybridNet")
+        if arch == "ResNet18":
+            return ResNet1D(c_in, n_cls)
+        return HybridNet(c_in, n_cls,
+                        hidden=self.cfg.get("base", 128),
+                        layers=self.cfg.get("layers", 2),
+                        drop=self.cfg.get("drop", 0.5))
+
     # --------------------------------------------------------------
-    def _train_fold(self, fold: int,
+    def _train_fold(self, fold: int, steps_total: int,
                     tr_idx, va_idx, ds_all: IMUWindowDataset,
                     id2idx: Dict[int, int], idx2name: Dict[int, str],
                     C_tot: int, device: torch.device, use_amp: bool):
 
         X_tr, y_tr = ds_all.X[tr_idx], ds_all.y[tr_idx]
         if self.cfg["augment"]:
-            X_tr = np.stack([sign_flip(add_gauss(x)) for x in X_tr])
+            X_tr = np.stack([sign_flip(add_gauss(scale_amplitude(dropout_segment(x))))
+                             for x in X_tr])
         y_tr_i = np.array([id2idx[v] for v in y_tr])
 
         ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
@@ -410,10 +538,7 @@ class TrainWorker(QThread):
                           torch.from_numpy(y_va_i)),
             batch_size=self.cfg["batch"], pin_memory=(device.type == "cuda"))
 
-        model = HybridNet(C_tot, len(uids:=id2idx),
-                          hidden=self.cfg["base"],
-                          layers=self.cfg["layers"],
-                          drop=self.cfg["drop"]).to(device)
+        model = self._create_model(C_tot, len(uids:=id2idx)).to(device)
 
         alpha = torch.tensor(compute_class_weight(
             "balanced", classes=np.arange(len(uids)), y=y_tr_i_r)).float().to(device)
@@ -429,6 +554,8 @@ class TrainWorker(QThread):
 
         best_val, best_state, bad = float("inf"), None, 0
         for ep in range(1, self.cfg["epochs"]+1):
+            if self.isInterruptionRequested():
+                return None
             model.train(); tr_loss = 0.
             for xb, yb in dl_tr:
                 xb = xb.to(device, non_blocking=True)
@@ -456,7 +583,7 @@ class TrainWorker(QThread):
             probs = torch.cat(probs).numpy()
 
             self.step.emit(ep, tr_loss, val_loss)
-            self.progress.emit(int((fold-1+ep/self.cfg["epochs"])/5*100))
+            self.progress.emit(int((fold-1+ep/self.cfg["epochs"])/steps_total*100))
 
             if val_loss < best_val - 1e-4:
                 best_val, best_state, bad = val_loss, model.state_dict(), 0
@@ -480,6 +607,62 @@ class TrainWorker(QThread):
         curves = pr_curves(y_va_i, prob_va, len(uids))
 
         return cm_fold, rep_fold, curves
+
+    def _train_all(self, fold: int, steps_total: int,
+                   ds_all: IMUWindowDataset, id2idx: Dict[int, int],
+                   C_tot: int, device: torch.device, use_amp: bool):
+        X_tr = ds_all.X
+        if self.cfg["augment"]:
+            X_tr = np.stack([
+                sign_flip(add_gauss(scale_amplitude(dropout_segment(x))))
+                for x in X_tr])
+        y_tr_i = np.array([id2idx[v] for v in ds_all.y])
+
+        ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
+        X_tr_r, y_tr_i_r = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
+        X_tr_r = X_tr_r.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
+
+        dl_tr = DataLoader(
+            TensorDataset(torch.from_numpy(X_tr_r),
+                          torch.from_numpy(y_tr_i_r)),
+            batch_size=self.cfg["batch"], shuffle=True,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        model = self._create_model(C_tot, len(id2idx)).to(device)
+        alpha = torch.tensor(compute_class_weight(
+            "balanced", classes=np.arange(len(id2idx)), y=y_tr_i_r)).float().to(device)
+        crit = FocalLoss(alpha, gamma=1.0,
+                         smooth=max(.05, self.cfg["smooth"]))
+        opt  = torch.optim.AdamW(model.parameters(),
+                                 lr=self.cfg["lr"], weight_decay=self.cfg["wd"])
+        sched = OneCycleLR(opt, max_lr=self.cfg["lr"],
+                           steps_per_epoch=len(dl_tr),
+                           epochs=self.cfg["epochs"])
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+        for ep in range(1, self.cfg["epochs"]+1):
+            if self.isInterruptionRequested():
+                return None
+            model.train(); tr_loss = 0.
+            for xb, yb in dl_tr:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                opt.zero_grad()
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    logits = model(xb); loss = crit(logits, yb)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+                scaler.step(opt); scaler.update(); sched.step()
+                tr_loss += loss.item()*len(xb)
+            tr_loss /= len(dl_tr.dataset)
+
+            self.step.emit(ep, tr_loss, tr_loss)
+            self.progress.emit(int((fold-1+ep/self.cfg["epochs"]) / steps_total*100))
+
+        model.cpu()
+        return model
 
 # ═══════════════════ Qt-GUI ======================================
 class TrainingTab(QWidget):
@@ -542,6 +725,16 @@ class TrainingTab(QWidget):
         self.sp_fft.setEnabled(False); self.cb_fft.toggled.connect(self.sp_fft.setEnabled)
         self.cb_aug = QCheckBox("Augmentation"); self.cb_aug.setChecked(False)
         self.sp_smooth = QDoubleSpinBox(decimals=2, minimum=0., maximum=.2, value=.05)
+        self.cb_gpu = QCheckBox("Use GPU"); self.cb_gpu.setChecked(USE_CUDA)
+        self.cmb_cv = QComboBox(); self.cmb_cv.addItems(["Holdout", "5-Fold", "K-Fold"])
+        self.sp_kfold = QSpinBox(minimum=2, maximum=10, value=5); self.sp_kfold.setEnabled(False)
+        self.sp_split = QDoubleSpinBox(decimals=2, minimum=0.1, maximum=0.5, value=0.2)
+        self.sp_split.setEnabled(True)
+        self.cmb_cv.currentTextChanged.connect(lambda t: self.sp_kfold.setEnabled(t == "K-Fold"))
+        self.cmb_cv.currentTextChanged.connect(lambda t: self.sp_split.setEnabled(t == "Holdout"))
+        self.sp_seed = QSpinBox(minimum=0, maximum=999999, value=42)
+        self.cmb_arch = QComboBox(); self.cmb_arch.addItems(["HybridNet", "ResNet18"])
+        self.cb_final = QCheckBox("Final full training"); self.cb_final.setChecked(True)
 
         widgets = [
             ("Epochs", self.sp_epochs),
@@ -560,13 +753,24 @@ class TrainingTab(QWidget):
             ("FFT-Bins", self.sp_fft),
             ("Augment.", self.cb_aug),
             ("Label-Smooth", self.sp_smooth),
+            ("Use GPU", self.cb_gpu),
+            ("Cross-Validation", self.cmb_cv),
+            ("K", self.sp_kfold),
+            ("Split", self.sp_split),
+            ("Seed", self.sp_seed),
+            ("Architecture", self.cmb_arch),
+            ("Train Full", self.cb_final),
         ]
         for lbl, w in widgets: form.addRow(lbl, w)
         lv.addLayout(form)
 
         self.btn_train = QPushButton("Train model")
         self.btn_train.clicked.connect(self._start)
-        lv.addWidget(self.btn_train)
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop)
+        row_btn = QHBoxLayout(); row_btn.addWidget(self.btn_train); row_btn.addWidget(self.btn_stop)
+        lv.addLayout(row_btn)
         self.progress = QProgressBar(); lv.addWidget(self.progress)
 
         splitter.addWidget(left); splitter.setStretchFactor(0, 1)
@@ -602,7 +806,9 @@ class TrainingTab(QWidget):
         self.btn_save.clicked.connect(self._save_model)
         self.btn_export = QPushButton("Export ONNX")
         self.btn_export.clicked.connect(self._export_onnx)
-        hb = QHBoxLayout(); hb.addWidget(self.btn_save); hb.addWidget(self.btn_export)
+        self.btn_load = QPushButton("Load Model")
+        self.btn_load.clicked.connect(self._load_model)
+        hb = QHBoxLayout(); hb.addWidget(self.btn_save); hb.addWidget(self.btn_export); hb.addWidget(self.btn_load)
         mt.addLayout(hb)
         self.tabs.addTab(self.met_tab, "Metrics")
 
@@ -623,6 +829,13 @@ class TrainingTab(QWidget):
             drop=self.sp_drop.value(), add_speed=self.cb_speed.isChecked(),
             fft_bins=self.sp_fft.value() if self.cb_fft.isChecked() else 0,
             augment=self.cb_aug.isChecked(), smooth=self.sp_smooth.value(),
+            use_gpu=self.cb_gpu.isChecked(),
+            cv_folds=(0 if self.cmb_cv.currentText()=="Holdout" else
+                      (5 if self.cmb_cv.currentText()=="5-Fold" else self.sp_kfold.value())),
+            split=self.sp_split.value(),
+            seed=self.sp_seed.value(),
+            arch=self.cmb_arch.currentText(),
+            final_full=self.cb_final.isChecked(),
         )
 
     # --------------------------------------------------------------
@@ -640,6 +853,7 @@ class TrainingTab(QWidget):
         self.worker.step.connect(self.loss_canvas.add_step)
         self.worker.log.connect(self._log_from_worker)
         self.worker.finished.connect(self._done)
+        self.btn_stop.setEnabled(True)
         self.worker.start()
 
     # --------------------------------------------------------------
@@ -653,6 +867,14 @@ class TrainingTab(QWidget):
                 self.tbl_stats.setItem(r, 0, it_cls); self.tbl_stats.setItem(r, 1, it_pts)
         else:
             self.txt_report.append(msg)
+
+    # --------------------------------------------------------------
+    def _stop(self):
+        if hasattr(self, "worker") and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait()
+        self.btn_stop.setEnabled(False)
+        self.btn_train.setEnabled(True)
 
     # --------------------------------------------------------------
     def _done(self, rep_dict, cm, idx2name, τ, n_total, n_val,
@@ -726,6 +948,7 @@ class TrainingTab(QWidget):
                                 n_total=n_total, n_val=n_val)
         self._trained_model = model
         self.btn_save.setEnabled(True); self.btn_train.setEnabled(True)
+        self.btn_stop.setEnabled(False)
 
     # --------------------------------------------------------------
     def _create_pdf_report(self, pdf_path: Path):
@@ -812,10 +1035,16 @@ class TrainingTab(QWidget):
         base_dir = QFileDialog.getExistingDirectory(self, "Speicherort wählen", str(Path.home()))
         if not base_dir: return
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_name = f"HybridNet_{timestamp}"
+        model_name = f"{self._cfg.get('arch','Model')}_{timestamp}"
         folder = Path(base_dir) / model_name; folder.mkdir(parents=True, exist_ok=True)
 
         torch.save(self._trained_model.state_dict(), folder/f"{model_name}.pt")
+        cfg = dict(self._cfg)
+        cfg.update({"c_in": self._trained_model.in_channels,
+                    "n_cls": self._trained_model.fc.out_features,
+                    "arch": self._cfg.get("arch", "HybridNet")})
+        with open(folder/"config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
         self._create_pdf_report(folder/f"{model_name}.pdf")
         QMessageBox.information(self, "Export abgeschlossen",
                                 f"Modell + Bericht gespeichert in:\n{folder}")
@@ -835,6 +1064,25 @@ class TrainingTab(QWidget):
                           input_names=["imu"], output_names=["logits"])
         QMessageBox.information(self, "ONNX-Export",
                                 f"Modell erfolgreich exportiert:\n{path}")
+
+    # --------------------------------------------------------------
+    def _load_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Model", "", "Model (*.pt)")
+        if not path:
+            return
+        cfg_path = Path(path).with_name("config.json")
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        else:
+            cfg = self._get_cfg()
+        self._cfg = cfg
+        model = self._create_model(cfg.get("c_in", self.sp_base.value()),
+                                   cfg.get("n_cls", len(self.label_map)))
+        state = torch.load(path, map_location="cpu")
+        model.load_state_dict(state)
+        self._trained_model = model
+        self.txt_report.append(f"Model loaded from {path}")
 
 # ═══════════════════ main() ======================================
 if __name__ == "__main__":
