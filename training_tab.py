@@ -666,6 +666,8 @@ class TrainWorker(QThread):
 
 # ═══════════════════ Qt-GUI ======================================
 class TrainingTab(QWidget):
+    model_saved = pyqtSignal(str)
+
     def __init__(self, label_map: Dict[str, int], unknown_id: int,
                  start_folder: Path | None = None):
         super().__init__()
@@ -1038,17 +1040,26 @@ class TrainingTab(QWidget):
         model_name = f"{self._cfg.get('arch','Model')}_{timestamp}"
         folder = Path(base_dir) / model_name; folder.mkdir(parents=True, exist_ok=True)
 
-        torch.save(self._trained_model.state_dict(), folder/f"{model_name}.pt")
+        pt_path = folder / f"{model_name}.pt"
+        torch.save(self._trained_model.state_dict(), pt_path)
         cfg = dict(self._cfg)
-        cfg.update({"c_in": self._trained_model.in_channels,
-                    "n_cls": self._trained_model.fc.out_features,
-                    "arch": self._cfg.get("arch", "HybridNet")})
+        cfg.update({
+            "c_in": self._trained_model.in_channels,
+            "n_cls": self._trained_model.fc.out_features,
+            "arch": self._cfg.get("arch", "HybridNet"),
+            "threshold": self._train_info.get("τ") if self._train_info else None,
+        })
         with open(folder/"config.json", "w") as f:
             json.dump(cfg, f, indent=2)
         self._create_pdf_report(folder/f"{model_name}.pdf")
-        QMessageBox.information(self, "Export abgeschlossen",
-                                f"Modell + Bericht gespeichert in:\n{folder}")
+        reply = QMessageBox.question(
+            self,
+            "Export abgeschlossen",
+            f"Modell + Bericht gespeichert in:\n{folder}\nIn Hauptprogramm laden?",
+        )
         self.txt_report.append(f"Package saved → {folder}")
+        if reply == QMessageBox.Yes:
+            self.model_saved.emit(str(pt_path))
 
     # --------------------------------------------------------------
     def _export_onnx(self):

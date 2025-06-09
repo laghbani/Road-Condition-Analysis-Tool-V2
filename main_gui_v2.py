@@ -142,7 +142,7 @@ try:
     from progress_ui import ProgressWindow
     from videopc_widget import VideoPointCloudTab
     from stats_tab import StatsTab
-    from training_tab import TrainingTab, HybridNet
+    from training_tab import TrainingTab, HybridNet, ResNet1D
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
     sys.exit(1)
@@ -1092,6 +1092,7 @@ class MainWindow(QMainWindow):
 
         # ------------------------------------------------------ Train
         self.tab_train = TrainingTab(MainWindow.LABEL_IDS, UNKNOWN_ID)
+        self.tab_train.model_saved.connect(lambda p: self._select_ai_model(p))
         self.tabs.addTab(self.tab_train, "Train")
 
         self.tabs.currentChanged.connect(self._tab_changed)
@@ -1263,6 +1264,7 @@ class MainWindow(QMainWindow):
 
         self.act_auto_ai = QAction("Auto labeling", self, checkable=True)
         self.act_auto_ai.setChecked(False)
+        self.act_auto_ai.setEnabled(False)
         self.act_auto_ai.toggled.connect(self._toggle_auto_label)
         m_ai.addAction(self.act_auto_ai)
 
@@ -2121,33 +2123,62 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     # -------------------------------------------------------------- AI actions
-    def _select_ai_model(self) -> None:
+    def _select_ai_model(self, path: str | None = None) -> None:
         start = "/home/afius/Desktop/anomaly-data-hs-merseburg/"
         filt = "Model (*.pt *.pth *.onnx);;PyTorch Model (*.pt *.pth);;ONNX Model (*.onnx);;All Files (*)"
-        path, _ = QFileDialog.getOpenFileName(self, "Select AI model", start, filt)
-        if not path:
-            return
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, "Select AI model", start, filt)
+            if not path:
+                return
         try:
             ext = pathlib.Path(path).suffix.lower()
             self.ai_model_path = path
             self.ai_model = None
             self.ai_session = None
             self.ai_in_channels = 0
+            cfg: dict = {}
             if ext == ".onnx":
                 if ort is None:
-                    raise RuntimeError("onnxruntime not available")
+                    QMessageBox.warning(self, "Model load", "ONNX model cannot be loaded because onnxruntime is not installed.")
+                    return
                 self.ai_session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
                 inp = self.ai_session.get_inputs()[0]
                 if len(inp.shape) >= 3 and inp.shape[1] is not None:
                     self.ai_in_channels = int(inp.shape[1])
             else:
+                cfg_path = pathlib.Path(path).with_name("config.json")
+                arch = "HybridNet"
+                c_in = None
+                n_cls = len(self.LABEL_IDS)
+                if cfg_path.exists():
+                    with open(cfg_path, "r") as f:
+                        cfg = json.load(f)
+                    arch = cfg.get("arch", arch)
+                    c_in = cfg.get("c_in", None)
+                    n_cls = cfg.get("n_cls", n_cls)
+                    self.ai_params["window"] = cfg.get("window", self.ai_params["window"])
+                    self.ai_params["stride"] = cfg.get("stride", self.ai_params["stride"])
+                    if "threshold" in cfg:
+                        self.ai_params["threshold"] = cfg["threshold"]
                 state = torch.load(path, map_location="cpu")
-                key = next(k for k in state if k.endswith("weight"))
-                c_in = state[key].shape[1]
+                if c_in is None:
+                    first_weight = next(k for k in state if k.endswith(".weight"))
+                    c_in = state[first_weight].shape[1]
                 self.ai_in_channels = int(c_in)
-                self.ai_model = HybridNet(c_in, len(self.LABEL_IDS))
-                self.ai_model.load_state_dict(state)
-                self.ai_model.eval()
+                if arch == "ResNet18":
+                    model = ResNet1D(c_in, n_cls)
+                else:
+                    model = HybridNet(c_in, n_cls)
+                try:
+                    model.load_state_dict(state)
+                except RuntimeError as e:
+                    QMessageBox.warning(self, "Model load", f"Weights do not match architecture: {e}")
+                    return
+                model.eval()
+                self.ai_model = model
+            self.act_auto_ai.setEnabled(True)
+            self.statusBar().showMessage(f"Model loaded: {path}", 5000)
+            QMessageBox.information(self, "Model load", f"Model loaded: {path}")
         except Exception as exc:
             QMessageBox.warning(self, "Model load", f"Failed to load model: {exc}")
 
