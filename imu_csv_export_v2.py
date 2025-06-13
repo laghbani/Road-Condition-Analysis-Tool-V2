@@ -20,19 +20,8 @@ from sensor_msgs_py import point_cloud2 as pc2
 from videopc_widget import _pc_to_xyz
 
 # label colors used for exporting labeled plots
-ANOMALY_COLORS = {
-    "normal": "#00FF00",
-    "depression": "#FF0000",
-    "cover": "#FFA500",
-    "cobble road/ traditional road": "#FFFF00",
-    "transverse grove": "#008000",
-    "gravel road": "#FAF2A1",
-    "cracked / irregular pavement and aspahlt": "#E06D06",
-    "bump": "#54F2F2",
-    "uneven/repaired asphalt road": "#A30B37",
-    "Damaged pavemant / asphalt road": "#2B15AA",
-}
-UNKNOWN_NAME = "unknown"
+from labels import ANOMALY_TYPES, UNKNOWN_NAME
+ANOMALY_COLORS = {n: props["color"] for n, props in ANOMALY_TYPES.items()}
 
 
 CITY_BBOX = {
@@ -41,6 +30,11 @@ CITY_BBOX = {
     "Leipzig": ((51.28, 51.42), (12.20, 12.48)),
     "Berlin": ((52.30, 52.65), (13.00, 13.80)),
     "Munich": ((48.09, 48.23), (11.45, 11.65)),
+    "Harz": ((51.60, 51.90), (10.20, 10.90)),
+    "Freiberg": ((50.85, 50.95), (13.30, 13.40)),
+    "Freiburg": ((47.95, 48.05), (7.80, 7.95)),
+    "Schkeuditz": ((51.36, 51.44), (12.13, 12.26)),
+    "Köhten": ((51.70, 51.75), (11.90, 12.05)),
 }
 
 
