@@ -97,8 +97,9 @@ class RebuildTab(QWidget):
         opt.addStretch()
         v_data.addLayout(opt)
 
-        self.fig = Figure(layout="constrained")
+        self.fig = Figure(figsize=(9, 6), layout="constrained")
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setMinimumHeight(400)
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
         v_data.addWidget(self.canvas, 1)
 
@@ -282,10 +283,13 @@ class RebuildTab(QWidget):
             return [self.csv_dfs[self.current_csv]]
         return [self.csv_dfs[self.view_csv]]
 
-    def _apply_range(self, start: float, end: float, lid: int, lname: str) -> None:
+    def _apply_range(self, start: float, end: float, lid: int, lname: str,
+                     old_lid: int | None = None) -> None:
         eps = 1e-3
         for df in self._selected_dfs():
             mask = (df["time"] >= start - eps) & (df["time"] <= end + eps)
+            if old_lid is not None:
+                mask &= df["label_id"] == old_lid
             df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
 
     def _add_label(self) -> None:
@@ -414,6 +418,7 @@ class RebuildTab(QWidget):
             i1 += 1
         start = df.loc[i0, "time"]
         end = df.loc[i1, "time"]
+        old_id = df.loc[i0, "label_id"]
 
         if event.button == 1:
             dlg = LabelEditDialog(lbl, self)
@@ -421,9 +426,9 @@ class RebuildTab(QWidget):
                 return
             lname = dlg.result()
             lid = LABEL_IDS[lname]
-            self._apply_range(start, end, lid, lname)
+            self._apply_range(start, end, lid, lname, old_id)
             self._draw()
         elif event.button == 3 and event.dblclick:
-            self._apply_range(start, end, UNKNOWN_ID, UNKNOWN_NAME)
+            self._apply_range(start, end, UNKNOWN_ID, UNKNOWN_NAME, old_id)
             self._draw()
         
