@@ -142,6 +142,7 @@ try:
     from progress_ui import ProgressWindow
     from videopc_widget import VideoPointCloudTab
     from stats_tab import StatsTab
+    from rebuild_tab import RebuildTab
     from training_tab import TrainingTab, HybridNet, ResNet1D
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
@@ -184,19 +185,10 @@ DEFAULT_OVERRIDES: dict[str, np.ndarray] = {
 # ===========================================================================
 # Label-Mapping
 # ===========================================================================
-ANOMALY_TYPES: Dict[str, Dict[str, str | int]] = {
-    "normal": {"score": 0,  "color": "#00FF00"},
-    "depression": {"score": 4, "color": "#FF0000"},
-    "cover": {"score": 2, "color": "#FFA500"},
-    "cobble road/ traditional road": {"score": 1, "color": "#FFFF00"},
-    "transverse grove": {"score": 1, "color": "#008000"},
-    "gravel road": {"score": 4, "color": "#FAF2A1"},
-    "cracked / irregular pavement and aspahlt": {"score": 2, "color": "#E06D06"},
-    "bump": {"score": 1, "color": "#54F2F2"},
-    "uneven/repaired asphalt road": {"score": 1, "color": "#A30B37"},
-    "Damaged pavemant / asphalt road": {"score": 4, "color": "#2B15AA"},
-}
-UNKNOWN_ID, UNKNOWN_NAME, UNKNOWN_COLOR = 99, "unknown", "#808080"
+from labels import (
+    ANOMALY_TYPES, LABEL_IDS as GLOBAL_LABEL_IDS,
+    UNKNOWN_ID, UNKNOWN_NAME, UNKNOWN_COLOR,
+)
 
 # ===========================================================================
 # Dataclass IMU
@@ -956,7 +948,7 @@ class EditLabelCmd(QUndoCommand):
 # Main-Window
 # ===========================================================================
 class MainWindow(QMainWindow):
-    LABEL_IDS = {name: i + 1 for i, name in enumerate(ANOMALY_TYPES)}
+    LABEL_IDS = GLOBAL_LABEL_IDS
 
     def __init__(self) -> None:
         super().__init__()
@@ -1089,6 +1081,10 @@ class MainWindow(QMainWindow):
         colors[UNKNOWN_NAME] = UNKNOWN_COLOR
         self.tab_stats = StatsTab(colors, UNKNOWN_NAME)
         self.tabs.addTab(self.tab_stats, "Stats")
+
+        # ------------------------------------------------------ Rebuild
+        self.tab_rebuild = RebuildTab()
+        self.tabs.addTab(self.tab_rebuild, "Rebuild")
 
         # ------------------------------------------------------ Train
         self.tab_train = TrainingTab(MainWindow.LABEL_IDS, UNKNOWN_ID)
