@@ -434,9 +434,18 @@ class SlamBuilderWorker(QThread):
                         from kiss_icp.config import KissConfig
                     except Exception:
                         from kiss_icp.config import KISSConfig as KissConfig  # type: ignore
-                cfg = KissConfig()
-                if hasattr(cfg, 'voxel_size'):
-                    cfg.voxel_size = self.voxel
+                # Some versions of kiss-icp require voxel_size at init
+                try:
+                    cfg = KissConfig(voxel_size=self.voxel)
+                except Exception:
+                    cfg = KissConfig()
+                    try:
+                        cfg.voxel_size = self.voxel
+                    except Exception:
+                        try:
+                            cfg.hash_map.voxel_size = self.voxel  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
                 slam = KissICP(cfg)
             self.setMaximum.emit(len(self.pcs))
             world_pts: list[np.ndarray] = []
