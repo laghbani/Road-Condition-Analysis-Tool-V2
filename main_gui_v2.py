@@ -27,6 +27,7 @@ except Exception:
     ort = None
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 import pandas as pd
 import json
 import os
@@ -378,20 +379,23 @@ class BagReaderWorker(QThread):
 
 
 # ===========================================================================
-# Map Builder Thread
+# SLAM Builder Thread
 # ===========================================================================
-class MapBuilderWorker(QThread):
-    """Worker thread to aggregate point clouds into a single array."""
+class SlamBuilderWorker(QThread):
+    """Worker thread running a small SLAM pipeline."""
 
     stepChanged = pyqtSignal(str)
     setMaximum = pyqtSignal(int)
     progress = pyqtSignal(int)
     finished = pyqtSignal(object, object)
 
-    def __init__(self, pcs: list[PointCloud2], voxel_size: float) -> None:
+    def __init__(self, pcs: list[PointCloud2], imu: list[ImuSample], delay: float, voxel_size: float, mode: int) -> None:
         super().__init__()
         self.pcs = pcs
+        self.imu = imu
+        self.delay = delay
         self.voxel = voxel_size
+        self.mode = mode
 
     @staticmethod
     def _downsample(points: np.ndarray, voxel: float) -> np.ndarray:
@@ -401,21 +405,53 @@ class MapBuilderWorker(QThread):
         _, idx = np.unique(grid, axis=0, return_index=True)
         return points[sorted(idx)]
 
+    def _predict_pose(self, last_t: float, cur_t: float) -> np.ndarray:
+        """Very coarse IMU integration for orientation."""
+        if not self.imu:
+            return np.eye(4)
+        w = [s.msg.angular_velocity for s in self.imu if last_t <= s.time_abs + self.delay <= cur_t]
+        if not w:
+            return np.eye(4)
+        arr = np.array([[v.x, v.y, v.z] for v in w], float)
+        dt = cur_t - last_t
+        rot_vec = arr.mean(0) * dt
+        Rm = Rotation.from_rotvec(rot_vec).as_matrix()
+        T = np.eye(4)
+        T[:3, :3] = Rm
+        return T
+
     def run(self) -> None:
         try:
-            self.stepChanged.emit("Processing point clouds …")
+            if self.mode == 0:
+                from kiss_icp.pipeline import KissICP, KissConfig
+                cfg = KissConfig()
+                cfg.voxel_size = self.voxel
+                slam = KissICP(cfg)
             self.setMaximum.emit(len(self.pcs))
-            all_pts: list[np.ndarray] = []
+            world_pts: list[np.ndarray] = []
+            last_t = None
             for i, msg in enumerate(self.pcs):
+                self.stepChanged.emit(f"Frame {i}/{len(self.pcs)}")
                 pts = videopc_widget._pc_to_xyz(msg)
-                pts = self._downsample(pts, self.voxel)
-                all_pts.append(pts)
-                if i % 10 == 0:
+                if self.mode == 0:
+                    stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                    init = np.eye(4) if last_t is None else self._predict_pose(last_t, stamp)
+                    slam.register_frame(pts, init_guess=init)
+                    T_w_s = slam.pose
+                    pts_w = (T_w_s @ np.c_[pts, np.ones(len(pts))].T).T[:, :3]
+                    world_pts.append(self._downsample(pts_w, self.voxel))
+                    last_t = stamp
+                else:
+                    pts = self._downsample(pts, self.voxel)
+                    world_pts.append(pts)
+                if i % 5 == 0:
                     self.progress.emit(i)
-            self.progress.emit(len(self.pcs))
-            arr = np.vstack(all_pts) if all_pts else np.empty((0, 3), np.float32)
+            if self.mode == 0:
+                arr = np.vstack(world_pts) if world_pts else np.empty((0, 3), np.float32)
+            else:
+                arr = np.vstack(world_pts) if world_pts else np.empty((0, 3), np.float32)
             self.finished.emit(arr, None)
-        except Exception as exc:  # pragma: no cover - worker error path
+        except Exception as exc:
             self.finished.emit(None, exc)
 
 
@@ -858,7 +894,7 @@ class SlamSettingsDialog(QDialog):
         form.addRow("Voxel size [m]", self.sb_voxel)
 
         self.cmb_mode = QComboBox()
-        self.cmb_mode.addItems(["Fast-LIO2", "Simple ICP"])
+        self.cmb_mode.addItems(["KISS-ICP (Standard)", "Simple ICP"])
         self.cmb_mode.setCurrentIndex(mode)
         form.addRow("Mode", self.cmb_mode)
 
@@ -1120,7 +1156,7 @@ class MainWindow(QMainWindow):
         self.slam_map: np.ndarray | None = None
 
         self.act_export_map: QAction | None = None
-        self.map_worker: MapBuilderWorker | None = None
+        self.map_worker: SlamBuilderWorker | None = None
 
         self._build_menu()
         self._build_ui()
@@ -2280,7 +2316,14 @@ class MainWindow(QMainWindow):
             return
         steps = ["Processing point clouds", "Finalize"]
         progress = ProgressWindow("Build Map", steps, parent=self)
-        self.map_worker = MapBuilderWorker(pcs, self.slam_voxel_size)
+        imu = self.samples.get(self.slam_imu_topic or "", [])
+        self.map_worker = SlamBuilderWorker(
+            pcs,
+            imu,
+            delay=self.slam_sensor_delay,
+            voxel_size=self.slam_voxel_size,
+            mode=self.slam_mode_index,
+        )
         self.map_worker.stepChanged.connect(progress.advance)
         self.map_worker.setMaximum.connect(progress.set_bar_range)
         self.map_worker.progress.connect(progress.set_bar_value)
