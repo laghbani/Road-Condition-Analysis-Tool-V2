@@ -165,6 +165,7 @@ class VideoPointCloudTab(QWidget):
         self.scatter_item: GLScatterPlotItem | None = None
         self._last_pts: np.ndarray | None = None
         self._last_cols: np.ndarray | None = None
+        self.map_pts: np.ndarray | None = None
         self.point_size = self.spn_size.value()
         self.sync_index = 0
         self.timer = QTimer(self)
@@ -342,19 +343,6 @@ class VideoPointCloudTab(QWidget):
         if not self.pc_arrays:
             return
 
-        QFileDialog = _get_qt_widget(self, "QFileDialog")
-        if QFileDialog is None:
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save LIDAR Map",
-            "lidar_map.pcd",
-            "PCD Files (*.pcd)"
-        )
-        if not path:
-            return
-
         pts = build_map(
             self.pc_arrays,
             step=self.spn_step.value(),
@@ -363,9 +351,21 @@ class VideoPointCloudTab(QWidget):
             max_dist=self.spn_range.value(),
         )
 
-        save_map(Path(path), pts)
+        if pts.size:
+            self.map_pts = pts
+            self.draw_scatter(pts)
 
-        QMessageBox = _get_qt_widget(self, "QMessageBox")
-        if QMessageBox is not None:
-            QMessageBox.information(self, "Build Map", f"Map saved: {path}")
+        QFileDialog = _get_qt_widget(self, "QFileDialog")
+        if QFileDialog is not None:
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save LIDAR Map",
+                "lidar_map.pcd",
+                "PCD Files (*.pcd)"
+            )
+            if path:
+                save_map(Path(path), pts)
+                QMessageBox = _get_qt_widget(self, "QMessageBox")
+                if QMessageBox is not None:
+                    QMessageBox.information(self, "Build Map", f"Map saved: {path}")
 
