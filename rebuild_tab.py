@@ -92,8 +92,10 @@ class RebuildTab(QWidget):
         opt = QHBoxLayout()
         self.chk_names = QCheckBox("Show names")
         self.chk_legend = QCheckBox("Show legend")
+        self.chk_xlabel = QCheckBox("Show time axis")
         opt.addWidget(self.chk_names)
         opt.addWidget(self.chk_legend)
+        opt.addWidget(self.chk_xlabel)
         opt.addStretch()
         v_data.addLayout(opt)
 
@@ -251,7 +253,8 @@ class RebuildTab(QWidget):
             ax.plot(df["time"], df["accel_y"], label="accel_y")
             ax.plot(df["time"], df["accel_z"], label="accel_z")
         self._restore_labels(ax, df)
-        ax.set_xlabel("time [s]")
+        if self.chk_xlabel.isChecked():
+            ax.set_xlabel("time")
         ax.set_ylabel("m/s²")
         if self.chk_legend.isChecked():
             ax.legend(fontsize="x-small")
