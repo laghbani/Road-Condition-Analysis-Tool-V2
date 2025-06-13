@@ -27,7 +27,10 @@ except Exception:
     ort = None
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+try:
+    from scipy.spatial.transform import Rotation  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Rotation = None
 import pandas as pd
 import json
 import os
@@ -407,7 +410,7 @@ class SlamBuilderWorker(QThread):
 
     def _predict_pose(self, last_t: float, cur_t: float) -> np.ndarray:
         """Very coarse IMU integration for orientation."""
-        if not self.imu:
+        if not self.imu or Rotation is None:
             return np.eye(4)
         w = [s.msg.angular_velocity for s in self.imu if last_t <= s.time_abs + self.delay <= cur_t]
         if not w:
@@ -423,9 +426,17 @@ class SlamBuilderWorker(QThread):
     def run(self) -> None:
         try:
             if self.mode == 0:
-                from kiss_icp.pipeline import KissICP, KissConfig
+                try:
+                    from kiss_icp.pipeline import KissICP, KissConfig
+                except Exception:
+                    from kiss_icp.pipeline import KissICP  # type: ignore
+                    try:
+                        from kiss_icp.config import KissConfig
+                    except Exception:
+                        from kiss_icp.config import KISSConfig as KissConfig  # type: ignore
                 cfg = KissConfig()
-                cfg.voxel_size = self.voxel
+                if hasattr(cfg, 'voxel_size'):
+                    cfg.voxel_size = self.voxel
                 slam = KissICP(cfg)
             self.setMaximum.emit(len(self.pcs))
             world_pts: list[np.ndarray] = []
