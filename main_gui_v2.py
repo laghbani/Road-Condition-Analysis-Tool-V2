@@ -1557,12 +1557,21 @@ class MainWindow(QMainWindow):
         self.span_selector.clear()
         self.label_patches.clear()
 
+        # Filter out topics without data to avoid KeyError
+        valid_topics = [t for t in self.active_topics if t in self.dfs]
+        if len(valid_topics) != len(self.active_topics):
+            missing = set(self.active_topics) - set(valid_topics)
+            log.warning("Skipping missing topics: %s", ", ".join(missing))
+            self.active_topics = valid_topics
+
         rows = len(self.active_topics) * (2 if verify else 1)
         gs = self.fig.add_gridspec(rows, 1,
                                    height_ratios=[3, .6] * len(self.active_topics) if verify else None)
 
         for i, topic in enumerate(self.active_topics):
-            df = self.dfs[topic]
+            df = self.dfs.get(topic)
+            if df is None:
+                continue
             row = i * (2 if verify else 1)
             ax = self.fig.add_subplot(gs[row])
             ax.set_title(f"{topic} – Linear Acc.")

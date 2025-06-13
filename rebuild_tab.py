@@ -34,6 +34,7 @@ class RebuildTab(QWidget):
         self.csv_dfs: Dict[str, pd.DataFrame] = {}
         self.current_csv: str | None = None
         self.current_span: tuple[float, float] | None = None
+        self.view_mode = "Raw"
 
         vbox = QVBoxLayout(self)
         hl = QHBoxLayout()
@@ -55,6 +56,11 @@ class RebuildTab(QWidget):
         self.cmb_csv = QComboBox()
         self.cmb_csv.currentTextChanged.connect(self._select_csv)
         v_data.addWidget(self.cmb_csv)
+
+        self.cmb_view = QComboBox()
+        self.cmb_view.addItems(["Raw", "Corrected", "Weighted"])
+        self.cmb_view.currentTextChanged.connect(self._update_view)
+        v_data.addWidget(self.cmb_view)
 
         self.fig = Figure(layout="constrained")
         self.canvas = FigureCanvas(self.fig)
@@ -93,6 +99,10 @@ class RebuildTab(QWidget):
         v_peak.addWidget(self.lbl_peak, 1)
         self.tabs.addTab(w_peak, "Peaks")
 
+        self.peak_imgs: list[Path] = []
+        self.peak_index = 0
+        self.setFocusPolicy(Qt.StrongFocus)
+
     # ------------------------------------------------------------------ browsing
     def _browse(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select export folder", str(Path.home()))
@@ -126,12 +136,33 @@ class RebuildTab(QWidget):
         self.current_csv = name
         self._draw(df)
 
+    def _update_view(self, mode: str) -> None:
+        self.view_mode = mode
+        if self.current_csv:
+            df = self.csv_dfs[self.current_csv]
+            self._draw(df)
+
     def _draw(self, df: pd.DataFrame) -> None:
         self.fig.clear()
         ax = self.fig.add_subplot(111)
-        ax.plot(df["time"], df["accel_x"], label="accel_x")
-        ax.plot(df["time"], df["accel_y"], label="accel_y")
-        ax.plot(df["time"], df["accel_z"], label="accel_z")
+        if self.view_mode == "Raw":
+            ax.plot(df["time"], df["accel_x"], label="accel_x")
+            ax.plot(df["time"], df["accel_y"], label="accel_y")
+            ax.plot(df["time"], df["accel_z"], label="accel_z")
+        elif self.view_mode == "Corrected" and "accel_corr_x" in df.columns:
+            ax.plot(df["time"], df["accel_corr_x"], label="accel_corr_x")
+            ax.plot(df["time"], df["accel_corr_y"], label="accel_corr_y")
+            ax.plot(df["time"], df["accel_corr_z"], label="accel_corr_z")
+        elif self.view_mode == "Weighted" and "awx" in df.columns:
+            ax.plot(df["time"], df["awx"], label="awx")
+            ax.plot(df["time"], df["awy"], label="awy")
+            ax.plot(df["time"], df["awz"], label="awz")
+            if "awv" in df.columns:
+                ax.plot(df["time"], df["awv"], label="awv")
+        else:
+            ax.plot(df["time"], df["accel_x"], label="accel_x")
+            ax.plot(df["time"], df["accel_y"], label="accel_y")
+            ax.plot(df["time"], df["accel_z"], label="accel_z")
         self._restore_labels(ax, df)
         self.span = SpanSelector(ax, self._span, "horizontal", useblit=True,
                                  props=dict(alpha=.3, facecolor="#ff8888"))
@@ -210,11 +241,32 @@ class RebuildTab(QWidget):
     def _select_peak(self, name: str) -> None:
         path = self.cmb_peak.currentData()
         if not path:
+            self.peak_imgs = []
+            self.lbl_peak.setText("No image")
+            self.lbl_peak.setPixmap(QPixmap())
             return
-        imgs = sorted(path.glob("*.png"))
-        if imgs:
-            pix = QPixmap(str(imgs[0]))
+        self.peak_imgs = sorted(path.glob("*.png"))
+        self.peak_index = 0
+        self._show_peak_image()
+
+    def _show_peak_image(self) -> None:
+        if self.peak_imgs:
+            img = self.peak_imgs[self.peak_index]
+            pix = QPixmap(str(img))
             self.lbl_peak.setPixmap(pix.scaled(640, 480, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.lbl_peak.setText("")
         else:
             self.lbl_peak.setText("No image")
             self.lbl_peak.setPixmap(QPixmap())
+
+    def keyPressEvent(self, event) -> None:
+        if self.tabs.currentIndex() == 1 and self.peak_imgs:
+            if event.key() == Qt.Key_Right:
+                self.peak_index = (self.peak_index + 1) % len(self.peak_imgs)
+                self._show_peak_image()
+                return
+            if event.key() == Qt.Key_Left:
+                self.peak_index = (self.peak_index - 1) % len(self.peak_imgs)
+                self._show_peak_image()
+                return
+        super().keyPressEvent(event)
