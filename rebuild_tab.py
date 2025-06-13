@@ -14,7 +14,8 @@ from matplotlib.widgets import SpanSelector
 from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QComboBox, QTabWidget, QDialog, QDialogButtonBox
+    QFileDialog, QComboBox, QTabWidget, QDialog, QDialogButtonBox,
+    QGridLayout
 )
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import Qt
@@ -57,6 +58,7 @@ class RebuildTab(QWidget):
         self.current_csv: str | None = None
         self.current_span: tuple[float, float] | None = None
         self.view_mode = "Raw"
+        self.view_csv: str | None = None
 
         self.ax_csv: dict[object, str] = {}
         self.span_selectors: dict[str, SpanSelector] = {}
@@ -123,9 +125,16 @@ class RebuildTab(QWidget):
         self.cmb_peak = QComboBox()
         self.cmb_peak.currentTextChanged.connect(self._select_peak)
         v_peak.addWidget(self.cmb_peak)
-        self.lbl_peak = QLabel("No image")
-        self.lbl_peak.setAlignment(Qt.AlignCenter)
-        v_peak.addWidget(self.lbl_peak, 1)
+
+        grid = QGridLayout()
+        self.lbl_peaks = []
+        for i in range(6):
+            lbl = QLabel("No image")
+            lbl.setAlignment(Qt.AlignCenter)
+            grid.addWidget(lbl, i // 3, i % 3)
+            self.lbl_peaks.append(lbl)
+        v_peak.addLayout(grid)
+
         self.tabs.addTab(w_peak, "Peaks")
 
         self.peak_imgs: list[Path] = []
@@ -168,10 +177,11 @@ class RebuildTab(QWidget):
     # ------------------------------------------------------------------ CSV logic
     def _select_csv(self, name: str) -> None:
         if name == "(All)" or not name:
+            self.view_csv = None
             self.current_csv = None
-            self._draw()
-            return
-        self.current_csv = name
+        else:
+            self.view_csv = name
+            self.current_csv = name
         self._draw()
 
     def _update_view(self, mode: str) -> None:
@@ -185,9 +195,10 @@ class RebuildTab(QWidget):
             sel.disconnect_events()
         self.span_selectors.clear()
 
-        dfs = self.csv_dfs
-        if self.current_csv:
-            dfs = {self.current_csv: self.csv_dfs[self.current_csv]}
+        if self.view_csv:
+            dfs = {self.view_csv: self.csv_dfs[self.view_csv]}
+        else:
+            dfs = self.csv_dfs
 
         if not dfs:
             self.canvas.draw_idle()
@@ -253,46 +264,56 @@ class RebuildTab(QWidget):
         self.current_csv = csv
         self.current_span = (xmin, xmax)
 
+    def _selected_dfs(self):
+        if self.view_csv is None:
+            return self.csv_dfs.values()
+        if self.current_csv:
+            return [self.csv_dfs[self.current_csv]]
+        return [self.csv_dfs[self.view_csv]]
+
     def _add_label(self) -> None:
-        if not self.current_csv or not self.current_span:
+        if not self.current_span:
             return
-        df = self.csv_dfs[self.current_csv]
         xmin, xmax = self.current_span
         if xmax <= xmin:
             return
         lname = self.cmb_label.currentText()
         lid = LABEL_IDS[lname]
-        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
-        df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
+        for df in self._selected_dfs():
+            mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+            df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
         self._draw()
 
     def _del_label(self) -> None:
-        if not self.current_csv or not self.current_span:
+        if not self.current_span:
             return
-        df = self.csv_dfs[self.current_csv]
         xmin, xmax = self.current_span
         if xmax <= xmin:
             return
-        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
-        df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+        for df in self._selected_dfs():
+            mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+            df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
         self._draw()
 
     def _edit_label(self) -> None:
-        if not self.current_csv or not self.current_span:
+        if not self.current_span:
             return
-        df = self.csv_dfs[self.current_csv]
         xmin, xmax = self.current_span
-        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
-        if not mask.any():
-            return
-        current = df.loc[mask, "label_name"].mode().iat[0]
-        dlg = LabelEditDialog(current, self)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        lname = dlg.result()
-        lid = LABEL_IDS[lname]
-        df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
-        self._draw()
+        for df in self._selected_dfs():
+            mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+            if not mask.any():
+                continue
+            current = df.loc[mask, "label_name"].mode().iat[0]
+            dlg = LabelEditDialog(current, self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            lname = dlg.result()
+            lid = LABEL_IDS[lname]
+            for df2 in self._selected_dfs():
+                mask2 = (df2["time"] >= xmin) & (df2["time"] <= xmax)
+                df2.loc[mask2, ["label_id", "label_name"]] = [lid, lname]
+            self._draw()
+            break
 
     def _save_csv(self) -> None:
         if not self.current_csv:
@@ -323,32 +344,34 @@ class RebuildTab(QWidget):
         path = self.cmb_peak.currentData()
         if not path:
             self.peak_imgs = []
-            self.lbl_peak.setText("No image")
-            self.lbl_peak.setPixmap(QPixmap())
+            for lbl in self.lbl_peaks:
+                lbl.setText("No image")
+                lbl.setPixmap(QPixmap())
             return
         self.peak_imgs = sorted(path.glob("*.png"))
         self.peak_index = 0
-        self._show_peak_image()
+        self._show_peak_images()
 
-    def _show_peak_image(self) -> None:
-        if self.peak_imgs:
-            img = self.peak_imgs[self.peak_index]
-            pix = QPixmap(str(img))
-            self.lbl_peak.setPixmap(pix.scaled(640, 480, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            self.lbl_peak.setText("")
-        else:
-            self.lbl_peak.setText("No image")
-            self.lbl_peak.setPixmap(QPixmap())
+    def _show_peak_images(self) -> None:
+        for i, lbl in enumerate(self.lbl_peaks):
+            idx = self.peak_index + i
+            if 0 <= idx < len(self.peak_imgs):
+                pix = QPixmap(str(self.peak_imgs[idx]))
+                lbl.setPixmap(pix.scaled(320, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                lbl.setText("")
+            else:
+                lbl.setPixmap(QPixmap())
+                lbl.setText("No image")
 
     def keyPressEvent(self, event) -> None:
         if self.tabs.currentIndex() == 1 and self.peak_imgs:
             if event.key() == Qt.Key_Right:
-                self.peak_index = (self.peak_index + 1) % len(self.peak_imgs)
-                self._show_peak_image()
+                self.peak_index = min(self.peak_index + 6, max(len(self.peak_imgs) - 6, 0))
+                self._show_peak_images()
                 return
             if event.key() == Qt.Key_Left:
-                self.peak_index = (self.peak_index - 1) % len(self.peak_imgs)
-                self._show_peak_image()
+                self.peak_index = max(self.peak_index - 6, 0)
+                self._show_peak_images()
                 return
         super().keyPressEvent(event)
 
@@ -360,20 +383,33 @@ class RebuildTab(QWidget):
         if not csv:
             return
         self.current_csv = csv
-        if event.button == 3 and event.dblclick:
-            df = self.csv_dfs[csv]
-            times = df["time"].to_numpy()
-            idx = int(np.clip(np.searchsorted(times, event.xdata), 0, len(df) - 1))
-            lbl = df.loc[idx, "label_name"]
-            if lbl == UNKNOWN_NAME:
+        df = self.csv_dfs[csv]
+        times = df["time"].to_numpy()
+        idx = int(np.clip(np.searchsorted(times, event.xdata), 0, len(df) - 1))
+        lbl = df.loc[idx, "label_name"]
+        # determine contiguous region around index
+        i0 = idx
+        while i0 > 0 and df.loc[i0 - 1, "label_name"] == lbl:
+            i0 -= 1
+        i1 = idx
+        while i1 + 1 < len(df) and df.loc[i1 + 1, "label_name"] == lbl:
+            i1 += 1
+        start = df.loc[i0, "time"]
+        end = df.loc[i1, "time"]
+
+        if event.button == 1:
+            dlg = LabelEditDialog(lbl, self)
+            if dlg.exec() != QDialog.Accepted:
                 return
-            # find contiguous region
-            i0 = idx
-            while i0 > 0 and df.loc[i0 - 1, "label_name"] == lbl:
-                i0 -= 1
-            i1 = idx
-            while i1 + 1 < len(df) and df.loc[i1 + 1, "label_name"] == lbl:
-                i1 += 1
-            df.loc[i0:i1, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+            lname = dlg.result()
+            lid = LABEL_IDS[lname]
+            for df2 in self._selected_dfs():
+                mask = (df2["time"] >= start) & (df2["time"] <= end)
+                df2.loc[mask, ["label_id", "label_name"]] = [lid, lname]
+            self._draw()
+        elif event.button == 3 and event.dblclick:
+            for df2 in self._selected_dfs():
+                mask = (df2["time"] >= start) & (df2["time"] <= end)
+                df2.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
             self._draw()
         
