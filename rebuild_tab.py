@@ -9,11 +9,12 @@ from labels import (
 )
 
 import pandas as pd
+import numpy as np
 from matplotlib.widgets import SpanSelector
 from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QComboBox, QTabWidget
+    QFileDialog, QComboBox, QTabWidget, QDialog, QDialogButtonBox
 )
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import Qt
@@ -25,6 +26,26 @@ except Exception:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
 # ---------------------------------------------------------------------------
+class LabelEditDialog(QDialog):
+    """Dialog to change label name."""
+
+    def __init__(self, current: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Label")
+        layout = QHBoxLayout(self)
+        layout.addWidget(QLabel(current))
+        self.cmb = QComboBox()
+        self.cmb.addItems(list(ANOMALY_TYPES))
+        layout.addWidget(self.cmb)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def result(self) -> str:
+        return self.cmb.currentText()
+
+# ---------------------------------------------------------------------------
 class RebuildTab(QWidget):
     """Load exported CSV data to adjust labels and view peak images."""
 
@@ -32,9 +53,13 @@ class RebuildTab(QWidget):
         super().__init__(parent)
         self.folder: Path | None = None
         self.csv_dfs: Dict[str, pd.DataFrame] = {}
+        self.csv_paths: Dict[str, Path] = {}
         self.current_csv: str | None = None
         self.current_span: tuple[float, float] | None = None
         self.view_mode = "Raw"
+
+        self.ax_csv: dict[object, str] = {}
+        self.span_selectors: dict[str, SpanSelector] = {}
 
         vbox = QVBoxLayout(self)
         hl = QHBoxLayout()
@@ -64,6 +89,7 @@ class RebuildTab(QWidget):
 
         self.fig = Figure(layout="constrained")
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.mpl_connect("button_press_event", self._mouse_press)
         v_data.addWidget(self.canvas, 1)
 
         ctl = QHBoxLayout()
@@ -77,6 +103,9 @@ class RebuildTab(QWidget):
         self.btn_del = QPushButton("Delete")
         self.btn_del.clicked.connect(self._del_label)
         ctl.addWidget(self.btn_del)
+        self.btn_edit = QPushButton("Edit…")
+        self.btn_edit.clicked.connect(self._edit_label)
+        ctl.addWidget(self.btn_edit)
         self.btn_save = QPushButton("Save")
         self.btn_save.clicked.connect(self._save_csv)
         ctl.addWidget(self.btn_save)
@@ -113,11 +142,21 @@ class RebuildTab(QWidget):
         self.folder = folder
         self.lbl_folder.setText(str(folder))
         self.csv_dfs.clear()
+        self.csv_paths.clear()
         self.cmb_csv.clear()
+        items = []
         for csv in sorted(folder.glob("*.csv")):
             if csv.name.endswith("_track.csv"):
                 continue
-            self.cmb_csv.addItem(csv.name, csv)
+            df = pd.read_csv(csv)
+            self.csv_dfs[csv.name] = df
+            self.csv_paths[csv.name] = csv
+            items.append(csv.name)
+        self.cmb_csv.addItem("(All)", None)
+        for it in items:
+            self.cmb_csv.addItem(it, self.csv_paths[it])
+        self.current_csv = None
+        self._draw()
         # peaks
         self.cmb_peak.clear()
         peak_dir = folder / "peaks"
@@ -128,23 +167,49 @@ class RebuildTab(QWidget):
 
     # ------------------------------------------------------------------ CSV logic
     def _select_csv(self, name: str) -> None:
-        path = self.cmb_csv.currentData()
-        if not path:
+        if name == "(All)" or not name:
+            self.current_csv = None
+            self._draw()
             return
-        df = pd.read_csv(path)
-        self.csv_dfs[name] = df
         self.current_csv = name
-        self._draw(df)
+        self._draw()
 
     def _update_view(self, mode: str) -> None:
         self.view_mode = mode
-        if self.current_csv:
-            df = self.csv_dfs[self.current_csv]
-            self._draw(df)
+        self._draw()
 
-    def _draw(self, df: pd.DataFrame) -> None:
+    def _draw(self) -> None:
         self.fig.clear()
-        ax = self.fig.add_subplot(111)
+        self.ax_csv.clear()
+        for sel in self.span_selectors.values():
+            sel.disconnect_events()
+        self.span_selectors.clear()
+
+        dfs = self.csv_dfs
+        if self.current_csv:
+            dfs = {self.current_csv: self.csv_dfs[self.current_csv]}
+
+        if not dfs:
+            self.canvas.draw_idle()
+            return
+
+        gs = self.fig.add_gridspec(len(dfs), 1)
+        for i, (name, df) in enumerate(dfs.items()):
+            ax = self.fig.add_subplot(gs[i])
+            self._plot_df(ax, df)
+            ax.set_title(name)
+            self.ax_csv[ax] = name
+            self.span_selectors[name] = SpanSelector(
+                ax,
+                lambda x0, x1, t=name: self._span_selected(t, x0, x1),
+                "horizontal",
+                useblit=True,
+                props=dict(alpha=.3, facecolor="#ff8888"),
+            )
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def _plot_df(self, ax, df: pd.DataFrame) -> None:
         if self.view_mode == "Raw":
             ax.plot(df["time"], df["accel_x"], label="accel_x")
             ax.plot(df["time"], df["accel_y"], label="accel_y")
@@ -164,12 +229,9 @@ class RebuildTab(QWidget):
             ax.plot(df["time"], df["accel_y"], label="accel_y")
             ax.plot(df["time"], df["accel_z"], label="accel_z")
         self._restore_labels(ax, df)
-        self.span = SpanSelector(ax, self._span, "horizontal", useblit=True,
-                                 props=dict(alpha=.3, facecolor="#ff8888"))
         ax.set_xlabel("time [s]")
         ax.set_ylabel("m/s²")
         ax.legend(fontsize="x-small")
-        self.canvas.draw_idle()
 
     def _restore_labels(self, ax, df: pd.DataFrame) -> None:
         last = UNKNOWN_NAME
@@ -187,7 +249,8 @@ class RebuildTab(QWidget):
             color = ANOMALY_TYPES[last]["color"]
             ax.axvspan(start, prev, color=color, alpha=0.2)
 
-    def _span(self, xmin: float, xmax: float) -> None:
+    def _span_selected(self, csv: str, xmin: float, xmax: float) -> None:
+        self.current_csv = csv
         self.current_span = (xmin, xmax)
 
     def _add_label(self) -> None:
@@ -201,7 +264,7 @@ class RebuildTab(QWidget):
         lid = LABEL_IDS[lname]
         mask = (df["time"] >= xmin) & (df["time"] <= xmax)
         df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
-        self._draw(df)
+        self._draw()
 
     def _del_label(self) -> None:
         if not self.current_csv or not self.current_span:
@@ -212,14 +275,32 @@ class RebuildTab(QWidget):
             return
         mask = (df["time"] >= xmin) & (df["time"] <= xmax)
         df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
-        self._draw(df)
+        self._draw()
+
+    def _edit_label(self) -> None:
+        if not self.current_csv or not self.current_span:
+            return
+        df = self.csv_dfs[self.current_csv]
+        xmin, xmax = self.current_span
+        mask = (df["time"] >= xmin) & (df["time"] <= xmax)
+        if not mask.any():
+            return
+        current = df.loc[mask, "label_name"].mode().iat[0]
+        dlg = LabelEditDialog(current, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        lname = dlg.result()
+        lid = LABEL_IDS[lname]
+        df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
+        self._draw()
 
     def _save_csv(self) -> None:
         if not self.current_csv:
             return
-        path = self.cmb_csv.currentData()
-        df = self.csv_dfs[self.current_csv]
-        df.to_csv(path, index=False)
+        path = self.csv_paths.get(self.current_csv)
+        if path:
+            df = self.csv_dfs[self.current_csv]
+            df.to_csv(path, index=False)
 
     def _export(self) -> None:
         if not self.folder:
@@ -270,3 +351,29 @@ class RebuildTab(QWidget):
                 self._show_peak_image()
                 return
         super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------ mouse
+    def _mouse_press(self, event) -> None:
+        if event.inaxes is None or event.xdata is None:
+            return
+        csv = self.ax_csv.get(event.inaxes)
+        if not csv:
+            return
+        self.current_csv = csv
+        if event.button == 3 and event.dblclick:
+            df = self.csv_dfs[csv]
+            times = df["time"].to_numpy()
+            idx = int(np.clip(np.searchsorted(times, event.xdata), 0, len(df) - 1))
+            lbl = df.loc[idx, "label_name"]
+            if lbl == UNKNOWN_NAME:
+                return
+            # find contiguous region
+            i0 = idx
+            while i0 > 0 and df.loc[i0 - 1, "label_name"] == lbl:
+                i0 -= 1
+            i1 = idx
+            while i1 + 1 < len(df) and df.loc[i1 + 1, "label_name"] == lbl:
+                i1 += 1
+            df.loc[i0:i1, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+            self._draw()
+        
