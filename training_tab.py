@@ -1097,12 +1097,9 @@ class TrainingTab(QWidget):
 
 # ═══════════════════ main() ======================================
 if __name__ == "__main__":
-    label_map = {
-        "normal": 1, "depression": 2, "cover": 3, "cobble": 4,
-        "transverse": 5, "gravel": 6, "cracked": 7,
-        "bump": 8, "uneven": 9,
-    }
+    from labels import LABEL_IDS, UNKNOWN_ID
+
     app = QApplication(sys.argv)
-    win = TrainingTab(label_map, unknown_id=99, start_folder=Path.home())
+    win = TrainingTab(LABEL_IDS, unknown_id=UNKNOWN_ID, start_folder=Path.home())
     win.resize(1400, 850); win.show()
     sys.exit(app.exec())
