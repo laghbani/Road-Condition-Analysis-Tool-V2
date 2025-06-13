@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QDoubleSpinBox, QComboBox, QSpinBox
+    QPushButton, QDoubleSpinBox, QComboBox, QSpinBox,
+    QProgressDialog, QApplication,
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap, QImage
@@ -75,8 +76,10 @@ class VideoPointCloudTab(QWidget):
         self.btn_pause = QPushButton("Pause")
         self.btn_replay = QPushButton("Replay")
         self.btn_toggle_roi = QPushButton("Toggle ROI")
+        self.btn_build_map = QPushButton("Build Map")
 
-        for b in (self.btn_play, self.btn_pause, self.btn_replay, self.btn_toggle_roi):
+        for b in (self.btn_play, self.btn_pause, self.btn_replay,
+                  self.btn_toggle_roi, self.btn_build_map):
             ctrl.addWidget(b)
         ctrl.addStretch()
         vbox.addLayout(ctrl)
@@ -136,12 +139,15 @@ class VideoPointCloudTab(QWidget):
         self._last_cols: np.ndarray | None = None
         self.point_size = self.spn_size.value()
         self.sync_index = 0
+        self.map_thread = None
+        self.progress = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._next_frame)
 
         self.btn_play.clicked.connect(self.play)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_replay.clicked.connect(self.replay)
+        self.btn_build_map.clicked.connect(self._start_build_map)
 
         self.roi_mode = False
         self.btn_toggle_roi.clicked.connect(self._toggle_roi)
@@ -235,7 +241,7 @@ class VideoPointCloudTab(QWidget):
         qimg = qimg.copy()
         self.show_video_frame(qimg)
 
-    def draw_scatter(self, pts_raw) -> None:
+    def draw_scatter(self, pts_raw, colors: np.ndarray | None = None) -> None:
         if isinstance(pts_raw, np.ndarray):
             pts = pts_raw
         elif isinstance(pts_raw, PointCloud2):
@@ -246,11 +252,12 @@ class VideoPointCloudTab(QWidget):
             return
         self.gl_view.setVisible(True)
         self.lbl_placeholder.setVisible(False)
-        z = pts[:, 2]
-        zmin = float(z.min())
-        rng = float(z.max() - zmin) or 1.0
-        norm = (z - zmin) / rng
-        colors = np.column_stack((norm, np.zeros_like(norm), 1 - norm, np.ones_like(norm)))
+        if colors is None:
+            z = pts[:, 2]
+            zmin = float(z.min())
+            rng = float(z.max() - zmin) or 1.0
+            norm = (z - zmin) / rng
+            colors = np.column_stack((norm, np.zeros_like(norm), 1 - norm, np.ones_like(norm)))
         self._last_pts = pts
         self._last_cols = colors
         if self.scatter_item is None:
@@ -300,3 +307,37 @@ class VideoPointCloudTab(QWidget):
         self.gl_view.setVisible(False)
         self.lbl_placeholder.setPixmap(QPixmap.fromImage(img))
         self.lbl_placeholder.setVisible(True)
+
+    # ---------------------------- map building ----------------------------
+    def _start_build_map(self) -> None:
+        if not self.pc_arrays:
+            return
+        cur_time = 0.0
+        if self.frame_times and self.sync_index > 0:
+            cur_time = self.frame_times[self.sync_index - 1]
+        from map_builder import MapBuilder
+        self.map_thread = MapBuilder(
+            self.pc_arrays,
+            self.frame_times,
+            self.spn_pre.value(),
+            self.spn_post.value(),
+            cur_time,
+        )
+        self.map_thread.progress.connect(self._on_map_progress)
+        self.map_thread.result.connect(self._on_map_result)
+        self.progress = QProgressDialog("Building map…", None, 0, 0, self)
+        self.progress.setWindowTitle("Build Map")
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.show()
+        self.map_thread.start()
+
+    def _on_map_progress(self, step: int, total: int) -> None:
+        if self.progress is not None:
+            self.progress.setMaximum(total)
+            self.progress.setValue(step)
+            QApplication.processEvents()
+
+    def _on_map_result(self, pts: np.ndarray, cols: np.ndarray) -> None:
+        if self.progress is not None:
+            self.progress.close()
+        self.draw_scatter(pts, cols)
