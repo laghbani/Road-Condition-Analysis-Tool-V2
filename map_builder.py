@@ -68,7 +68,7 @@ class MapBuilder(QThread):
             return
         if self.times:
             idxs = [i for i, t in enumerate(self.times)
-                    if self.cur_time - self.pre <= t <= self.cur_time + self.post]
+                    if i < len(self.pc_arrays) and self.cur_time - self.pre <= t <= self.cur_time + self.post]
         else:
             idxs = list(range(len(self.pc_arrays)))
         n_scans = len(idxs)
