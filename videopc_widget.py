@@ -75,8 +75,15 @@ class VideoPointCloudTab(QWidget):
         self.btn_pause = QPushButton("Pause")
         self.btn_replay = QPushButton("Replay")
         self.btn_toggle_roi = QPushButton("Toggle ROI")
+        self.btn_build_map = QPushButton("Build Map")
 
-        for b in (self.btn_play, self.btn_pause, self.btn_replay, self.btn_toggle_roi):
+        for b in (
+            self.btn_play,
+            self.btn_pause,
+            self.btn_replay,
+            self.btn_toggle_roi,
+            self.btn_build_map,
+        ):
             ctrl.addWidget(b)
         ctrl.addStretch()
         vbox.addLayout(ctrl)
