@@ -71,12 +71,43 @@ class VideoPointCloudTab(QWidget):
         self.spn_post.setValue(2.0)
         ctrl.addWidget(self.spn_post)
 
+        ctrl.addWidget(QLabel("Step:"))
+        self.spn_step = QSpinBox()
+        self.spn_step.setRange(1, 10)
+        self.spn_step.setValue(1)
+        ctrl.addWidget(self.spn_step)
+
+        ctrl.addWidget(QLabel("MaxDist:"))
+        self.spn_range = QDoubleSpinBox()
+        self.spn_range.setRange(0.1, 100.0)
+        self.spn_range.setValue(30.0)
+        ctrl.addWidget(self.spn_range)
+
+        ctrl.addWidget(QLabel("MinZ:"))
+        self.spn_minz = QDoubleSpinBox()
+        self.spn_minz.setRange(-5.0, 5.0)
+        self.spn_minz.setValue(-1.0)
+        ctrl.addWidget(self.spn_minz)
+
+        ctrl.addWidget(QLabel("MaxZ:"))
+        self.spn_maxz = QDoubleSpinBox()
+        self.spn_maxz.setRange(-5.0, 5.0)
+        self.spn_maxz.setValue(1.5)
+        ctrl.addWidget(self.spn_maxz)
+
         self.btn_play = QPushButton("Play")
         self.btn_pause = QPushButton("Pause")
         self.btn_replay = QPushButton("Replay")
         self.btn_toggle_roi = QPushButton("Toggle ROI")
+        self.btn_build_map = QPushButton("Build Map")
 
-        for b in (self.btn_play, self.btn_pause, self.btn_replay, self.btn_toggle_roi):
+        for b in (
+            self.btn_play,
+            self.btn_pause,
+            self.btn_replay,
+            self.btn_toggle_roi,
+            self.btn_build_map,
+        ):
             ctrl.addWidget(b)
         ctrl.addStretch()
         vbox.addLayout(ctrl)
@@ -142,6 +173,7 @@ class VideoPointCloudTab(QWidget):
         self.btn_play.clicked.connect(self.play)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_replay.clicked.connect(self.replay)
+        self.btn_build_map.clicked.connect(self._build_map)
 
         self.roi_mode = False
         self.btn_toggle_roi.clicked.connect(self._toggle_roi)
@@ -300,3 +332,40 @@ class VideoPointCloudTab(QWidget):
         self.gl_view.setVisible(False)
         self.lbl_placeholder.setPixmap(QPixmap.fromImage(img))
         self.lbl_placeholder.setVisible(True)
+
+    def _build_map(self) -> None:
+        """Combine loaded point clouds and save a filtered map."""
+        from pathlib import Path
+        from imu_csv_export_v2 import _get_qt_widget
+        from map_builder import build_map, save_map
+
+        if not self.pc_arrays:
+            return
+
+        QFileDialog = _get_qt_widget(self, "QFileDialog")
+        if QFileDialog is None:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save LIDAR Map",
+            "lidar_map.pcd",
+            "PCD Files (*.pcd)"
+        )
+        if not path:
+            return
+
+        pts = build_map(
+            self.pc_arrays,
+            step=self.spn_step.value(),
+            min_z=self.spn_minz.value(),
+            max_z=self.spn_maxz.value(),
+            max_dist=self.spn_range.value(),
+        )
+
+        save_map(Path(path), pts)
+
+        QMessageBox = _get_qt_widget(self, "QMessageBox")
+        if QMessageBox is not None:
+            QMessageBox.information(self, "Build Map", f"Map saved: {path}")
+
