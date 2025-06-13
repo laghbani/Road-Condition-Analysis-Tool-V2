@@ -15,7 +15,7 @@ from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QComboBox, QTabWidget, QDialog, QDialogButtonBox,
-    QGridLayout
+    QGridLayout, QCheckBox
 )
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import Qt
@@ -89,6 +89,14 @@ class RebuildTab(QWidget):
         self.cmb_view.currentTextChanged.connect(self._update_view)
         v_data.addWidget(self.cmb_view)
 
+        opt = QHBoxLayout()
+        self.chk_names = QCheckBox("Show names")
+        self.chk_legend = QCheckBox("Show legend")
+        opt.addWidget(self.chk_names)
+        opt.addWidget(self.chk_legend)
+        opt.addStretch()
+        v_data.addLayout(opt)
+
         self.fig = Figure(layout="constrained")
         self.canvas = FigureCanvas(self.fig)
         self.canvas.mpl_connect("button_press_event", self._mouse_press)
@@ -137,7 +145,7 @@ class RebuildTab(QWidget):
 
         self.tabs.addTab(w_peak, "Peaks")
 
-        self.peak_imgs: list[Path] = []
+        self.peak_groups: list[list[Path]] = []
         self.peak_index = 0
         self.setFocusPolicy(Qt.StrongFocus)
 
@@ -205,10 +213,12 @@ class RebuildTab(QWidget):
             return
 
         gs = self.fig.add_gridspec(len(dfs), 1)
+        show_names = self.chk_names.isChecked()
         for i, (name, df) in enumerate(dfs.items()):
             ax = self.fig.add_subplot(gs[i])
             self._plot_df(ax, df)
-            ax.set_title(name)
+            if show_names:
+                ax.set_title(name)
             self.ax_csv[ax] = name
             self.span_selectors[name] = SpanSelector(
                 ax,
@@ -242,7 +252,8 @@ class RebuildTab(QWidget):
         self._restore_labels(ax, df)
         ax.set_xlabel("time [s]")
         ax.set_ylabel("m/s²")
-        ax.legend(fontsize="x-small")
+        if self.chk_legend.isChecked():
+            ax.legend(fontsize="x-small")
 
     def _restore_labels(self, ax, df: pd.DataFrame) -> None:
         last = UNKNOWN_NAME
@@ -271,6 +282,12 @@ class RebuildTab(QWidget):
             return [self.csv_dfs[self.current_csv]]
         return [self.csv_dfs[self.view_csv]]
 
+    def _apply_range(self, start: float, end: float, lid: int, lname: str) -> None:
+        eps = 1e-3
+        for df in self._selected_dfs():
+            mask = (df["time"] >= start - eps) & (df["time"] <= end + eps)
+            df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
+
     def _add_label(self) -> None:
         if not self.current_span:
             return
@@ -279,9 +296,7 @@ class RebuildTab(QWidget):
             return
         lname = self.cmb_label.currentText()
         lid = LABEL_IDS[lname]
-        for df in self._selected_dfs():
-            mask = (df["time"] >= xmin) & (df["time"] <= xmax)
-            df.loc[mask, ["label_id", "label_name"]] = [lid, lname]
+        self._apply_range(xmin, xmax, lid, lname)
         self._draw()
 
     def _del_label(self) -> None:
@@ -290,9 +305,7 @@ class RebuildTab(QWidget):
         xmin, xmax = self.current_span
         if xmax <= xmin:
             return
-        for df in self._selected_dfs():
-            mask = (df["time"] >= xmin) & (df["time"] <= xmax)
-            df.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+        self._apply_range(xmin, xmax, UNKNOWN_ID, UNKNOWN_NAME)
         self._draw()
 
     def _edit_label(self) -> None:
@@ -309,9 +322,7 @@ class RebuildTab(QWidget):
                 return
             lname = dlg.result()
             lid = LABEL_IDS[lname]
-            for df2 in self._selected_dfs():
-                mask2 = (df2["time"] >= xmin) & (df2["time"] <= xmax)
-                df2.loc[mask2, ["label_id", "label_name"]] = [lid, lname]
+            self._apply_range(xmin, xmax, lid, lname)
             self._draw()
             break
 
@@ -343,34 +354,41 @@ class RebuildTab(QWidget):
     def _select_peak(self, name: str) -> None:
         path = self.cmb_peak.currentData()
         if not path:
-            self.peak_imgs = []
+            self.peak_groups = []
             for lbl in self.lbl_peaks:
                 lbl.setText("No image")
                 lbl.setPixmap(QPixmap())
             return
-        self.peak_imgs = sorted(path.glob("*.png"))
+        groups: Dict[str, list[Path]] = {}
+        for img in sorted(path.glob("*.png")):
+            key = img.stem.split("_")[-1]
+            groups.setdefault(key, []).append(img)
+        self.peak_groups = [groups[k] for k in sorted(groups.keys())]
         self.peak_index = 0
         self._show_peak_images()
 
     def _show_peak_images(self) -> None:
-        for i, lbl in enumerate(self.lbl_peaks):
-            idx = self.peak_index + i
-            if 0 <= idx < len(self.peak_imgs):
-                pix = QPixmap(str(self.peak_imgs[idx]))
-                lbl.setPixmap(pix.scaled(320, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                lbl.setText("")
-            else:
-                lbl.setPixmap(QPixmap())
-                lbl.setText("No image")
+        for lbl in self.lbl_peaks:
+            lbl.setPixmap(QPixmap())
+            lbl.setText("No image")
+        if not self.peak_groups:
+            return
+        imgs = self.peak_groups[self.peak_index]
+        for lbl, img in zip(self.lbl_peaks, imgs):
+            pix = QPixmap(str(img))
+            if lbl.width() and lbl.height():
+                pix = pix.scaled(lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            lbl.setPixmap(pix)
+            lbl.setText("")
 
     def keyPressEvent(self, event) -> None:
-        if self.tabs.currentIndex() == 1 and self.peak_imgs:
+        if self.tabs.currentIndex() == 1 and self.peak_groups:
             if event.key() == Qt.Key_Right:
-                self.peak_index = min(self.peak_index + 6, max(len(self.peak_imgs) - 6, 0))
+                self.peak_index = min(self.peak_index + 1, len(self.peak_groups) - 1)
                 self._show_peak_images()
                 return
             if event.key() == Qt.Key_Left:
-                self.peak_index = max(self.peak_index - 6, 0)
+                self.peak_index = max(self.peak_index - 1, 0)
                 self._show_peak_images()
                 return
         super().keyPressEvent(event)
@@ -403,13 +421,9 @@ class RebuildTab(QWidget):
                 return
             lname = dlg.result()
             lid = LABEL_IDS[lname]
-            for df2 in self._selected_dfs():
-                mask = (df2["time"] >= start) & (df2["time"] <= end)
-                df2.loc[mask, ["label_id", "label_name"]] = [lid, lname]
+            self._apply_range(start, end, lid, lname)
             self._draw()
         elif event.button == 3 and event.dblclick:
-            for df2 in self._selected_dfs():
-                mask = (df2["time"] >= start) & (df2["time"] <= end)
-                df2.loc[mask, ["label_id", "label_name"]] = [UNKNOWN_ID, UNKNOWN_NAME]
+            self._apply_range(start, end, UNKNOWN_ID, UNKNOWN_NAME)
             self._draw()
         
