@@ -427,26 +427,32 @@ class SlamBuilderWorker(QThread):
         try:
             if self.mode == 0:
                 try:
-                    from kiss_icp.pipeline import KissICP, KissConfig
+                    from kiss_icp.pipeline import OdometryPipeline, default_config
+                    cfg = default_config()
+                    cfg["voxel_size"] = float(self.voxel or 0.2)
+                    cfg["max_distance"] = 100.0
+                    slam = OdometryPipeline(cfg)
                 except Exception:
-                    from kiss_icp.pipeline import KissICP  # type: ignore
                     try:
-                        from kiss_icp.config import KissConfig
+                        from kiss_icp.pipeline import KissICP, KissConfig
                     except Exception:
-                        from kiss_icp.config import KISSConfig as KissConfig  # type: ignore
-                # Some versions of kiss-icp require voxel_size at init
-                try:
-                    cfg = KissConfig(voxel_size=self.voxel)
-                except Exception:
-                    cfg = KissConfig()
-                    try:
-                        cfg.voxel_size = self.voxel
-                    except Exception:
+                        from kiss_icp.pipeline import KissICP  # type: ignore
                         try:
-                            cfg.hash_map.voxel_size = self.voxel  # type: ignore[attr-defined]
+                            from kiss_icp.config import KissConfig
                         except Exception:
-                            pass
-                slam = KissICP(cfg)
+                            from kiss_icp.config import KISSConfig as KissConfig  # type: ignore
+                    try:
+                        cfg = KissConfig(voxel_size=float(self.voxel or 0.2))
+                    except Exception:
+                        cfg = KissConfig()
+                        try:
+                            cfg.voxel_size = float(self.voxel or 0.2)
+                        except Exception:
+                            try:
+                                cfg.hash_map.voxel_size = float(self.voxel or 0.2)  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                    slam = KissICP(cfg)
             self.setMaximum.emit(len(self.pcs))
             world_pts: list[np.ndarray] = []
             last_t = None
