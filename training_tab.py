@@ -18,11 +18,13 @@ road_anomaly_trainer_hybrid_gpu_safe.py
 # ──────────────────── BASIS-IMPORTS & LOGGING ────────────────────
 from __future__ import annotations
 import os, sys, itertools, logging, contextlib
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 from pathlib import Path
 from typing import Dict, List, Tuple
 import random
 from datetime import datetime
 import json
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -158,11 +160,13 @@ class IMUWindowDataset(Dataset):
                     continue
                 win = arr[s:s+L].T      # C × L
                 if fft_bins:
-                    specs = []
-                    for c in range(3):
-                        mag = np.abs(rfft(win[c]))[:fft_bins].astype(np.float32)
-                        specs.append(np.repeat(mag[:, None], L, axis=1))
-                    win = np.concatenate([win, *specs], 0)
+                    mag = np.abs(rfft(win[:3], axis=1))[:, :fft_bins].astype(np.float32)
+                    if fft_bins < L:
+                        pad = ((0, 0), (0, L - fft_bins))
+                        mag = np.pad(mag, pad)
+                    elif fft_bins > L:
+                        mag = mag[:, :L]
+                    win = np.concatenate([win, mag], 0)
                 if augment:
                     win = sign_flip(add_gauss(scale_amplitude(dropout_segment(win))))
                 self.X.append(win); self.y.append(int(maj)); self.grp.append(csv.stem)
@@ -371,6 +375,7 @@ class TrainWorker(QThread):
         super().__init__()
         self.folder, self.map = folder, label_map
         self.unk, self.cfg = unknown_id, cfg
+        self.scaler: StandardScaler | None = None
 
     def _csvs(self): return [p for p in self.folder.rglob("*.csv")
                              if not p.name.endswith("_track.csv")]
@@ -384,6 +389,7 @@ class TrainWorker(QThread):
         if X_va is not None:
             flat = X_va.transpose(0,2,1).reshape(-1, C)
             X_va = scaler.transform(flat).reshape(-1, X_va.shape[2], C).transpose(0,2,1).astype(np.float32)
+        self.scaler = scaler
         return X_tr, X_va
 
     # --------------------------------------------------------------
@@ -394,7 +400,7 @@ class TrainWorker(QThread):
             np.random.seed(seed)
             random.seed(seed)
             torch.use_deterministic_algorithms(True)
-            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+            torch.backends.cudnn.benchmark = False
             csvs = self._csvs()
             if not csvs:
                 raise RuntimeError("Keine CSV-Dateien gefunden.")
@@ -426,6 +432,7 @@ class TrainWorker(QThread):
 
             cm_total = np.zeros((len(uids), len(uids)), int)
             rep_acc, curves_fold = None, {}
+            all_max = []
             fold = 0
 
             for tr_idx, va_idx in splits:
@@ -447,8 +454,9 @@ class TrainWorker(QThread):
                             id2idx, idx2name, C_tot, device, use_amp)
                         if result is None:
                             return
-                        cm_fold, rep_fold, curves = result
+                        cm_fold, rep_fold, curves, max_prob = result
                         cm_total += cm_fold
+                        all_max.append(max_prob)
                         if rep_acc is None:
                             rep_acc = {k:(v.copy() if isinstance(v, dict) else v)
                                        for k, v in rep_fold.items()}
@@ -474,7 +482,10 @@ class TrainWorker(QThread):
                 if isinstance(v, dict):
                     for m in v: rep_acc[k][m] /= folds_total
                 else: rep_acc[k] /= folds_total
-            τ = _oob_threshold(cm_total.max(1), .95)
+            if all_max:
+                τ = _oob_threshold(np.concatenate(all_max), .95)
+            else:
+                τ = 0.0
 
             if self.cfg.get("final_full"):
                 fold += 1
@@ -533,7 +544,11 @@ class TrainWorker(QThread):
         y_tr_i = np.array([id2idx[v] for v in y_tr])
 
         if self.cfg.get("oversample"):
-            ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
+            ros = RandomOverSampler(
+                sampling_strategy="not majority",
+                random_state=42,
+                max_samples=self.cfg.get("ros_cap", 50000),
+            )
             X_tr, y_tr_i = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
             X_tr = X_tr.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
         X_va = X_va.astype(np.float32)
@@ -553,8 +568,11 @@ class TrainWorker(QThread):
 
         model = self._create_model(C_tot, len(uids:=id2idx)).to(device)
 
-        alpha = torch.tensor(compute_class_weight(
-            "balanced", classes=np.arange(len(uids)), y=y_tr_i)).float().to(device)
+        if self.cfg.get("oversample"):
+            alpha_vals = np.ones(len(uids))
+        else:
+            alpha_vals = compute_class_weight("balanced", classes=np.arange(len(uids)), y=y_tr_i)
+        alpha = torch.tensor(alpha_vals).float().to(device)
         crit = FocalLoss(alpha, gamma=1.0,
                          smooth=max(.05, self.cfg["smooth"]))
 
@@ -566,6 +584,7 @@ class TrainWorker(QThread):
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type=="cuda")
 
         best_val, best_state, bad = float("inf"), None, 0
+        pat_final = max(1, self.cfg["patience"] // 2)
         for ep in range(1, self.cfg["epochs"]+1):
             if self.isInterruptionRequested():
                 return None
@@ -602,7 +621,7 @@ class TrainWorker(QThread):
                 best_val, best_state, bad = val_loss, model.state_dict(), 0
             else:
                 bad += 1
-                if bad >= self.cfg["patience"]:
+                if bad >= pat_final:
                     break
 
         model.load_state_dict(best_state)
@@ -619,7 +638,7 @@ class TrainWorker(QThread):
             zero_division=0, output_dict=True)
         curves = pr_curves(y_va_i, prob_va, len(uids))
 
-        return cm_fold, rep_fold, curves
+        return cm_fold, rep_fold, curves, prob_va.max(1)
 
     def _train_all(self, fold: int, steps_total: int,
                    ds_all: IMUWindowDataset, id2idx: Dict[int, int],
@@ -633,7 +652,11 @@ class TrainWorker(QThread):
         y_tr_i = np.array([id2idx[v] for v in ds_all.y])
 
         if self.cfg.get("oversample"):
-            ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
+            ros = RandomOverSampler(
+                sampling_strategy="not majority",
+                random_state=42,
+                max_samples=self.cfg.get("ros_cap", 50000),
+            )
             X_tr, y_tr_i = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
             X_tr = X_tr.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
 
@@ -645,8 +668,12 @@ class TrainWorker(QThread):
         )
 
         model = self._create_model(C_tot, len(id2idx)).to(device)
-        alpha = torch.tensor(compute_class_weight(
-            "balanced", classes=np.arange(len(id2idx)), y=y_tr_i)).float().to(device)
+        if self.cfg.get("oversample"):
+            alpha_vals = np.ones(len(id2idx))
+        else:
+            alpha_vals = compute_class_weight(
+                "balanced", classes=np.arange(len(id2idx)), y=y_tr_i)
+        alpha = torch.tensor(alpha_vals).float().to(device)
         crit = FocalLoss(alpha, gamma=1.0,
                          smooth=max(.05, self.cfg["smooth"]))
         opt  = torch.optim.AdamW(model.parameters(),
@@ -681,7 +708,7 @@ class TrainWorker(QThread):
                 best_val, best_state, bad = tr_loss, model.state_dict(), 0
             else:
                 bad += 1
-                if bad >= self.cfg["patience"]:
+                if bad >= pat_final:
                     break
         model.load_state_dict(best_state)
         model.cpu()
@@ -750,6 +777,8 @@ class TrainingTab(QWidget):
         self.sp_fft.setEnabled(False); self.cb_fft.toggled.connect(self.sp_fft.setEnabled)
         self.cb_aug = QCheckBox("Augmentation"); self.cb_aug.setChecked(False)
         self.cb_ros = QCheckBox("Oversample"); self.cb_ros.setChecked(True)
+        self.sp_ros_cap = QSpinBox(minimum=1000, maximum=100000, value=50000)
+        self.sp_ros_cap.setSingleStep(1000)
         self.sp_smooth = QDoubleSpinBox(decimals=2, minimum=0., maximum=.2, value=.05)
         self.cb_gpu = QCheckBox("Use GPU"); self.cb_gpu.setChecked(USE_CUDA)
         self.cmb_cv = QComboBox(); self.cmb_cv.addItems(["Holdout", "5-Fold", "K-Fold"])
@@ -779,6 +808,7 @@ class TrainingTab(QWidget):
             ("FFT-Bins", self.sp_fft),
             ("Augment.", self.cb_aug),
             ("Oversample", self.cb_ros),
+            ("ROS Cap", self.sp_ros_cap),
             ("Label-Smooth", self.sp_smooth),
             ("Use GPU", self.cb_gpu),
             ("Cross-Validation", self.cmb_cv),
@@ -864,6 +894,7 @@ class TrainingTab(QWidget):
             arch=self.cmb_arch.currentText(),
             final_full=self.cb_final.isChecked(),
             oversample=self.cb_ros.isChecked(),
+            ros_cap=self.sp_ros_cap.value(),
         )
 
     # --------------------------------------------------------------
@@ -912,6 +943,7 @@ class TrainingTab(QWidget):
             self.btn_train.setEnabled(True); self.btn_stop.setEnabled(False)
             return
         self.idx2name = idx2name
+        self._scaler = getattr(self.worker, "scaler", None)
 
         # Confusion
         self.cm_placeholder.hide()
@@ -1072,6 +1104,9 @@ class TrainingTab(QWidget):
 
         pt_path = folder / f"{model_name}.pt"
         torch.save(self._trained_model.state_dict(), pt_path)
+        if getattr(self, "_scaler", None) is not None:
+            with open(folder / "scaler.pkl", "wb") as f:
+                pickle.dump(self._scaler, f)
         cfg = dict(self._cfg)
         cfg.update({
             "c_in": self._trained_model.in_channels,
