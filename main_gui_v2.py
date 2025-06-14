@@ -143,6 +143,7 @@ try:
     from videopc_widget import VideoPointCloudTab
     from stats_tab import StatsTab
     from rebuild_tab import RebuildTab
+    from segments_tab import SegmentsTab
     from training_tab import TrainingTab, HybridNet, ResNet1D
 except ModuleNotFoundError:
     print("[FATAL] ROS 2-Python-Pakete nicht gefunden. Bitte ROS 2 installieren & sourcen.")
@@ -1085,6 +1086,10 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------ Rebuild
         self.tab_rebuild = RebuildTab()
         self.tabs.addTab(self.tab_rebuild, "Rebuild")
+
+        # ------------------------------------------------------ Segments
+        self.tab_segments = SegmentsTab()
+        self.tabs.addTab(self.tab_segments, "Segments")
 
         # ------------------------------------------------------ Train
         self.tab_train = TrainingTab(MainWindow.LABEL_IDS, UNKNOWN_ID)
