@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from enum import Enum, auto
+
 import pandas as pd
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
@@ -20,6 +22,17 @@ from matplotlib.figure import Figure
 from labels import ANOMALY_TYPES
 
 
+class ViewMode(Enum):
+    RAW = auto()
+    CORRECTED = auto()
+    VEHICLE = auto()
+    WEIGHTED = auto()
+
+    @classmethod
+    def titles(cls) -> List[str]:
+        return ["Raw", "Corrected", "Vehicle", "Weighted"]
+
+
 class SegmentsTab(QWidget):
     """Browse labeled segment CSVs and peak images."""
 
@@ -29,6 +42,8 @@ class SegmentsTab(QWidget):
         self.label_folders: Dict[str, List[Path]] = {}
         self.current_label: str = ""
         self.current_index: int = 0
+        self.view_mode: ViewMode = ViewMode.RAW
+        self.current_df: Optional[pd.DataFrame] = None
 
         self._build_ui()
         self._connect_signals()
@@ -63,6 +78,15 @@ class SegmentsTab(QWidget):
         self.canvas = FigureCanvas(self.fig)
         vbox.addWidget(self.canvas)
 
+        # view mode
+        hl_view = QHBoxLayout()
+        hl_view.addWidget(QLabel("View:"))
+        self.cmb_view = QComboBox()
+        self.cmb_view.addItems(ViewMode.titles())
+        hl_view.addWidget(self.cmb_view)
+        hl_view.addStretch(1)
+        vbox.addLayout(hl_view)
+
         # peak images
         grid = QGridLayout()
         self.lbl_peaks: List[QLabel] = []
@@ -76,6 +100,7 @@ class SegmentsTab(QWidget):
     def _connect_signals(self) -> None:
         self.btn_browse.clicked.connect(self._browse)
         self.cmb_folder.currentTextChanged.connect(self._folder_changed)
+        self.cmb_view.currentTextChanged.connect(self._update_view)
 
     # ------------------------------------------------------------------ folder logic
     def _browse(self) -> None:
@@ -109,6 +134,36 @@ class SegmentsTab(QWidget):
         self.current_index = 0
         self._load_current()
 
+    def _update_view(self, text: str) -> None:
+        try:
+            self.view_mode = ViewMode[text.upper()]
+        except KeyError:
+            self.view_mode = ViewMode.RAW
+        self._draw()
+
+    def _draw(self) -> None:
+        self.fig.clf()
+        if self.current_df is None:
+            self.canvas.draw_idle()
+            return
+
+        columns_by_mode = {
+            ViewMode.RAW: ("accel_x", "accel_y", "accel_z"),
+            ViewMode.CORRECTED: ("accel_corr_x", "accel_corr_y", "accel_corr_z"),
+            ViewMode.VEHICLE: ("accel_veh_x", "accel_veh_y", "accel_veh_z"),
+            ViewMode.WEIGHTED: ("awx", "awy", "awz", "awv"),
+        }
+        cols = columns_by_mode.get(self.view_mode, columns_by_mode[ViewMode.RAW])
+
+        ax = self.fig.add_subplot(111)
+        for col in cols:
+            if col in self.current_df.columns:
+                ax.plot(self.current_df["time"], self.current_df[col], label=col)
+        ax.set_xlabel("time [s]")
+        ax.set_ylabel("m/s²")
+        ax.legend(fontsize="x-small")
+        self.canvas.draw_idle()
+
     # ------------------------------------------------------------------ segment logic
     def _load_current(self) -> None:
         for lbl in self.lbl_peaks:
@@ -118,35 +173,35 @@ class SegmentsTab(QWidget):
 
         csvs = self.label_folders.get(self.current_label)
         if not csvs:
+            self.current_df = None
             self.canvas.draw_idle()
             return
 
         csv = csvs[self.current_index]
         try:
-            df = pd.read_csv(csv)
+            self.current_df = pd.read_csv(csv)
         except Exception:
+            self.current_df = None
             self.canvas.draw_idle()
             return
 
         self.cmb_label.setCurrentText(self.current_label)
-
-        ax = self.fig.add_subplot(111)
-        for col in ("accel_x", "accel_y", "accel_z"):
-            if col in df.columns:
-                ax.plot(df["time"], df[col], label=col)
-        ax.set_xlabel("time [s]")
-        ax.set_ylabel("m/s²")
-        ax.legend(fontsize="x-small")
-        self.canvas.draw_idle()
+        self._draw()
 
         seg_id = csv.stem.split("_")[-1]
         peak_dir = csv.parent / "peaks" / seg_id
         if peak_dir.is_dir():
-            for lbl, img in zip(self.lbl_peaks, sorted(peak_dir.glob("*.png"))):
-                pix = QPixmap(str(img))
-                if lbl.width() and lbl.height():
-                    pix = pix.scaled(lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                lbl.setPixmap(pix)
+            imgs = sorted(peak_dir.glob("*.png"))
+            for i, lbl in enumerate(self.lbl_peaks):
+                if i < len(imgs):
+                    pix = QPixmap(str(imgs[i]))
+                    if lbl.width() and lbl.height():
+                        pix = pix.scaled(
+                            lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        )
+                    lbl.setPixmap(pix)
+                else:
+                    lbl.setText("No image")
 
     # ------------------------------------------------------------------ navigation
     def keyPressEvent(self, event) -> None:  # noqa: N802
