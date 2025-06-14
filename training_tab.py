@@ -174,12 +174,6 @@ class IMUWindowDataset(Dataset):
         self.y = np.array(self.y, dtype=np.int64)
         self.grp = np.array(self.grp)
 
-        # Standard-Scaling kanalweise
-        C = self.X.shape[1]
-        flat = self.X.transpose(0, 2, 1).reshape(-1, C)
-        flat = StandardScaler().fit_transform(flat)
-        self.X = flat.reshape(-1, self.X.shape[2], C).transpose(0, 2, 1)
-
     def __len__(self): return len(self.y)
     def __getitem__(self, idx): return torch.from_numpy(self.X[idx]), int(self.y[idx])
 
@@ -289,11 +283,12 @@ class FocalLoss(nn.Module):
         super().__init__(); self.register_buffer("a", alpha)
         self.g, self.s = gamma, smooth
     def forward(self, logits, targets):
-        ce = F.cross_entropy(logits, targets, reduction="none")
+        ce = F.cross_entropy(logits, targets, reduction="none",
+                             label_smoothing=self.s)
         at = self.a[targets] if self.a.numel() > 1 else 1.
         pt = torch.exp(-ce)
         fl = at * (1-pt)**self.g * ce
-        return (1-self.s)*fl.mean() + self.s*ce.mean()
+        return fl.mean()
 
 def pr_curves(y_true, y_prob, n_cls):
     curves = {}
@@ -368,7 +363,7 @@ class PRCanvas(FigureCanvas):
 class TrainWorker(QThread):
     progress = pyqtSignal(int)
     step     = pyqtSignal(int, float, float)
-    finished = pyqtSignal(dict, np.ndarray, dict, float, int, int, object, dict)
+    finished = pyqtSignal(bool, dict, np.ndarray, dict, float, int, int, object, dict)
     log      = pyqtSignal(str)
 
     def __init__(self, folder: Path, label_map: Dict[str, int],
@@ -380,6 +375,17 @@ class TrainWorker(QThread):
     def _csvs(self): return [p for p in self.folder.rglob("*.csv")
                              if not p.name.endswith("_track.csv")]
 
+    def _scale(self, X_tr: np.ndarray, X_va: np.ndarray | None = None):
+        C = X_tr.shape[1]
+        scaler = StandardScaler()
+        flat = X_tr.transpose(0,2,1).reshape(-1, C)
+        scaler.fit(flat)
+        X_tr = scaler.transform(flat).reshape(-1, X_tr.shape[2], C).transpose(0,2,1).astype(np.float32)
+        if X_va is not None:
+            flat = X_va.transpose(0,2,1).reshape(-1, C)
+            X_va = scaler.transform(flat).reshape(-1, X_va.shape[2], C).transpose(0,2,1).astype(np.float32)
+        return X_tr, X_va
+
     # --------------------------------------------------------------
     def run(self):                       # noqa: C901
         try:
@@ -387,6 +393,8 @@ class TrainWorker(QThread):
             torch.manual_seed(seed)
             np.random.seed(seed)
             random.seed(seed)
+            torch.use_deterministic_algorithms(True)
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
             csvs = self._csvs()
             if not csvs:
                 raise RuntimeError("Keine CSV-Dateien gefunden.")
@@ -492,12 +500,13 @@ class TrainWorker(QThread):
                         raise
 
             val_count = len(ds_all)//folds_total if folds_total > 1 else len(va_idx)
-            self.finished.emit(rep_acc, cm_total, idx2name, τ,
+            self.finished.emit(True, rep_acc, cm_total, idx2name, τ,
                                len(ds_all), val_count,
                                self.last_model_cpu, curves_fold)
 
         except Exception as e:
             self.log.emit(f"Fehler im Training: {e}")
+            self.finished.emit(False, {}, np.zeros((1,1)), {}, 0.0, 0, 0, None, {})
 
     def _create_model(self, c_in: int, n_cls: int) -> nn.Module:
         arch = self.cfg.get("arch", "HybridNet")
@@ -516,20 +525,24 @@ class TrainWorker(QThread):
 
         X_tr, y_tr = ds_all.X[tr_idx], ds_all.y[tr_idx]
         if self.cfg["augment"]:
-            X_tr = np.stack([sign_flip(add_gauss(scale_amplitude(dropout_segment(x))))
-                             for x in X_tr])
+            X_tr = np.stack([
+                sign_flip(add_gauss(scale_amplitude(dropout_segment(x))))
+                for x in X_tr
+            ])
+        X_tr, X_va = self._scale(X_tr, ds_all.X[va_idx])
         y_tr_i = np.array([id2idx[v] for v in y_tr])
 
-        ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
-        X_tr_r, y_tr_i_r = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
-        X_tr_r = X_tr_r.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
-
-        X_va, y_va = ds_all.X[va_idx], ds_all.y[va_idx]
+        if self.cfg.get("oversample"):
+            ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
+            X_tr, y_tr_i = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
+            X_tr = X_tr.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
+        X_va = X_va.astype(np.float32)
+        y_va = ds_all.y[va_idx]
         y_va_i = np.array([id2idx[v] for v in y_va])
 
         dl_tr = DataLoader(
-            TensorDataset(torch.from_numpy(X_tr_r),
-                          torch.from_numpy(y_tr_i_r)),
+            TensorDataset(torch.from_numpy(X_tr),
+                          torch.from_numpy(y_tr_i)),
             batch_size=self.cfg["batch"], shuffle=True,
             pin_memory=(device.type == "cuda"),
         )
@@ -541,7 +554,7 @@ class TrainWorker(QThread):
         model = self._create_model(C_tot, len(uids:=id2idx)).to(device)
 
         alpha = torch.tensor(compute_class_weight(
-            "balanced", classes=np.arange(len(uids)), y=y_tr_i_r)).float().to(device)
+            "balanced", classes=np.arange(len(uids)), y=y_tr_i)).float().to(device)
         crit = FocalLoss(alpha, gamma=1.0,
                          smooth=max(.05, self.cfg["smooth"]))
 
@@ -550,7 +563,7 @@ class TrainWorker(QThread):
         sched = OneCycleLR(opt, max_lr=self.cfg["lr"],
                            steps_per_epoch=len(dl_tr),
                            epochs=self.cfg["epochs"])
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type=="cuda")
 
         best_val, best_state, bad = float("inf"), None, 0
         for ep in range(1, self.cfg["epochs"]+1):
@@ -616,22 +629,24 @@ class TrainWorker(QThread):
             X_tr = np.stack([
                 sign_flip(add_gauss(scale_amplitude(dropout_segment(x))))
                 for x in X_tr])
+        X_tr, _ = self._scale(X_tr)
         y_tr_i = np.array([id2idx[v] for v in ds_all.y])
 
-        ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
-        X_tr_r, y_tr_i_r = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
-        X_tr_r = X_tr_r.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
+        if self.cfg.get("oversample"):
+            ros = RandomOverSampler(sampling_strategy="not majority", random_state=42)
+            X_tr, y_tr_i = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
+            X_tr = X_tr.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
 
         dl_tr = DataLoader(
-            TensorDataset(torch.from_numpy(X_tr_r),
-                          torch.from_numpy(y_tr_i_r)),
+            TensorDataset(torch.from_numpy(X_tr),
+                          torch.from_numpy(y_tr_i)),
             batch_size=self.cfg["batch"], shuffle=True,
             pin_memory=(device.type == "cuda"),
         )
 
         model = self._create_model(C_tot, len(id2idx)).to(device)
         alpha = torch.tensor(compute_class_weight(
-            "balanced", classes=np.arange(len(id2idx)), y=y_tr_i_r)).float().to(device)
+            "balanced", classes=np.arange(len(id2idx)), y=y_tr_i)).float().to(device)
         crit = FocalLoss(alpha, gamma=1.0,
                          smooth=max(.05, self.cfg["smooth"]))
         opt  = torch.optim.AdamW(model.parameters(),
@@ -639,8 +654,9 @@ class TrainWorker(QThread):
         sched = OneCycleLR(opt, max_lr=self.cfg["lr"],
                            steps_per_epoch=len(dl_tr),
                            epochs=self.cfg["epochs"])
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type=="cuda")
 
+        best_val, best_state, bad = float("inf"), None, 0
         for ep in range(1, self.cfg["epochs"]+1):
             if self.isInterruptionRequested():
                 return None
@@ -661,6 +677,13 @@ class TrainWorker(QThread):
             self.step.emit(ep, tr_loss, tr_loss)
             self.progress.emit(int((fold-1+ep/self.cfg["epochs"]) / steps_total*100))
 
+            if tr_loss < best_val - 1e-4:
+                best_val, best_state, bad = tr_loss, model.state_dict(), 0
+            else:
+                bad += 1
+                if bad >= self.cfg["patience"]:
+                    break
+        model.load_state_dict(best_state)
         model.cpu()
         return model
 
@@ -726,6 +749,7 @@ class TrainingTab(QWidget):
         self.sp_fft = QSpinBox(minimum=8, maximum=128, value=40)
         self.sp_fft.setEnabled(False); self.cb_fft.toggled.connect(self.sp_fft.setEnabled)
         self.cb_aug = QCheckBox("Augmentation"); self.cb_aug.setChecked(False)
+        self.cb_ros = QCheckBox("Oversample"); self.cb_ros.setChecked(True)
         self.sp_smooth = QDoubleSpinBox(decimals=2, minimum=0., maximum=.2, value=.05)
         self.cb_gpu = QCheckBox("Use GPU"); self.cb_gpu.setChecked(USE_CUDA)
         self.cmb_cv = QComboBox(); self.cmb_cv.addItems(["Holdout", "5-Fold", "K-Fold"])
@@ -754,6 +778,7 @@ class TrainingTab(QWidget):
             ("", self.cb_fft),
             ("FFT-Bins", self.sp_fft),
             ("Augment.", self.cb_aug),
+            ("Oversample", self.cb_ros),
             ("Label-Smooth", self.sp_smooth),
             ("Use GPU", self.cb_gpu),
             ("Cross-Validation", self.cmb_cv),
@@ -838,6 +863,7 @@ class TrainingTab(QWidget):
             seed=self.sp_seed.value(),
             arch=self.cmb_arch.currentText(),
             final_full=self.cb_final.isChecked(),
+            oversample=self.cb_ros.isChecked(),
         )
 
     # --------------------------------------------------------------
@@ -879,8 +905,12 @@ class TrainingTab(QWidget):
         self.btn_train.setEnabled(True)
 
     # --------------------------------------------------------------
-    def _done(self, rep_dict, cm, idx2name, τ, n_total, n_val,
+    def _done(self, success, rep_dict, cm, idx2name, τ, n_total, n_val,
               model, curves_fold):
+        if not success:
+            QMessageBox.warning(self, "Training Fehler", "Training abgebrochen. Siehe Log.")
+            self.btn_train.setEnabled(True); self.btn_stop.setEnabled(False)
+            return
         self.idx2name = idx2name
 
         # Confusion
