@@ -64,7 +64,7 @@ from numpy.fft import rfft
 USE_CUDA = torch.cuda.is_available()
 if USE_CUDA:
     torch.cuda.empty_cache()
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
 INIT_DEVICE = torch.device("cuda" if USE_CUDA else "cpu")
 logging.getLogger().setLevel(logging.INFO)
 logging.info(f"Start on {INIT_DEVICE}")
@@ -547,9 +547,12 @@ class TrainWorker(QThread):
             ros = RandomOverSampler(
                 sampling_strategy="not majority",
                 random_state=42,
-                max_samples=self.cfg.get("ros_cap", 50000),
             )
             X_tr, y_tr_i = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
+            cap = self.cfg.get("ros_cap", 0)
+            if cap and len(X_tr) > cap:
+                sel = np.random.choice(len(X_tr), cap, replace=False)
+                X_tr, y_tr_i = X_tr[sel], y_tr_i[sel]
             X_tr = X_tr.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
         X_va = X_va.astype(np.float32)
         y_va = ds_all.y[va_idx]
@@ -655,9 +658,12 @@ class TrainWorker(QThread):
             ros = RandomOverSampler(
                 sampling_strategy="not majority",
                 random_state=42,
-                max_samples=self.cfg.get("ros_cap", 50000),
             )
             X_tr, y_tr_i = ros.fit_resample(X_tr.reshape(len(X_tr), -1), y_tr_i)
+            cap = self.cfg.get("ros_cap", 0)
+            if cap and len(X_tr) > cap:
+                sel = np.random.choice(len(X_tr), cap, replace=False)
+                X_tr, y_tr_i = X_tr[sel], y_tr_i[sel]
             X_tr = X_tr.reshape(-1, C_tot, self.cfg["window"]).astype(np.float32)
 
         dl_tr = DataLoader(
@@ -684,6 +690,7 @@ class TrainWorker(QThread):
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type=="cuda")
 
         best_val, best_state, bad = float("inf"), None, 0
+        pat_final = max(1, self.cfg["patience"] // 2)
         for ep in range(1, self.cfg["epochs"]+1):
             if self.isInterruptionRequested():
                 return None
