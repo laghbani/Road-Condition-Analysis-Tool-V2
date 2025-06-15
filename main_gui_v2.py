@@ -1031,6 +1031,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+        self._make_really_resizable()
 
         # Restore persisted window state
         self._restore_settings()
@@ -1113,6 +1114,23 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_train, "Train")
 
         self.tabs.currentChanged.connect(self._tab_changed)
+
+    # ------------------------------------------------------------------ Resize fix
+    def _make_really_resizable(self) -> None:
+        """Ensure window remains resizable after UI construction."""
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QWIDGETSIZE_MAX
+
+        self.setMinimumSize(200, 150)
+        self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+
+        flags = self.windowFlags()
+        flags &= ~Qt.MSWindowsFixedSizeDialogHint
+        flags |= Qt.WindowMinMaxButtonsHint
+        self.setWindowFlags(flags)
+
+        self.show()
+        self.hide()
 
     # ------------------------------------------------------------------ Settings
     def _restore_settings(self) -> None:
@@ -2280,7 +2298,7 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.showMaximized()
+    win.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
