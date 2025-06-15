@@ -27,6 +27,10 @@ except Exception:
     ort = None
 
 import numpy as np
+try:
+    from scipy.spatial.transform import Rotation  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Rotation = None
 import pandas as pd
 import json
 import os
@@ -140,6 +144,7 @@ try:
     )
     from iso_weighting import calc_awv
     from progress_ui import ProgressWindow
+    import videopc_widget
     from videopc_widget import VideoPointCloudTab
     from stats_tab import StatsTab
     from rebuild_tab import RebuildTab
@@ -374,6 +379,116 @@ class BagReaderWorker(QThread):
             )
         except Exception as exc:
             log.exception("BagReaderWorker error")
+            self.finished.emit(None, exc)
+
+
+# ===========================================================================
+# SLAM Builder Thread
+# ===========================================================================
+class SlamBuilderWorker(QThread):
+    """Worker thread running a small SLAM pipeline."""
+
+    stepChanged = pyqtSignal(str)
+    setMaximum = pyqtSignal(int)
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object, object)
+
+    def __init__(self, pcs: list[PointCloud2], imu: list[ImuSample], delay: float, voxel_size: float, mode: int) -> None:
+        super().__init__()
+        self.pcs = pcs
+        self.imu = imu
+        self.delay = delay
+        self.voxel = voxel_size
+        self.mode = mode
+
+    @staticmethod
+    def _downsample(points: np.ndarray, voxel: float) -> np.ndarray:
+        if voxel <= 0 or len(points) == 0:
+            return points
+        grid = np.floor(points / voxel).astype(np.int32)
+        _, idx = np.unique(grid, axis=0, return_index=True)
+        return points[sorted(idx)]
+
+    def _predict_pose(self, last_t: float, cur_t: float) -> np.ndarray:
+        """Very coarse IMU integration for orientation."""
+        if not self.imu or Rotation is None:
+            return np.eye(4)
+        w = [s.msg.angular_velocity for s in self.imu if last_t <= s.time_abs + self.delay <= cur_t]
+        if not w:
+            return np.eye(4)
+        arr = np.array([[v.x, v.y, v.z] for v in w], float)
+        dt = cur_t - last_t
+        rot_vec = arr.mean(0) * dt
+        Rm = Rotation.from_rotvec(rot_vec).as_matrix()
+        T = np.eye(4)
+        T[:3, :3] = Rm
+        return T
+
+    def run(self) -> None:
+        try:
+            if self.mode == 0:
+                try:
+                    from kiss_icp.pipeline import OdometryPipeline, default_config
+                    cfg = default_config()
+                    cfg["voxel_size"] = float(self.voxel or 0.2)
+                    cfg["max_distance"] = 100.0
+                    slam = OdometryPipeline(cfg)
+                except Exception:
+                    try:
+                        from kiss_icp.pipeline import KissICP, KissConfig
+                    except Exception:
+                        from kiss_icp.pipeline import KissICP  # type: ignore
+                        try:
+                            from kiss_icp.config import KissConfig
+                        except Exception:
+                            from kiss_icp.config import KISSConfig as KissConfig  # type: ignore
+                    vox = float(self.voxel or 0.2)
+                    try:
+                        cfg = KissConfig(voxel_size=vox)
+                    except Exception:
+                        try:
+                            # some versions require hash_map parameter
+                            from kiss_icp.utils import VoxelHashMap
+                            cfg = KissConfig(hash_map=VoxelHashMap(voxel_size=vox, max_distance=100.0, max_points_per_voxel=20))
+                        except Exception:
+                            try:
+                                cfg = KissConfig()
+                            except Exception:
+                                # fall back: bypass __init__ and set attribute later
+                                cfg = KissConfig.__new__(KissConfig)
+                            try:
+                                cfg.voxel_size = vox  # type: ignore[attr-defined]
+                            except Exception:
+                                try:
+                                    cfg.hash_map.voxel_size = vox  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+                    slam = KissICP(cfg)
+            self.setMaximum.emit(len(self.pcs))
+            world_pts: list[np.ndarray] = []
+            last_t = None
+            for i, msg in enumerate(self.pcs):
+                self.stepChanged.emit(f"Frame {i}/{len(self.pcs)}")
+                pts = videopc_widget._pc_to_xyz(msg)
+                if self.mode == 0:
+                    stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                    init = np.eye(4) if last_t is None else self._predict_pose(last_t, stamp)
+                    slam.register_frame(pts, init_guess=init)
+                    T_w_s = slam.pose
+                    pts_w = (T_w_s @ np.c_[pts, np.ones(len(pts))].T).T[:, :3]
+                    world_pts.append(self._downsample(pts_w, self.voxel))
+                    last_t = stamp
+                else:
+                    pts = self._downsample(pts, self.voxel)
+                    world_pts.append(pts)
+                if i % 5 == 0:
+                    self.progress.emit(i)
+            if self.mode == 0:
+                arr = np.vstack(world_pts) if world_pts else np.empty((0, 3), np.float32)
+            else:
+                arr = np.vstack(world_pts) if world_pts else np.empty((0, 3), np.float32)
+            self.finished.emit(arr, None)
+        except Exception as exc:
             self.finished.emit(None, exc)
 
 
@@ -778,6 +893,63 @@ class AIParamDialog(QDialog):
         }
 
 
+class SlamSettingsDialog(QDialog):
+    """Dialog to configure SLAM parameters."""
+
+    def __init__(
+        self,
+        imu_topics: list[str],
+        current_imu: str | None,
+        delay: float,
+        voxel: float,
+        mode: int,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("SLAM Settings")
+        self.resize(300, 200)
+
+        v = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.cmb_imu = QComboBox()
+        self.cmb_imu.addItems(imu_topics)
+        if current_imu in imu_topics:
+            self.cmb_imu.setCurrentText(current_imu)
+        form.addRow("IMU Topic", self.cmb_imu)
+
+        self.sb_delay = QDoubleSpinBox()
+        self.sb_delay.setRange(-1.0, 1.0)
+        self.sb_delay.setSingleStep(0.01)
+        self.sb_delay.setValue(delay)
+        form.addRow("Sensor delay [s]", self.sb_delay)
+
+        self.sb_voxel = QDoubleSpinBox()
+        self.sb_voxel.setRange(0.0, 5.0)
+        self.sb_voxel.setSingleStep(0.1)
+        self.sb_voxel.setValue(voxel)
+        form.addRow("Voxel size [m]", self.sb_voxel)
+
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItems(["KISS-ICP (Standard)", "Simple ICP"])
+        self.cmb_mode.setCurrentIndex(mode)
+        form.addRow("Mode", self.cmb_mode)
+
+        v.addLayout(form)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        v.addWidget(btns)
+
+    def result(self) -> tuple[str, float, float, int]:
+        return (
+            self.cmb_imu.currentText(),
+            self.sb_delay.value(),
+            self.sb_voxel.value(),
+            self.cmb_mode.currentIndex(),
+        )
+
+
 class _AIDataset(Dataset):
     """Simple dataset for auto labeling."""
 
@@ -1013,6 +1185,16 @@ class MainWindow(QMainWindow):
         self.ai_params: dict = {"window": 256, "stride": 128, "threshold": 0.9}
         self.auto_label_active: bool = False
 
+        # SLAM parameters
+        self.slam_sensor_delay: float = 0.0
+        self.slam_voxel_size: float = 0.2
+        self.slam_mode_index: int = 0
+        self.slam_imu_topic: str | None = None
+        self.slam_map: np.ndarray | None = None
+
+        self.act_export_map: QAction | None = None
+        self.map_worker: SlamBuilderWorker | None = None
+
         self._build_menu()
         self._build_ui()
 
@@ -1076,6 +1258,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_vpc, "Videos + PC")
         self.tab_vpc.cmb_video.currentTextChanged.connect(self._change_video_topic)
         self.tab_vpc.cmb_pc.currentTextChanged.connect(self._change_pc_topic)
+        self.tab_vpc.btn_build_map.clicked.connect(self._on_build_map_clicked)
 
         # ------------------------------------------------------ Stats
         colors = {n: d["color"] for n, d in ANOMALY_TYPES.items()}
@@ -1272,6 +1455,15 @@ class MainWindow(QMainWindow):
         self.act_auto_ai.toggled.connect(self._toggle_auto_label)
         m_ai.addAction(self.act_auto_ai)
 
+        m_slam = mb.addMenu("&SLAM")
+        act_slam_settings = QAction("SLAM Settings …", self)
+        act_slam_settings.triggered.connect(self._open_slam_settings_dialog)
+        m_slam.addAction(act_slam_settings)
+        self.act_export_map = QAction("Export Map …", self)
+        self.act_export_map.setEnabled(False)
+        self.act_export_map.triggered.connect(self._export_map)
+        m_slam.addAction(self.act_export_map)
+
         # Help menu
         m_help = mb.addMenu("&Help")
         act_help = QAction("User Guide", self)
@@ -1295,6 +1487,9 @@ class MainWindow(QMainWindow):
         self.dfs.clear()
         self.t0 = None
         self.available_topics.clear()
+        self.slam_map = None
+        if self.act_export_map:
+            self.act_export_map.setEnabled(False)
 
         steps = [
             "Open bag file",
@@ -2134,6 +2329,87 @@ class MainWindow(QMainWindow):
         vbox.addWidget(btns)
         dlg.resize(600, 500)
         dlg.exec()
+
+    # -------------------------------------------------------------- SLAM actions
+    def _open_slam_settings_dialog(self) -> None:
+        dlg = SlamSettingsDialog(
+            self.active_topics,
+            self.slam_imu_topic or (self.active_topics[0] if self.active_topics else ""),
+            self.slam_sensor_delay,
+            self.slam_voxel_size,
+            self.slam_mode_index,
+            self,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        (
+            self.slam_imu_topic,
+            self.slam_sensor_delay,
+            self.slam_voxel_size,
+            self.slam_mode_index,
+        ) = dlg.result()
+
+    def _on_build_map_clicked(self) -> None:
+        topic = self.tab_vpc.cmb_pc.currentText()
+        pcs = self.pc_frames_by_topic.get(topic, [])
+        if not pcs:
+            QMessageBox.information(self, "Info", "No point cloud data available.")
+            return
+        steps = ["Processing point clouds", "Finalize"]
+        progress = ProgressWindow("Build Map", steps, parent=self)
+        imu = self.samples.get(self.slam_imu_topic or "", [])
+        self.map_worker = SlamBuilderWorker(
+            pcs,
+            imu,
+            delay=self.slam_sensor_delay,
+            voxel_size=self.slam_voxel_size,
+            mode=self.slam_mode_index,
+        )
+        self.map_worker.stepChanged.connect(progress.advance)
+        self.map_worker.setMaximum.connect(progress.set_bar_range)
+        self.map_worker.progress.connect(progress.set_bar_value)
+        self.map_worker.finished.connect(lambda res, err: self._map_worker_done(res, err, progress))
+        self.map_worker.start()
+
+    def _map_worker_done(self, result: np.ndarray | None, err: Exception | None, progress: ProgressWindow) -> None:
+        if progress.wasCanceled():
+            progress.accept()
+            return
+        if err or result is None:
+            QMessageBox.critical(self, "Map build", str(err))
+            progress.accept()
+            return
+        self.slam_map = result
+        self.tab_vpc.draw_scatter(result)
+        if self.act_export_map:
+            self.act_export_map.setEnabled(True)
+        progress.advance("Finalize")
+        progress.accept()
+
+    def _export_map(self) -> None:
+        if self.slam_map is None or self.slam_map.size == 0:
+            QMessageBox.information(self, "Info", "No map to export.")
+            return
+        QFileDialog = _get_qt_widget(self, "QFileDialog")
+        if QFileDialog is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Map",
+            "",
+            "PLY Files (*.ply);;PCD Files (*.pcd);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            import open3d as o3d
+        except Exception:
+            QMessageBox.warning(self, "Export", "open3d not installed.")
+            return
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(self.slam_map.astype(float))
+        o3d.io.write_point_cloud(path, pcd)
+        QMessageBox.information(self, "Export", f"Map saved to: {path}")
 
     # -------------------------------------------------------------- AI actions
     def _select_ai_model(self, path: str | None = None) -> None:
