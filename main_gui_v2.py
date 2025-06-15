@@ -1018,7 +1018,7 @@ class MainWindow(QMainWindow):
 
         # Restore persisted window state
         self._restore_settings()
-        self.setWindowState(self.windowState() | Qt.WindowMaximized)
+        QTimer.singleShot(0, self._apply_maximize)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -1110,6 +1110,9 @@ class MainWindow(QMainWindow):
         topics = self.settings.value("active_topics")
         if isinstance(topics, list):
             self.active_topics = [str(t) for t in topics]
+
+    def _apply_maximize(self) -> None:
+        self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
     def closeEvent(self, e) -> None:
         self.settings.setValue("geom", self.saveGeometry())
