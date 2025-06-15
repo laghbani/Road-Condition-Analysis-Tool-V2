@@ -955,6 +955,11 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+        self.setWindowFlag(Qt.MSWindowsFixedSizeDialogHint, False)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
         self.setWindowTitle(f"Multisensory Road Condition Analysis v{APP_VERSION}")
         self.resize(1500, 900)
 
