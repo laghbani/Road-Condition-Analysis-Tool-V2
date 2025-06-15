@@ -95,7 +95,8 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox
+        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox,
+        QWIDGETSIZE_MAX
     )
     try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -110,7 +111,8 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox
+        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox,
+        QWIDGETSIZE_MAX
     )
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -956,6 +958,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Multisensory Road Condition Analysis v{APP_VERSION}")
         self.resize(1500, 900)
 
+        # --- ensure window can be maximized ---------------------------------
+        flags = self.windowFlags()
+        flags &= ~Qt.CustomizeWindowHint
+        flags &= ~Qt.MSWindowsFixedSizeDialogHint
+        flags &= ~Qt.Dialog
+        flags |= Qt.WindowSystemMenuHint
+        flags |= Qt.WindowMinimizeButtonHint
+        flags |= Qt.WindowMaximizeButtonHint
+        flags |= Qt.WindowCloseButtonHint
+        self.setWindowFlags(flags)
+
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+
         # Persistent settings
         self.settings = QSettings("HS-Merseburg", "RCAT")
         self.undo = QUndoStack(self)
@@ -1015,6 +1031,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_ui()
+        self._make_really_resizable()
 
         # Restore persisted window state
         self._restore_settings()
@@ -1097,6 +1114,23 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_train, "Train")
 
         self.tabs.currentChanged.connect(self._tab_changed)
+
+    # ------------------------------------------------------------------ Resize fix
+    def _make_really_resizable(self) -> None:
+        """Ensure window remains resizable after UI construction."""
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QWIDGETSIZE_MAX
+
+        self.setMinimumSize(200, 150)
+        self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+
+        flags = self.windowFlags()
+        flags &= ~Qt.MSWindowsFixedSizeDialogHint
+        flags |= Qt.WindowMinMaxButtonsHint
+        self.setWindowFlags(flags)
+
+        self.show()
+        self.hide()
 
     # ------------------------------------------------------------------ Settings
     def _restore_settings(self) -> None:
@@ -2264,7 +2298,7 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.showMaximized()
+    win.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
