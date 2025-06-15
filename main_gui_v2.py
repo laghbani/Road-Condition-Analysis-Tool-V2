@@ -1112,7 +1112,8 @@ class MainWindow(QMainWindow):
             self.active_topics = [str(t) for t in topics]
 
     def _apply_maximize(self) -> None:
-        self.setWindowState(self.windowState() | Qt.WindowMaximized)
+        """Ensure the window is maximized after restoring settings."""
+        self.showMaximized()
 
     def closeEvent(self, e) -> None:
         self.settings.setValue("geom", self.saveGeometry())
