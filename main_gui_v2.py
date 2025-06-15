@@ -1019,6 +1019,9 @@ class MainWindow(QMainWindow):
         # Restore persisted window state
         self._restore_settings()
 
+        # Ensure window starts maximized after restoring settings
+        QTimer.singleShot(0, self.showMaximized)
+
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
         central = QWidget()
@@ -2264,7 +2267,6 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.showMaximized()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
