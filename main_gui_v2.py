@@ -95,7 +95,8 @@ try:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox
+        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox,
+        QWIDGETSIZE_MAX
     )
     try:
         from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -110,7 +111,8 @@ except ImportError:
         QAction, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
         QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextBrowser,
         QPushButton, QGroupBox, QRadioButton, QDoubleSpinBox, QTabWidget,
-        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox
+        QActionGroup, QUndoStack, QUndoCommand, QFormLayout, QSpinBox,
+        QWIDGETSIZE_MAX
     )
     try:
         from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -955,6 +957,20 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"Multisensory Road Condition Analysis v{APP_VERSION}")
         self.resize(1500, 900)
+
+        # --- ensure window can be maximized ---------------------------------
+        flags = self.windowFlags()
+        flags &= ~Qt.CustomizeWindowHint
+        flags &= ~Qt.MSWindowsFixedSizeDialogHint
+        flags &= ~Qt.Dialog
+        flags |= Qt.WindowSystemMenuHint
+        flags |= Qt.WindowMinimizeButtonHint
+        flags |= Qt.WindowMaximizeButtonHint
+        flags |= Qt.WindowCloseButtonHint
+        self.setWindowFlags(flags)
+
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
 
         # Persistent settings
         self.settings = QSettings("HS-Merseburg", "RCAT")
